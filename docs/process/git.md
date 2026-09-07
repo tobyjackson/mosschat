@@ -76,8 +76,9 @@ and a pull request as described above.
 
 ## Branch protection status
 
-As of this document, `main` requires pull requests, blocks force pushes and
-branch deletion, and requires at least one approving review before merge.
-It does not yet require any status check, because no CI exists until WO-1.1
-merges. Once WO-1.1's CI workflow lands, Xavier adds the required check
-names to branch protection; this note stays until that is done.
+`main` requires pull requests, blocks force pushes and branch deletion, and
+requires zero approving reviews before merge (the repository owner cannot
+approve their own pull requests). WO-1.1's CI workflow has landed; the
+required status checks are `check (ubuntu-latest)` and `check
+(macos-latest)`, strict (branch must be up to date). This note stays until
+those checks are confirmed live in branch protection.
