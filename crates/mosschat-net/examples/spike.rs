@@ -3,10 +3,10 @@
 //! section E). Throwaway quality, kept lint-clean; none of this is permanent
 //! `mosschat-net` code. The gatehouse, the doorbell and real address
 //! discovery are WO-1.3; this spike only proves the pieces WO-1.3 depends on:
-//! an ed25519 identity presented through rustls, a pinned-key verifier, and
-//! a signed nonce exchanged over `mosschat-core`'s `Signer`.
+//! an ed25519 identity presented through rustls, a pinned-key verifier on
+//! both sides, and a signed nonce exchanged over `mosschat-core`'s `Signer`.
 //!
-//! # Run
+//! # Run, one machine
 //!
 //! In one terminal:
 //!
@@ -20,10 +20,49 @@
 //! cargo run -p mosschat-net --example spike -- dial <ticket>
 //! ```
 //!
+//! Both sides bind `0.0.0.0:0` by default, and the ticket falls back to
+//! `127.0.0.1` for its address when the bound address is unspecified, so
+//! this works unchanged on one machine.
+//!
 //! To reproduce the substituted-key failure case, mutate the 32 public-key
 //! bytes encoded in the ticket (leaving the address alone) before dialing;
 //! see [`ticket`] for the encoding. `docs/dev/spike-notes.md` cites the run
 //! that answered each research question.
+//!
+//! # Run, two machines
+//!
+//! On the listening machine, bind explicitly and advertise the address the
+//! dialing machine can actually reach (a LAN IP, or a forwarded public one):
+//!
+//! ```text
+//! cargo run -p mosschat-net --example spike -- listen --bind 0.0.0.0:7777 --advertise 203.0.113.10:7777
+//! ```
+//!
+//! The printed ticket then carries `203.0.113.10:7777` rather than
+//! `0.0.0.0:7777`, which is not a dialable address. On the other machine:
+//!
+//! ```text
+//! cargo run -p mosschat-net --example spike -- dial <ticket>
+//! ```
+//!
+//! # Mutual authentication with `--expect`
+//!
+//! By default the listener requires the dialer to present a client
+//! certificate (mutual TLS) but accepts any key on it, and says so plainly
+//! at startup. To pin the dialer's key too, pass its 64 hex character
+//! public key:
+//!
+//! ```text
+//! cargo run -p mosschat-net --example spike -- listen --expect <dialer-pubkey-hex>
+//! cargo run -p mosschat-net --example spike -- dial <ticket> --expect <listener-pubkey-hex>
+//! ```
+//!
+//! `dial`'s `--expect` is a belt-and-suspenders check against the pinned
+//! key already carried in the ticket, not a second source of trust: dial
+//! refuses to connect if the two disagree. Use `--identity <32-byte-seed-hex>`
+//! on either side to fix that process's ed25519 identity across runs
+//! instead of generating a fresh one, so its public key is known ahead of
+//! time for the other side's `--expect`.
 //!
 //! # Ticket
 //!
@@ -32,24 +71,34 @@
 //! address bytes, 2 byte big-endian port). No other fields for now; the
 //! gate address and other invite fields are WO-4.1's job.
 //!
-//! # TLS identity and the pinned verifier
+//! # TLS identity and the pinned verifiers
 //!
 //! Each side presents a self-signed certificate whose key is its ed25519
-//! identity (`identity::load_or_generate`, then [`cert::self_signed_cert`]).
-//! The dialer's [`verify::PinnedKeyVerifier`] uses rustls's `dangerous()`
+//! identity (`identity::generate`, then [`cert::self_signed_cert`]). The
+//! dialer's [`verify::PinnedKeyVerifier`] uses rustls's `dangerous()`
 //! verifier API (`ClientConfig::dangerous().with_custom_certificate_verifier`)
 //! to accept exactly the one 32-byte key from the ticket and reject every
 //! other key; this is deliberate for a spike where the peer's identity is
 //! already known out of band; real certificate-chain validation is not
-//! wanted or meaningful here. The listener does not verify the dialer's TLS
-//! certificate at all: authentication of the dialer happens at the
-//! application layer instead, via the signed nonce exchange in [`handshake`].
+//! wanted or meaningful here. The listener requires the dialer to present a
+//! client certificate (mutual TLS) and, symmetrically, uses
+//! [`verify::PinnedClientCertVerifier`] to pin that key when `--expect` is
+//! given; when it is not given, the listener still requires a certificate
+//! but accepts any key on it, which it prints plainly at startup so this is
+//! never mistaken for authentication. Both verifiers extract the ed25519
+//! public key from the certificate's SubjectPublicKeyInfo with a real DER
+//! parse (`x509-parser`), not a fixed-byte-prefix search. The signed nonce
+//! exchange in [`handshake`] adds a liveness/binding check over
+//! `mosschat-core`'s `Signer` on top of whatever the TLS layer already
+//! authenticated; it is not what makes the dialer authenticated to the
+//! listener, since with no `--expect` the listener never checks whose key
+//! signed the certificate it received.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::error::Error;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,10 +111,29 @@ const ALPN: &[u8] = b"moss-spike";
 const TICKET_PREFIX: &str = "moss1";
 const PING_COUNT: usize = 100;
 
+/// The domain-separation prefix signed ahead of every nonce in the
+/// handshake exchange (Yseult's review, finding 3), so a spike signature
+/// can never be confused with a TLS 1.3 `CertificateVerify` signature (a
+/// different message shape entirely) or, more importantly, with a future
+/// production signature over a bare 32 byte value such as `event_id`,
+/// `visit`, `body_hash` or a ticket secret (D5). WO-2.1 defines the actual
+/// production domain-separation prefixes; this one is scoped to this spike
+/// and is never meant to reach real code.
+const NONCE_DOMAIN_PREFIX: &[u8] = b"mosschat-spike-nonce-v1";
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
         eprintln!("spike: error: {err}");
+        // Walk the `source()` chain: quinn/rustls errors like
+        // `WriteError::ConnectionLost` wrap the real cause (a TLS alert
+        // such as `ApplicationVerificationFailure`) one level down, and the
+        // top-level `Display` alone does not show it.
+        let mut source = err.source();
+        while let Some(cause) = source {
+            eprintln!("spike: caused by: {cause}");
+            source = cause.source();
+        }
         std::process::exit(1);
     }
 }
@@ -73,12 +141,140 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("listen") => listen().await,
+        Some("listen") => {
+            let listen_args = cli::ListenArgs::parse(args)?;
+            listen(listen_args).await
+        }
         Some("dial") => {
-            let ticket_str = args.next().ok_or("usage: spike dial <ticket>")?;
-            dial(&ticket_str).await
+            let ticket_str = args.next().ok_or(
+                "usage: spike dial <ticket> [--bind <addr:port>] [--identity <hex32>] [--expect <hex32>]",
+            )?;
+            let dial_args = cli::DialArgs::parse(&ticket_str, args)?;
+            dial(dial_args).await
         }
         _ => Err("usage: spike listen | spike dial <ticket>".into()),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Command-line arguments
+// ---------------------------------------------------------------------
+
+mod cli {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::keyhex::decode32;
+
+    const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+
+    /// Arguments to `spike listen`.
+    pub struct ListenArgs {
+        /// Local address to bind the QUIC endpoint to.
+        pub bind: SocketAddr,
+        /// Address to encode in the printed ticket in place of the bound
+        /// address, for when the bound address is not itself reachable by
+        /// the dialer (behind NAT, or bound to `0.0.0.0`).
+        pub advertise: Option<SocketAddr>,
+        /// The dialer's public key to pin, if given. `None` means the
+        /// listener accepts a client certificate presenting any key.
+        pub expect: Option<[u8; 32]>,
+        /// A fixed 32 byte ed25519 seed for this process's identity, so its
+        /// public key is known ahead of time for the dialer's `--expect`.
+        pub identity: Option<[u8; 32]>,
+    }
+
+    /// Arguments to `spike dial <ticket>`.
+    pub struct DialArgs {
+        pub ticket: String,
+        pub bind: SocketAddr,
+        /// A fixed 32 byte ed25519 seed for this process's identity.
+        pub identity: Option<[u8; 32]>,
+        /// A consistency check against the ticket's own pinned key: if
+        /// given and it disagrees with the ticket, `dial` refuses to
+        /// connect rather than silently trusting the ticket alone.
+        pub expect: Option<[u8; 32]>,
+    }
+
+    impl ListenArgs {
+        pub fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+            let mut bind = None;
+            let mut advertise = None;
+            let mut expect = None;
+            let mut identity = None;
+            let mut it = args;
+            while let Some(flag) = it.next() {
+                match flag.as_str() {
+                    "--bind" => bind = Some(parse_socket_addr(&next_value(&mut it, "--bind")?)?),
+                    "--advertise" => {
+                        advertise = Some(parse_socket_addr(&next_value(&mut it, "--advertise")?)?);
+                    }
+                    "--expect" => expect = Some(decode32(&next_value(&mut it, "--expect")?)?),
+                    "--identity" => identity = Some(decode32(&next_value(&mut it, "--identity")?)?),
+                    other => return Err(format!("unknown flag {other}")),
+                }
+            }
+            Ok(Self {
+                bind: bind.unwrap_or(DEFAULT_BIND),
+                advertise,
+                expect,
+                identity,
+            })
+        }
+    }
+
+    impl DialArgs {
+        pub fn parse(ticket: &str, args: impl Iterator<Item = String>) -> Result<Self, String> {
+            let mut bind = None;
+            let mut identity = None;
+            let mut expect = None;
+            let mut it = args;
+            while let Some(flag) = it.next() {
+                match flag.as_str() {
+                    "--bind" => bind = Some(parse_socket_addr(&next_value(&mut it, "--bind")?)?),
+                    "--identity" => identity = Some(decode32(&next_value(&mut it, "--identity")?)?),
+                    "--expect" => expect = Some(decode32(&next_value(&mut it, "--expect")?)?),
+                    other => return Err(format!("unknown flag {other}")),
+                }
+            }
+            Ok(Self {
+                ticket: ticket.to_string(),
+                bind: bind.unwrap_or(DEFAULT_BIND),
+                identity,
+                expect,
+            })
+        }
+    }
+
+    fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+        args.next().ok_or_else(|| format!("{flag} needs a value"))
+    }
+
+    fn parse_socket_addr(s: &str) -> Result<SocketAddr, String> {
+        s.parse()
+            .map_err(|_| format!("{s} is not a valid address:port"))
+    }
+}
+
+mod keyhex {
+    /// Decodes 64 hex characters back into 32 bytes. Encoding the other way
+    /// uses the top-level [`super::hex`] helper, which already exists for
+    /// printing nonces the same way.
+    pub fn decode32(s: &str) -> Result<[u8; 32], String> {
+        if s.len() != 64 {
+            return Err(format!(
+                "expected 64 hex characters (32 bytes), got {} characters",
+                s.len()
+            ));
+        }
+        let mut out = [0u8; 32];
+        for (i, chunk) in out.iter_mut().enumerate() {
+            let byte_str = s
+                .get(i * 2..i * 2 + 2)
+                .ok_or_else(|| "hex string ended early".to_string())?;
+            *chunk = u8::from_str_radix(byte_str, 16)
+                .map_err(|_| format!("{byte_str:?} is not valid hex"))?;
+        }
+        Ok(out)
     }
 }
 
@@ -90,12 +286,16 @@ mod identity {
     use mosschat_core::identity::AuthorKey;
     use rand::RngExt;
 
-    /// Generates a fresh random ed25519 identity for this run of the spike.
+    /// Generates this process's ed25519 identity: `fixed_seed` if given
+    /// (so its public key is known ahead of time for the peer's
+    /// `--expect`), otherwise a fresh random one.
     ///
     /// A real house persists its identity (D4); a spike process is
-    /// throwaway, so a new key each run is correct here.
-    pub fn generate() -> (AuthorKey, [u8; 32]) {
-        let seed: [u8; 32] = rand::rng().random();
+    /// throwaway, so a new key each run is correct by default, with a
+    /// fixed seed available only to make the `--expect` flags in the
+    /// module docs reproducible across separate runs.
+    pub fn generate(fixed_seed: Option<[u8; 32]>) -> (AuthorKey, [u8; 32]) {
+        let seed = fixed_seed.unwrap_or_else(|| rand::rng().random());
         let key = AuthorKey::from_bytes(&seed);
         (key, seed)
     }
@@ -146,36 +346,27 @@ mod verify {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+    use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+    use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme};
 
-    /// The fixed 12-byte prefix of an RFC 8410 Ed25519 SubjectPublicKeyInfo:
-    /// a `SEQUENCE` wrapping the algorithm identifier for OID 1.3.101.112
-    /// and a `BIT STRING` header, immediately followed by the 32 raw public
-    /// key bytes. Searching a small self-signed certificate's DER for this
-    /// exact byte string is a deliberate spike shortcut in place of a real
-    /// X.509 parser (not in this work order's dependency list); it works
-    /// because rcgen's Ed25519 SPKI encoding is fixed and this prefix is
-    /// long enough not to occur by chance elsewhere in a certificate this
-    /// small.
-    const SPKI_ED25519_PREFIX: [u8; 12] = [
-        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-    ];
+    /// The DER content bytes of OID 1.3.101.112 (RFC 8410, id-Ed25519), the
+    /// algorithm identifier every ed25519 SubjectPublicKeyInfo carries.
+    const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 
+    /// Extracts the raw 32 byte ed25519 public key from a certificate's
+    /// SubjectPublicKeyInfo via a real DER parse (`x509-parser`), rather
+    /// than searching the certificate bytes for a fixed SPKI byte prefix
+    /// (Yseult's review, finding 5): a hostile certificate cannot plant a
+    /// matching prefix in some other field and have it picked up here,
+    /// because this walks the actual ASN.1 structure to the SPKI field
+    /// rather than pattern-matching raw bytes.
     fn extract_ed25519_public_key(cert_der: &[u8]) -> Option<[u8; 32]> {
-        let windows = cert_der.windows(SPKI_ED25519_PREFIX.len());
-        for (offset, window) in windows.enumerate() {
-            if window == SPKI_ED25519_PREFIX {
-                let start = offset + SPKI_ED25519_PREFIX.len();
-                let end = start + 32;
-                if let Some(key) = cert_der
-                    .get(start..end)
-                    .and_then(|slice| <[u8; 32]>::try_from(slice).ok())
-                {
-                    return Some(key);
-                }
-            }
+        let (_, cert) = x509_parser::parse_x509_certificate(cert_der).ok()?;
+        let spki = &cert.tbs_certificate.subject_pki;
+        if spki.algorithm.algorithm.as_bytes() != OID_ED25519 {
+            return None;
         }
-        None
+        <[u8; 32]>::try_from(spki.subject_public_key.data.as_ref()).ok()
     }
 
     fn verify_signature(
@@ -239,6 +430,75 @@ mod verify {
                 ));
             }
             Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            verify_signature(message, cert, dss)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            verify_signature(message, cert, dss)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![SignatureScheme::ED25519]
+        }
+    }
+
+    /// A rustls client certificate verifier that requires the dialer to
+    /// present a certificate and, when `expected` is `Some`, pins it to
+    /// exactly one 32-byte ed25519 public key exactly as
+    /// [`PinnedKeyVerifier`] does for the server's certificate (Yseult's
+    /// review, finding 2: the responder used to authenticate nobody). When
+    /// `expected` is `None` a certificate is still mandatory
+    /// (`client_auth_mandatory` is always `true`), but any key on it is
+    /// accepted; callers of [`super::listen`] are responsible for printing
+    /// that plainly, since a verifier accepting silently is exactly what
+    /// this finding was about.
+    pub struct PinnedClientCertVerifier {
+        pub expected: Option<[u8; 32]>,
+    }
+
+    impl fmt::Debug for PinnedClientCertVerifier {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("PinnedClientCertVerifier").finish()
+        }
+    }
+
+    impl ClientCertVerifier for PinnedClientCertVerifier {
+        fn root_hint_subjects(&self) -> &[DistinguishedName] {
+            // No certificate authority in this system (D2, D4); there is
+            // nothing to hint.
+            &[]
+        }
+
+        fn verify_client_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _now: UnixTime,
+        ) -> Result<ClientCertVerified, TlsError> {
+            let actual = extract_ed25519_public_key(end_entity).ok_or(
+                TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding),
+            )?;
+            if let Some(expected) = self.expected
+                && actual != expected
+            {
+                return Err(TlsError::InvalidCertificate(
+                    rustls::CertificateError::ApplicationVerificationFailure,
+                ));
+            }
+            Ok(ClientCertVerified::assertion())
         }
 
         fn verify_tls12_signature(
@@ -396,6 +656,24 @@ mod handshake {
     use super::*;
     use rand::RngExt;
 
+    /// The role byte baked into every signed nonce message (Yseult's
+    /// review, finding 3), distinguishing a signature made as the
+    /// connection's initiator from one made as its responder, so a
+    /// signature captured from one role can never be replayed as the
+    /// other's.
+    const ROLE_INITIATOR: u8 = 0x01;
+    const ROLE_RESPONDER: u8 = 0x02;
+
+    /// Builds the exact bytes signed and verified for one nonce: the fixed
+    /// domain prefix, the signer's role byte, then the 32 byte nonce.
+    fn domain_message(role: u8, nonce: &[u8; 32]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(super::NONCE_DOMAIN_PREFIX.len() + 1 + 32);
+        msg.extend_from_slice(super::NONCE_DOMAIN_PREFIX);
+        msg.push(role);
+        msg.extend_from_slice(nonce);
+        msg
+    }
+
     /// One side's outcome of the signed nonce exchange: the nonce it sent,
     /// signed and verified by the peer, and the nonce it received, signed
     /// and verified locally.
@@ -423,9 +701,13 @@ mod handshake {
         let sig_over_sent: [u8; 64] = peer_reply[0..64].try_into()?;
         #[allow(clippy::indexing_slicing)]
         let received_nonce: [u8; 32] = peer_reply[64..96].try_into()?;
-        verify(peer_pinned, &sent_nonce, &sig_over_sent)?;
+        verify(
+            peer_pinned,
+            &domain_message(ROLE_RESPONDER, &sent_nonce),
+            &sig_over_sent,
+        )?;
 
-        let sig_over_received = key.sign(&received_nonce);
+        let sig_over_received = key.sign(&domain_message(ROLE_INITIATOR, &received_nonce));
         let mut reply = Vec::with_capacity(96);
         reply.extend_from_slice(&sig_over_received);
         reply.extend_from_slice(&key.public_bytes());
@@ -448,7 +730,7 @@ mod handshake {
         let mut received_nonce = [0u8; 32];
         recv.read_exact(&mut received_nonce).await?;
 
-        let sig_over_received = key.sign(&received_nonce);
+        let sig_over_received = key.sign(&domain_message(ROLE_RESPONDER, &received_nonce));
         let sent_nonce: [u8; 32] = rand::rng().random();
         let mut reply = Vec::with_capacity(96);
         reply.extend_from_slice(&sig_over_received);
@@ -461,7 +743,11 @@ mod handshake {
         let sig_over_sent: [u8; 64] = peer_reply[0..64].try_into()?;
         #[allow(clippy::indexing_slicing)]
         let peer_pubkey: [u8; 32] = peer_reply[64..96].try_into()?;
-        verify(&peer_pubkey, &sent_nonce, &sig_over_sent)?;
+        verify(
+            &peer_pubkey,
+            &domain_message(ROLE_INITIATOR, &sent_nonce),
+            &sig_over_sent,
+        )?;
 
         Ok(Outcome {
             sent_nonce,
@@ -539,48 +825,93 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Builds the listener's QUIC endpoint, bound to `bind_addr`. Requires the
+/// dialer to present a client certificate (mutual TLS): pinned to
+/// `expect_client` when given, or accepting any key on it when not
+/// (Yseult's review, finding 2). Callers are responsible for logging which
+/// case applies; this function only enforces it.
 fn server_endpoint(
     cert: CertificateDer<'static>,
     key: PrivatePkcs8KeyDer<'static>,
+    bind_addr: SocketAddr,
+    expect_client: Option<[u8; 32]>,
 ) -> Result<Endpoint, Box<dyn Error>> {
+    let client_verifier = Arc::new(verify::PinnedClientCertVerifier {
+        expected: expect_client,
+    });
     let mut tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+        .with_client_cert_verifier(client_verifier)
         .with_single_cert(vec![cert], PrivateKeyDer::Pkcs8(key))?;
     tls_config.alpn_protocols = vec![ALPN.to_vec()];
     let quic_crypto = QuicServerConfig::try_from(tls_config)?;
     let server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
-    let bind_addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     Ok(Endpoint::server(server_config, bind_addr)?)
 }
 
-fn client_endpoint(pinned: [u8; 32]) -> Result<Endpoint, Box<dyn Error>> {
+/// Builds the dialer's QUIC endpoint, bound to `bind_addr`. Pins the
+/// server's key to `pinned` (from the ticket) and presents `cert`/`key` as
+/// its own client certificate, so the listener has something to
+/// authenticate (Yseult's review, finding 2).
+fn client_endpoint(
+    pinned: [u8; 32],
+    cert: CertificateDer<'static>,
+    key: PrivatePkcs8KeyDer<'static>,
+    bind_addr: SocketAddr,
+) -> Result<Endpoint, Box<dyn Error>> {
     let verifier = Arc::new(verify::PinnedKeyVerifier { pinned });
     let mut tls_config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_client_auth_cert(vec![cert], PrivateKeyDer::Pkcs8(key))?;
     tls_config.alpn_protocols = vec![ALPN.to_vec()];
     let quic_crypto = QuicClientConfig::try_from(tls_config)?;
     let client_config = ClientConfig::new(Arc::new(quic_crypto));
-    let bind_addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     let mut endpoint = Endpoint::client(bind_addr)?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
+}
+
+/// Returns the address to advertise in the ticket: `advertise` when given,
+/// otherwise `bound` unless `bound`'s address is unspecified (`0.0.0.0` or
+/// `::`), in which case the matching loopback address is substituted so a
+/// one-machine run still produces a dialable ticket (Konrad's review,
+/// must 2).
+fn advertise_addr(bound: SocketAddr, advertise: Option<SocketAddr>) -> SocketAddr {
+    if let Some(addr) = advertise {
+        return addr;
+    }
+    match bound.ip() {
+        IpAddr::V4(v4) if v4.is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound.port())
+        }
+        IpAddr::V6(v6) if v6.is_unspecified() => {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), bound.port())
+        }
+        _ => bound,
+    }
 }
 
 // ---------------------------------------------------------------------
 // listen / dial
 // ---------------------------------------------------------------------
 
-async fn listen() -> Result<(), Box<dyn Error>> {
+async fn listen(args: cli::ListenArgs) -> Result<(), Box<dyn Error>> {
     install_crypto_provider();
-    let (key, seed) = identity::generate();
+    let (key, seed) = identity::generate(args.identity);
     let (cert_der, key_der) = cert::self_signed_cert(&seed)?;
-    let endpoint = server_endpoint(cert_der, key_der)?;
+    let endpoint = server_endpoint(cert_der, key_der, args.bind, args.expect)?;
     let local_addr = endpoint.local_addr()?;
     let public = key.public_bytes();
-    println!("spike: listening on {local_addr}");
-    println!("spike: ticket: {}", ticket::encode(&public, local_addr));
+    let advertised = advertise_addr(local_addr, args.advertise);
+    println!("spike: identity {}", hex(&public));
+    println!("spike: bound on {local_addr}, advertising {advertised}");
+    match args.expect {
+        Some(expected) => println!("spike: pinning the dialer's key to {}", hex(&expected)),
+        None => {
+            println!("spike: --expect not given; accepting a client certificate presenting any key")
+        }
+    }
+    println!("spike: ticket: {}", ticket::encode(&public, advertised));
 
     loop {
         let Some(incoming) = endpoint.accept().await else {
@@ -619,11 +950,23 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn dial(ticket_str: &str) -> Result<(), Box<dyn Error>> {
+async fn dial(args: cli::DialArgs) -> Result<(), Box<dyn Error>> {
     install_crypto_provider();
-    let (pinned, addr) = ticket::decode(ticket_str)?;
-    let (key, _seed) = identity::generate();
-    let endpoint = client_endpoint(pinned)?;
+    let (pinned, addr) = ticket::decode(&args.ticket)?;
+    if let Some(expected) = args.expect
+        && expected != pinned
+    {
+        return Err(format!(
+            "--expect {} disagrees with the ticket's pinned key {}",
+            hex(&expected),
+            hex(&pinned)
+        )
+        .into());
+    }
+    let (key, seed) = identity::generate(args.identity);
+    let (cert_der, key_der) = cert::self_signed_cert(&seed)?;
+    println!("spike: identity {}", hex(&key.public_bytes()));
+    let endpoint = client_endpoint(pinned, cert_der, key_der, args.bind)?;
 
     let start = Instant::now();
     let connecting = endpoint.connect(addr, "spike")?;

@@ -432,6 +432,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "tokio",
+ "x509-parser",
 ]
 
 [[package]]
