@@ -1,0 +1,67 @@
+# cargo-deny configuration. Run by `ci/check.sh` and by `cargo deny check` directly.
+# Schema reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = false
+no-default-features = false
+
+# Licences: the allow list is every licence string carried by the crates pinned in
+# versions.md, plus the licences of the three D7 CBOR candidates named in
+# versions-v3-notes.md (BlueOak-1.0.0 for minicbor, MIT for cbor4ii, Apache-2.0 for
+# ciborium; the latter two are already covered). This lets WO-1.2 pick the CBOR crate on
+# merit instead of the allow list quietly deciding it first. Any further addition is made
+# by running `cargo deny check licenses`, reading what it reports, and recording the
+# crate and licence in versions.md with the date, per that file's own rule.
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "BlueOak-1.0.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+# Advisories: deny on any known vulnerability. Unmaintained and yanked crates warn rather
+# than deny for now, since nothing is depended on yet in this work order; a phase that
+# adds real dependencies revisits this if a warning becomes routine noise.
+[advisories]
+ignore = []
+
+# Bans: invariant 9 forbids duplicate crypto majors. `multiple-versions = "warn"` catches
+# ordinary dependency-graph duplication generally (a warning is a prompt to look, not a
+# hard failure, since some duplication is unavoidable in a large graph), while the three
+# crates named in the work order get a hard deny on more than one version in the tree,
+# because two versions of a signing, transport-security or hashing crate in one binary is
+# exactly the kind of silent inconsistency invariant 9 exists to catch.
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-workspace = true
+# The four `mosschat-*` path dependencies of the `mosschat` binary have no version
+# requirement because they are workspace-internal path deps, not external crates
+# resolved by version; without this they would otherwise trip the wildcard deny above.
+allow-wildcard-paths = true
+
+[[bans.deny]]
+name = "ed25519-dalek"
+deny-multiple-versions = true
+
+[[bans.deny]]
+name = "rustls"
+deny-multiple-versions = true
+
+[[bans.deny]]
+name = "blake3"
+deny-multiple-versions = true
+
+# Sources: only crates.io, so nothing arrives from an unreviewed git remote.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
