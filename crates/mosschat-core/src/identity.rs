@@ -4,7 +4,7 @@
 //! `mosschat-net` calls `sign` and `verify` on bytes it has already framed, and
 //! nothing in this module knows what a QUIC connection or a TLS certificate is.
 
-use ed25519_dalek::{Signature, Signer as EdSigner, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as EdSigner, SigningKey, VerifyingKey};
 
 use crate::error::CoreError;
 
@@ -58,8 +58,13 @@ pub fn verify(public: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> Result<(), CoreE
     let verifying_key =
         VerifyingKey::from_bytes(public).map_err(|_| CoreError::MalformedKeyOrSignature)?;
     let signature = Signature::from_bytes(sig);
+    // `verify_strict` rejects low-order (weak) public keys and signatures, on
+    // top of the malleability checks plain `verify` already applies. Every
+    // caller here accepts a peer-chosen key (WO-1.3 registration, WO-3.2
+    // beacons, WO-3.4 device-add, WO-4.2 redemption), so non-strict `verify`
+    // is never safe in this permanent path (CWE-347).
     verifying_key
-        .verify(msg, &signature)
+        .verify_strict(msg, &signature)
         .map_err(|_| CoreError::InvalidSignature)
 }
 
@@ -101,5 +106,19 @@ mod tests {
         tampered[0] ^= 0x01;
         let public = key.public_bytes();
         assert!(verify(&public, &tampered, &sig).is_err());
+    }
+
+    /// Reproduces Yseult's review finding: the low-order public key `01
+    /// 00..00` paired with the signature `01 00..00` followed by 32 zero
+    /// bytes "verifies" against every message under non-strict `verify`,
+    /// with no private key involved. `verify_strict` must reject it.
+    #[test]
+    fn low_order_key_and_signature_are_rejected_for_an_arbitrary_message() {
+        let mut public = [0u8; 32];
+        public[0] = 0x01;
+        let mut sig = [0u8; 64];
+        sig[0] = 0x01;
+        let msg = b"an arbitrary message held under no private key";
+        assert!(verify(&public, msg, &sig).is_err());
     }
 }

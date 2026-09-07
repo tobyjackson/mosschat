@@ -68,7 +68,10 @@ impl Envelope {
     /// # Errors
     ///
     /// Returns a [`minicbor::decode::Error`] if `bytes` is not a
-    /// definite-length 8-element array of the expected field types.
+    /// definite-length 8-element array of the expected field types, if
+    /// `bytes` carries anything after the 8th field, or if `bytes` is not
+    /// itself the canonical shortest-form encoding of the value it decodes
+    /// to (D7's deterministic profile).
     pub fn from_cbor(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut dec = Decoder::new(bytes);
         let len = dec.array()?;
@@ -85,7 +88,12 @@ impl Envelope {
         let ts_ms = dec.u64()?;
         let body_hash = read_32(&mut dec)?;
         let body_len = dec.u32()?;
-        Ok(Self {
+        if dec.position() != bytes.len() {
+            return Err(DecodeError::message(
+                "envelope must not carry trailing bytes after its 8 fields",
+            ));
+        }
+        let envelope = Self {
             v,
             visit,
             author,
@@ -94,7 +102,19 @@ impl Envelope {
             ts_ms,
             body_hash,
             body_len,
-        })
+        };
+        // D7's deterministic profile requires shortest-form integers; rather
+        // than hand-audit minicbor's internal `type_len` table field by
+        // field, re-encode the decoded value and require a byte-for-byte
+        // match against the input. Any non-canonical encoding (e.g. `0x18
+        // 0x01` for a value that fits the direct-value form) re-encodes
+        // shorter and is caught here.
+        if envelope.to_cbor() != bytes {
+            return Err(DecodeError::message(
+                "envelope is not the canonical shortest-form CBOR encoding",
+            ));
+        }
+        Ok(envelope)
     }
 }
 
@@ -116,30 +136,144 @@ mod tests {
     use super::*;
     use rand::{Rng, RngExt};
 
+    /// minicbor's shortest-form integer width in bytes for `v`, matching the
+    /// major-type-0 branches in its own `encoder.rs`/`type_len`: 1 byte for
+    /// the direct-value range, then 2, 3, 5 and 9 byte headers as the value
+    /// grows past each width's ceiling.
+    fn cbor_uint_len(v: u64) -> usize {
+        match v {
+            0..=23 => 1,
+            24..=255 => 2,
+            256..=65535 => 3,
+            65536..=0xFFFF_FFFF => 5,
+            _ => 9,
+        }
+    }
+
+    /// Draws a `u64` uniformly from one of the five integer-width buckets
+    /// Konrad's review named ([0,23], [24,255], [256,65535],
+    /// [65536,2^32-1], [2^32,u64::MAX]), rather than uniformly over the
+    /// whole range, so every branch of minicbor's shortest-form encoding is
+    /// exercised with roughly equal probability instead of one branch
+    /// dominating 1000 draws.
+    fn random_bucketed_u64(rng: &mut impl Rng) -> u64 {
+        match rng.random_range(0..5u8) {
+            0 => rng.random_range(0..=23u64),
+            1 => rng.random_range(24..=255u64),
+            2 => rng.random_range(256..=65535u64),
+            3 => rng.random_range(65536..=u64::from(u32::MAX)),
+            _ => rng.random_range(u64::from(u32::MAX) + 1..=u64::MAX),
+        }
+    }
+
+    /// Same idea as [`random_bucketed_u64`], but for `body_len: u32`, which
+    /// only has four reachable width buckets.
+    fn random_bucketed_u32(rng: &mut impl Rng) -> u32 {
+        match rng.random_range(0..4u8) {
+            0 => rng.random_range(0..=23u32),
+            1 => rng.random_range(24..=255u32),
+            2 => rng.random_range(256..=65535u32),
+            _ => rng.random_range(65536..=u32::MAX),
+        }
+    }
+
     fn random_envelope(rng: &mut impl Rng) -> Envelope {
         Envelope {
             v: 1,
             visit: rng.random(),
             author: rng.random(),
-            seq: rng.random(),
+            seq: random_bucketed_u64(rng),
             prev: rng.random(),
-            ts_ms: rng.random(),
+            ts_ms: random_bucketed_u64(rng),
             body_hash: rng.random(),
-            body_len: rng.random(),
+            body_len: random_bucketed_u32(rng),
         }
     }
 
+    /// The fixed portion of an envelope's encoding: the 8-element array
+    /// header (1 byte) plus `v` (always `1`, 1 byte) plus the four 32 byte
+    /// strings (each a 2 byte header, since 32 > 23, plus 32 bytes of data).
+    const FIXED_ENCODING_LEN: usize = 1 + 1 + 4 * (2 + 32);
+
+    fn expected_encoding_len(e: &Envelope) -> usize {
+        FIXED_ENCODING_LEN
+            + cbor_uint_len(e.seq)
+            + cbor_uint_len(e.ts_ms)
+            + cbor_uint_len(u64::from(e.body_len))
+    }
+
     /// D7's determinism proof: a round trip over 1000 random envelopes,
-    /// decode then re-encode, asserting byte identity every time.
+    /// decode then re-encode, asserting byte identity every time. `seq`,
+    /// `ts_ms` and `body_len` are drawn from [`random_bucketed_u64`] and
+    /// [`random_bucketed_u32`] rather than uniformly, so this exercises
+    /// every one of minicbor's integer-width branches rather than almost
+    /// always taking the 9-byte branch, and the encoded length is checked
+    /// against the width each drawn value should produce.
     #[test]
     fn round_trip_1000_random_envelopes_is_byte_identical() {
         let mut rng = rand::rng();
         for _ in 0..1000 {
             let original = random_envelope(&mut rng);
             let bytes = original.to_cbor();
+            assert_eq!(bytes.len(), expected_encoding_len(&original));
             let decoded = Envelope::from_cbor(&bytes).expect("decode");
             assert_eq!(original, decoded);
             assert_eq!(bytes, decoded.to_cbor());
+        }
+    }
+
+    /// Exact width-boundary values named in Konrad's review, checked one at
+    /// a time against a fixed envelope so the resulting length change is
+    /// attributable to exactly the field under test.
+    #[test]
+    fn integer_width_boundaries_encode_to_the_expected_length() {
+        let boundaries: &[u64] = &[
+            0,
+            23,
+            24,
+            255,
+            256,
+            65535,
+            65536,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            u64::MAX,
+        ];
+        for &value in boundaries {
+            let mut e = Envelope {
+                v: 1,
+                visit: [0u8; 32],
+                author: [0u8; 32],
+                seq: value,
+                prev: [0u8; 32],
+                ts_ms: 0,
+                body_hash: [0u8; 32],
+                body_len: 0,
+            };
+            let bytes = e.to_cbor();
+            assert_eq!(
+                bytes.len(),
+                expected_encoding_len(&e),
+                "seq={value} encoded to an unexpected length"
+            );
+            e.seq = 0;
+            e.ts_ms = value;
+            let bytes = e.to_cbor();
+            assert_eq!(
+                bytes.len(),
+                expected_encoding_len(&e),
+                "ts_ms={value} encoded to an unexpected length"
+            );
+            e.ts_ms = 0;
+            if let Ok(body_len) = u32::try_from(value) {
+                e.body_len = body_len;
+                let bytes = e.to_cbor();
+                assert_eq!(
+                    bytes.len(),
+                    expected_encoding_len(&e),
+                    "body_len={value} encoded to an unexpected length"
+                );
+            }
         }
     }
 
@@ -181,5 +315,73 @@ mod tests {
         if let Ok(decoded) = Envelope::from_cbor(&bytes) {
             assert_ne!(decoded, sample);
         }
+    }
+
+    fn sample_envelope() -> Envelope {
+        Envelope {
+            v: 1,
+            visit: [1u8; 32],
+            author: [2u8; 32],
+            seq: 42,
+            prev: [3u8; 32],
+            ts_ms: 1_757_000_000_000,
+            body_hash: [4u8; 32],
+            body_len: 128,
+        }
+    }
+
+    /// Yseult's finding: a valid envelope with trailing bytes appended must
+    /// be rejected, not silently decoded while ignoring the tail.
+    #[test]
+    fn rejects_trailing_bytes_after_the_envelope() {
+        let mut bytes = sample_envelope().to_cbor();
+        bytes.extend(std::iter::repeat_n(0xFFu8, 64));
+        assert!(Envelope::from_cbor(&bytes).is_err());
+    }
+
+    /// Yseult's finding: `0x18 0x01` (a non-shortest-form encoding of `1`)
+    /// in place of the canonical single byte `0x01` for `v` must be
+    /// rejected, even though it decodes to the same value `1`.
+    #[test]
+    fn rejects_non_canonical_integer_encoding() {
+        let canonical = sample_envelope().to_cbor();
+        // Byte 0 is the array header; byte 1 is `v`'s canonical single-byte
+        // encoding of `1` (major type 0, direct value 1: `0x01`).
+        assert_eq!(canonical[1], 0x01);
+        let mut non_canonical = Vec::with_capacity(canonical.len() + 1);
+        non_canonical.push(canonical[0]);
+        non_canonical.push(0x18); // one-byte-length-follows marker
+        non_canonical.push(0x01); // the same value, 1, in non-shortest form
+        non_canonical.extend_from_slice(&canonical[2..]);
+        assert!(Envelope::from_cbor(&non_canonical).is_err());
+    }
+
+    /// Yseult's finding, and the existing `len != Some(8)` guard: an array
+    /// of the wrong length must be rejected rather than partially decoded.
+    #[test]
+    fn rejects_arrays_of_the_wrong_length() {
+        let mut bytes = sample_envelope().to_cbor();
+        // Byte 0 is the array header `0x88` (definite length 8); `0x87`
+        // claims 7 elements while the same 8 fields of data still follow.
+        assert_eq!(bytes[0], 0x88);
+        bytes[0] = 0x87;
+        assert!(Envelope::from_cbor(&bytes).is_err());
+    }
+
+    /// Yseult's finding: a byte-string length prefix must be checked
+    /// against the remaining input before any data is read, so a hostile
+    /// claim of `u64::MAX` bytes fails immediately instead of allocating or
+    /// hanging. minicbor's `read_slice` bounds-checks via `buf.get(range)`
+    /// before returning a slice, so this never allocates on the claimed
+    /// length; this test pins that behaviour at the envelope boundary.
+    #[test]
+    fn rejects_an_oversized_length_prefix_before_allocating() {
+        let mut bytes = vec![0x88u8, 0x01]; // array(8), v = 1
+        bytes.push(0x5B); // byte string, 8-byte length follows
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        // No data follows the bogus length; a correct decoder must fail
+        // fast on the bounds check rather than attempt to read or allocate
+        // `u64::MAX` bytes.
+        assert!(Envelope::from_cbor(&bytes).is_err());
     }
 }
