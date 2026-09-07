@@ -8,6 +8,14 @@ license = "MIT OR Apache-2.0"
 [lints]
 workspace = true
 
+# CBOR crate pick (D7, WO-1.2): minicbor. Reasoning and the three-way trial
+# output are in docs/dev/cbor-pick.md. cbor4ii and ciborium (the other two D7
+# candidates) also passed the trial and are deliberately not dependencies here.
 [dependencies]
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+thiserror = "2.0.20"
+blake3 = "1.8.7"
+rand = "0.10"
+minicbor = { version = "2.3.0", features = ["std"] }
 
 [dev-dependencies]
