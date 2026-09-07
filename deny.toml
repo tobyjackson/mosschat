@@ -20,6 +20,10 @@ allow = [
     "BSD-3-Clause",
     "CC0-1.0",
     "BlueOak-1.0.0",
+    # WO-1.2: needed by the quinn/rustls network stack's transitive
+    # dependencies, added after `cargo deny check licenses` named them.
+    "ISC", # ring, rustls-webpki, untrusted
+    "Unicode-3.0", # unicode-ident
 ]
 confidence-threshold = 0.8
 

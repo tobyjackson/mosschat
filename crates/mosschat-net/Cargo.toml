@@ -8,6 +8,22 @@ license = "MIT OR Apache-2.0"
 [lints]
 workspace = true
 
+# TLS crypto provider: ring, not aws-lc-rs. rcgen (dev-dependency, example
+# only) defaults to its own "ring" feature for certificate signing, so
+# pinning quinn/rustls to the same backend keeps one crypto implementation
+# in the binary instead of two, which is the spirit of invariant 9 even
+# though ring/aws-lc-rs are not literally on deny.toml's crypto-major list.
 [dependencies]
+mosschat-core = { path = "../mosschat-core" }
+quinn = { version = "0.11.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "log"] }
+rustls = { version = "0.23.44", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+blake3 = "1.8.7"
+rand = "0.10"
 
 [dev-dependencies]
+# rcgen: dev-dependency only, used by the spike example to build a
+# self-signed certificate whose key is the ed25519 identity. rcgen's
+# "ring" feature (its default) matches the crypto provider chosen above.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }

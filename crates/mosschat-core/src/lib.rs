@@ -8,6 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod error;
+pub mod event;
+pub mod identity;
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

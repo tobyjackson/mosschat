@@ -32,10 +32,19 @@ for dep in $forbidden_deps; do
 done
 
 echo "check.sh: invariant 2, every crate root has #![forbid(unsafe_code)]"
+# Every crate root: src/{lib,main}.rs, plus every example, test file and
+# src/bin entry point, each of which is its own crate root and would
+# otherwise go unchecked (issue #4, folded into WO-1.2 per Konrad's review
+# of PR #2).
 while IFS= read -r -d '' root; do
     if ! grep -q '^#!\[forbid(unsafe_code)\]' "$root"; then
         fail "invariant 2 violated: $root is missing #![forbid(unsafe_code)]"
     fi
-done < <(find crates -type f \( -name lib.rs -o -name main.rs \) -path '*/src/*' -print0)
+done < <(find crates -type f \( \
+    \( -name lib.rs -o -name main.rs \) -path '*/src/*' \
+    -o -path '*/examples/*.rs' \
+    -o -path '*/tests/*.rs' \
+    -o -path '*/src/bin/*.rs' \
+    \) -print0)
 
 echo "check.sh: all checks passed"
