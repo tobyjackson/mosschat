@@ -43,7 +43,8 @@ while IFS= read -r -d '' root; do
 done < <(find crates -type f \( \
     \( -name lib.rs -o -name main.rs \) -path '*/src/*' \
     -o -path '*/examples/*.rs' \
-    -o -path '*/tests/*.rs' \
+    -o \( -path '*/tests/*.rs' -not -path '*/tests/*/*.rs' \) \
+    -o -path '*/benches/*.rs' \
     -o -path '*/src/bin/*.rs' \
     \) -print0)
 

@@ -20,7 +20,15 @@ Source: `quinn-proto-0.11.17/src/connection/mod.rs`.
 - The new path starts unvalidated: `migrate()` sets `challenge_pending` and
   arms `Timer::PathValidation` for `now + 3 * max(pto, prev_pto)`
   (`mod.rs:3066-3069`). The old path is kept as `prev_path` so traffic has
-  somewhere to fall back to (`mod.rs:3056-3064`).
+  somewhere to fall back to (`mod.rs:3056-3064`), but only when
+  `prev.challenge.is_none()` (`mod.rs:3057`), i.e. only when that old path
+  had already finished its own validation. Two migrations in quick
+  succession, which hole punching can produce when several candidate
+  addresses arrive close together, leave the second migration's
+  `prev.challenge` still `Some` from the first; `prev_path` is then never
+  set, so `mod.rs:1199`'s validation-timeout fallback has nothing to take
+  and the connection simply stays on the unvalidated path with its
+  challenge state cleared, rather than reverting.
 - If validation doesn't complete before that timer fires, `mod.rs:1197-1203`
   reverts `self.path` to the saved `prev_path`. So "how long the peer takes
   to notice a dead path" after a migration attempt is bounded by
