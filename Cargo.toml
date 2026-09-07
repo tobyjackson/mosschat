@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/mosschat-core",
+    "crates/mosschat-net",
+    "crates/mosschat-door",
+    "crates/mosschat-tui",
+    "crates/mosschat",
+]
+
+# Invariant 1: no panics in library code. Every crate opts in with
+# `[lints] workspace = true`; see docs/dev/lints.md for the test-module
+# allow pattern that keeps `--all-targets` green on test code.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+dbg_macro = "deny"

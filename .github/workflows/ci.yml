@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # dtolnay/rust-toolchain does not read rust-toolchain.toml itself; the @stable
+      # rev and the components list below are kept in sync with that file by hand.
+      # rustup also honours rust-toolchain.toml directly for any `cargo`/`rustc`
+      # invocation in this checkout, so a drift here would still be caught locally.
+      - name: Install Rust toolchain (kept in sync with rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Run the checks
+        run: ./ci/check.sh

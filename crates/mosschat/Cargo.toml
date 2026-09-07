@@ -1,0 +1,19 @@
+[package]
+name = "mosschat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "mosschat"
+path = "src/main.rs"
+
+[dependencies]
+mosschat-core = { path = "../mosschat-core" }
+mosschat-net = { path = "../mosschat-net" }
+mosschat-door = { path = "../mosschat-door" }
+mosschat-tui = { path = "../mosschat-tui" }
