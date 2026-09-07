@@ -1,0 +1,13 @@
+{
+  "updated_at": "2026-09-07T15:32:44-0600",
+  "phase": "1",
+  "task": "Phase 1 (the gatehouse and the doorbell) started 2026-09-07. WO-1.1 (Ursula: workspace, crates, CI) is in flight as a pull request. docs/process/git.md has landed on main (Xavier).",
+  "next_step": "Xavier merges WO-1.1 after Konrad's review, then WO-1.2 (Jerome: the quinn spike, and the CBOR crate pick) can start.",
+  "blocked_on": "WO-1.1 review and merge.",
+  "where": "Repository /Users/toby/code/mosschat (GitHub tobyjackson/mosschat, branch main). Plan at ~/Unhewn/Projects/MossChat/PLAN.md, revision 3. decisions.md is the authority where the two disagree.",
+  "open_decisions": [
+    "mosschat.io registration pending (Toby, not urgent)",
+    "which CBOR crate (WO-1.2 picks)"
+  ],
+  "notes_for_next_step": "One worktree per agent under ~/code/mosschat-wt/<agent>; never share a tree. Commit messages end with Claude-Session: https://claude.ai/code/session_01JhkHdEWtjg7WVCLjek3AWV"
+}
