@@ -989,16 +989,32 @@ impl GateClient {
             record_gate_close(rec, Step::ReflectSecondary, &e, &connection);
             e
         };
-        let (mut send, mut recv) = connection
-            .open_bi()
+        // One budget of section 5's deadline for the whole exchange, for
+        // the reason `goodbye` has one (Yseult's M1 on PR 69, which named
+        // these lines too): only the reply read carried a deadline, while
+        // opening the stream and writing to it block with no deadline of
+        // their own, `write_all` on stream flow control. `doctor` calls
+        // this with no timeout of its own around it, so a gate that stops
+        // issuing `MAX_STREAM_DATA` here hangs the run exactly as it could
+        // at the goodbye.
+        let deadline = tokio::time::Instant::now() + authed::control_read_deadline();
+        let (mut send, mut recv) = tokio::time::timeout_at(deadline, connection.open_bi())
             .await
+            .map_err(|_| reflect_step(GateError::Timeout))?
             .map_err(|e| reflect_step(e.into()))?;
-        wire::write_frame(&mut send, &Frame::Reflect { v: 1 })
-            .await
-            .map_err(reflect_step)?;
-        let reply = wire::read_frame(&mut recv, authed::control_read_deadline())
-            .await
-            .map_err(reflect_step)?;
+        tokio::time::timeout_at(
+            deadline,
+            wire::write_frame(&mut send, &Frame::Reflect { v: 1 }),
+        )
+        .await
+        .map_err(|_| reflect_step(GateError::Timeout))?
+        .map_err(reflect_step)?;
+        let reply = wire::read_frame(
+            &mut recv,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await
+        .map_err(reflect_step)?;
         // Closes promptly so the gate's secondary-port handler (which waits
         // for this before dropping its own `Connection`, see `server.rs`)
         // does not sit on its bounded wait for no reason.
