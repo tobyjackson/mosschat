@@ -60,6 +60,20 @@ impl FriendStore for InMemoryFriendStore {
     }
 }
 
+/// A house's friend list read from a file is the same shape as a gate's
+/// member list, so it is the same loader (WO-1.5a): one 64 hex character
+/// ed25519 public key per line, blank lines and `#` comments ignored.
+///
+/// The two lists mean different things and this impl does not conflate
+/// them: a gate's list says who may register, a house's says whose knock
+/// it answers. What they share is the file format, and a second parser for
+/// the same format is a second set of bugs.
+impl FriendStore for crate::gate::MemberList {
+    fn is_friend(&self, key: &[u8; 32]) -> bool {
+        self.contains(key)
+    }
+}
+
 /// One outstanding invite this house issued: the hash of its secret, its
 /// expiry, and whether it has already been redeemed (single use).
 #[derive(Debug)]
@@ -322,6 +336,44 @@ mod seal {
     }
 }
 
+/// Something a [`GateClient`]'s own background reader saw, for a caller
+/// that has to act on it rather than only answer it (WO-1.5a).
+///
+/// A headless house is the caller this exists for: the client answers
+/// knocks by itself against the friend list, but only the house can print
+/// that it happened, and only the house knows what to do when the
+/// introduction that follows says a peer is about to dial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateEvent {
+    /// A knock from this key was accepted (`KnockAnswer` with `accept`).
+    KnockAccepted {
+        /// The friend that knocked, from the sealed body it opened.
+        peer_key: [u8; 32],
+    },
+    /// The gate introduced this house to a peer whose knock it accepted,
+    /// so that peer's dial is on its way. Only the responder's side is
+    /// reported: the asker already holds the outcome of its own
+    /// [`GateClient::introduce`] call.
+    Introduced {
+        /// The relay session the gate assigned.
+        session: u32,
+        /// The peer this session is with.
+        peer_key: [u8; 32],
+        /// `2`, the responder, for every event this enum reports.
+        role: u8,
+    },
+}
+
+/// How many [`GateEvent`]s the client holds for a caller that has not
+/// taken them yet.
+///
+/// Chosen, not measured: one visit produces two, and section 1 caps a
+/// registration at 8 live sessions, so 32 is several times what a house
+/// can legitimately have outstanding. A full queue drops the newest and
+/// counts it rather than blocking the reader loop, which would stop the
+/// house answering the gate at all.
+pub const GATE_EVENT_QUEUE: usize = 32;
+
 /// The outcome of a successful [`GateClient::introduce`] call.
 #[derive(Debug, Clone)]
 pub struct IntroduceOutcome {
@@ -359,6 +411,19 @@ struct Inner {
     /// discarded, so a house could learn either only out of band).
     registered_observed: std::net::SocketAddr,
     registered_secondary_port: u16,
+    /// The events a caller takes with [`GateClient::events`], and the
+    /// receiving half until it does.
+    events_tx: tokio::sync::mpsc::Sender<GateEvent>,
+    events_rx: StdMutex<Option<tokio::sync::mpsc::Receiver<GateEvent>>>,
+    /// Events dropped because nothing was taking them fast enough.
+    events_dropped: std::sync::atomic::AtomicU64,
+    /// The server half of this house's own QUIC configuration, kept so
+    /// [`GateClient::accept_peer`] can attach a peer connection's own
+    /// transport config (section 3's pinned MTU and epoch-resetting
+    /// congestion factory) to an incoming dial. The endpoint's default is
+    /// not enough: the epoch is per peer, and the peer is not known until
+    /// the address the dial arrived at is looked up.
+    server_config: quinn::ServerConfig,
     /// The diagnostics recorder for the attempt this client was opened
     /// for, if the caller gave one ([`GateClient::connect_with_recorder`]).
     /// A plain `Option` rather than something settable later: section 7's
@@ -519,6 +584,7 @@ impl GateClient {
             .map_err(|e| GateError::Protocol(e.to_string()))?;
         let quic_server = QuicServerConfig::try_from(server_tls)?;
         let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        let accept_config = server_config.clone();
 
         // Bound as IPv6 unspecified, not IPv4: `PorchSocket` (via
         // `quinn::udp::UdpSocketState`) configures this dual-stack, so one
@@ -636,9 +702,10 @@ impl GateClient {
         let reply = wire::read_frame(&mut recv, authed::control_read_deadline())
             .await
             .map_err(register_step)?;
-        let (registered_observed, registered_secondary_port) = match reply {
+        let (registered_observed, registered_secondary_port, registered_keepalive_s) = match reply {
             Frame::Registered {
                 observed,
+                keepalive_s,
                 secondary_port,
                 ..
             } => {
@@ -669,7 +736,7 @@ impl GateClient {
                     StepOutcome::Ok,
                     format!("gate saw {decoded}"),
                 );
-                (decoded, secondary_port)
+                (decoded, secondary_port, keepalive_s)
             }
             Frame::Error { code, detail, .. } => {
                 // `detail` is the gate's own text, capped at 64 bytes on
@@ -713,6 +780,7 @@ impl GateClient {
         let mut process_salt = [0u8; 5];
         rand::rng().fill(&mut process_salt);
 
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(GATE_EVENT_QUEUE);
         let inner = Arc::new(Inner {
             endpoint,
             porch,
@@ -730,6 +798,10 @@ impl GateClient {
             auto_answer_knocks: std::sync::atomic::AtomicBool::new(true),
             registered_observed,
             registered_secondary_port,
+            events_tx,
+            events_rx: StdMutex::new(Some(events_rx)),
+            events_dropped: std::sync::atomic::AtomicU64::new(0),
+            server_config: accept_config,
             recorder,
             client_config,
             sessions: StdMutex::new(HashMap::new()),
@@ -739,6 +811,18 @@ impl GateClient {
         let reader_inner = Arc::clone(&inner);
         tokio::spawn(async move {
             reader_loop(reader_inner, recv).await;
+        });
+        // Section 1: "a registration expiring 90 s after its last
+        // keepalive". Nothing sent frame 9 before WO-1.5a, which was
+        // invisible while every run was a `doctor` that finished in
+        // seconds and fatal the moment one held a visit open: at 90 s the
+        // gate deregisters this house and closes the connection, taking
+        // the relay session under the visit with it, and the record would
+        // have blamed the path.
+        let keepalive_inner = Arc::downgrade(&inner);
+        let keepalive_period = Duration::from_secs(u64::from(registered_keepalive_s.max(1)));
+        tokio::spawn(async move {
+            keepalive_loop(keepalive_inner, keepalive_period).await;
         });
 
         Ok(Self { inner })
@@ -854,6 +938,72 @@ impl GateClient {
     #[must_use]
     pub fn recorder(&self) -> Option<Recorder> {
         self.inner.recorder.clone()
+    }
+
+    /// Takes the stream of [`GateEvent`]s this client's reader produces.
+    ///
+    /// Once, deliberately: two takers would each see half the events and
+    /// neither would be wrong about it. `None` on a second call.
+    #[must_use]
+    pub fn events(&self) -> Option<tokio::sync::mpsc::Receiver<GateEvent>> {
+        self.inner.events_rx.lock_or_recover().take()
+    }
+
+    /// How many events were dropped because nothing was taking them.
+    #[must_use]
+    pub fn events_dropped(&self) -> u64 {
+        self.inner
+            .events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Accepts a peer's dial arriving on this house's own endpoint, and
+    /// returns it with the key its handshake proved (WO-1.5a).
+    ///
+    /// The mirror of [`GateClient::dial_peer`], and the responder half of
+    /// section 2 step 2. It exists because the endpoint's default server
+    /// configuration cannot carry section 3's per peer state: the
+    /// congestion epoch belongs to one peer's path table entry, and which
+    /// peer that is, is only known from the address the dial arrived at.
+    /// The porch socket rewrote that address to the peer's synthetic one
+    /// before quinn ever saw it, so the lookup is exact rather than a
+    /// guess, and a dial to an address no session was introduced to is
+    /// refused before a handshake is spent on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`GateError`] if the dial arrived at an address this
+    /// house holds no path for, the handshake fails, or the key it proves
+    /// is not one this house has a relay path to.
+    pub async fn accept_peer(
+        &self,
+        incoming: quinn::Incoming,
+    ) -> Result<([u8; 32], quinn::Connection), GateError> {
+        let synthetic = incoming.remote_address();
+        let Some(path) = self.inner.porch.path_by_synthetic(&synthetic) else {
+            incoming.refuse();
+            return Err(GateError::Protocol(
+                "a peer dialled an address no session was introduced to".into(),
+            ));
+        };
+        let mut config = self.inner.server_config.clone();
+        config.transport_config(crate::path::peer_transport_config(path.epoch()));
+        let connection = incoming.accept_with(Arc::new(config))?.await?;
+        let authed_conn = AuthedConnection::new(connection)?;
+        let peer_key = authed_conn.peer_key();
+        // The path table is what says this key was introduced to this
+        // house: `insert_relay_path` put it there when the `Introduction`
+        // arrived, so a connection whose proven key has no entry is one
+        // nobody knocked for.
+        if self.inner.porch.path_for(&peer_key).is_none() {
+            authed_conn
+                .connection()
+                .close(0u32.into(), b"no session for this key");
+            return Err(GateError::InvalidIdentity(
+                "the dialling peer's key has no relay path in this house".into(),
+            ));
+        }
+        Ok((peer_key, authed_conn.connection().clone()))
     }
 
     /// Disables this client's automatic `Knock` answering, so a test can
@@ -1427,6 +1577,41 @@ impl Inner {
     }
 }
 
+/// Sends frame 9 every `period` for as long as this house is registered.
+///
+/// Exit paths, since no task may run without one: the client is dropped
+/// (the `Weak` fails to upgrade), or the write fails, which is what a
+/// closed or lost gate connection looks like from here.
+async fn keepalive_loop(inner: std::sync::Weak<Inner>, period: Duration) {
+    loop {
+        tokio::time::sleep(period).await;
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        let mut send = inner.control_send.lock().await;
+        if wire::write_frame(&mut send, &Frame::Keepalive { v: 1 })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Hands one event to whoever took [`GateClient::events`], or counts it as
+/// dropped.
+///
+/// `try_send`, never `send`: this is called from the reader loop, and a
+/// loop that waits for a caller to read an event is a house that stops
+/// answering its gate because nobody was listening.
+fn emit_event(inner: &Arc<Inner>, event: GateEvent) {
+    if inner.events_tx.try_send(event).is_err() {
+        inner
+            .events_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
     loop {
         let frame = match wire::read_frame(&mut recv, Duration::from_secs(3600)).await {
@@ -1475,6 +1660,14 @@ async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
                             Step::RelayOpen,
                             StepOutcome::Ok,
                             format!("relay session {session}, as the responder"),
+                        );
+                        emit_event(
+                            &inner,
+                            GateEvent::Introduced {
+                                session,
+                                peer_key,
+                                role,
+                            },
                         );
                     }
                 }
@@ -1597,16 +1790,24 @@ async fn answer_knock(inner: &Arc<Inner>, tag: [u8; 32], sealed: Vec<u8>) {
             .insert(tag, body.from);
     }
 
-    let mut send = inner.control_send.lock().await;
-    let _ = wire::write_frame(
-        &mut send,
-        &Frame::KnockAnswer {
-            v: 1,
-            tag,
-            accept: true,
+    {
+        let mut send = inner.control_send.lock().await;
+        let _ = wire::write_frame(
+            &mut send,
+            &Frame::KnockAnswer {
+                v: 1,
+                tag,
+                accept: true,
+            },
+        )
+        .await;
+    }
+    emit_event(
+        inner,
+        GateEvent::KnockAccepted {
+            peer_key: body.from,
         },
-    )
-    .await;
+    );
 }
 
 /// Verifies `msg` was signed by `signer_key` under `sig`, delegating to

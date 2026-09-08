@@ -1,9 +1,10 @@
 //! The mosschat binary: one artefact, three roles (D1). Plain `mosschat` starts the
-//! house if needed and attaches the terminal client; `mosschat --headless` runs the
-//! house alone so a machine can stay home with no window open; the same binary can also
-//! run the gatehouse role for a community. The house and client roles land in later work
-//! orders; `gatehouse` (WO-1.3a) is the first role wired here, and `doctor` (WO-1.4b,
-//! `docs/dev/gatehouse-design.md` section 7) the first command.
+//! house if needed and attaches the terminal client; `mosschat house --headless` runs
+//! the house alone so a machine can stay home with no window open; the same binary can
+//! also run the gatehouse role for a community. The client role lands in a later work
+//! order; `gatehouse` (WO-1.3a) was the first role wired here, `doctor` (WO-1.4b,
+//! `docs/dev/gatehouse-design.md` section 7) the first command, and `house`
+//! (WO-1.5a) the callee those measurements need.
 
 #![forbid(unsafe_code)]
 
@@ -24,10 +25,16 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("house") => {
+            if let Err(err) = run_house(args) {
+                eprintln!("mosschat house: error: {err}");
+                std::process::exit(1);
+            }
+        }
         _ => {
             println!(
-                "mosschat: workspace scaffold; the `gatehouse` role (WO-1.3a) and `doctor` \
-                 (WO-1.4b) are wired up"
+                "mosschat: workspace scaffold; the `gatehouse` role (WO-1.3a), `house \
+                 --headless` (WO-1.5a) and `doctor` (WO-1.4b) are wired up"
             );
         }
     }
@@ -182,6 +189,161 @@ async fn serve_gatehouse(args: GatehouseArgs) -> Result<(), Box<dyn std::error::
         tokio::signal::ctrl_c().await?;
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------------
+// `mosschat house --headless` (WO-1.5a, gatehouse design sections 2 and 4)
+// ----------------------------------------------------------------------
+
+/// What `house` was asked to run.
+struct HouseArgs {
+    gate: String,
+    community: [u8; 32],
+    gate_key: Option<[u8; 32]>,
+    friends: PathBuf,
+    identity_seed: [u8; 32],
+    no_punch: bool,
+}
+
+impl HouseArgs {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut gate = None;
+        let mut community = None;
+        let mut gate_key = None;
+        let mut friends = None;
+        let mut identity_seed = None;
+        let mut headless = false;
+        let mut no_punch = false;
+        let mut identity_arg_given = false;
+        let mut identity_file_given = false;
+        let mut it = args;
+        while let Some(flag) = it.next() {
+            let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
+            match flag.as_str() {
+                "--headless" => headless = true,
+                "--gate" => gate = Some(value()?),
+                "--community" => community = Some(decode_hex32(&value()?)?),
+                "--gate-key" => gate_key = Some(decode_hex32(&value()?)?),
+                "--friends" => friends = Some(PathBuf::from(value()?)),
+                // The same rule as the gatehouse and doctor roles: a seed
+                // on the command line is visible to any local user through
+                // `ps`, so the file form is the preferred one (Yseult
+                // finding 9).
+                "--identity" => {
+                    identity_arg_given = true;
+                    identity_seed = Some(decode_hex32(&value()?)?);
+                }
+                "--identity-file" => {
+                    identity_file_given = true;
+                    let path = value()?;
+                    let contents = std::fs::read_to_string(&path)
+                        .map_err(|e| format!("reading --identity-file {path:?}: {e}"))?;
+                    identity_seed = Some(decode_hex32(contents.trim())?);
+                }
+                "--no-punch" => no_punch = true,
+                other => return Err(format!("unknown flag {other}")),
+            }
+        }
+        if identity_arg_given && identity_file_given {
+            return Err("--identity and --identity-file are mutually exclusive".into());
+        }
+        if !headless {
+            // There is no terminal client yet (D1's third role), so the
+            // only house this binary can run is the headless one, and a
+            // flag that is silently optional today would silently change
+            // meaning the day the client lands.
+            return Err(
+                "--headless is required: the terminal client role is a later work order".into(),
+            );
+        }
+        Ok(Self {
+            gate: gate.ok_or("--gate <host:port> is required")?,
+            community: community.ok_or("--community <64 hex chars> is required")?,
+            gate_key,
+            friends: friends
+                .ok_or("--friends <path> is required: one 64 hex character public key per line")?,
+            identity_seed: identity_seed
+                .ok_or("--identity-file <path> is required: a house keeps one identity")?,
+            no_punch,
+        })
+    }
+}
+
+fn run_house(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
+    let parsed = HouseArgs::parse(args)?;
+    let gate = resolve_one(&parsed.gate)?;
+    // The same loader as the gate's member list: one 64 hex character
+    // ed25519 public key per line, blank lines and `#` comments ignored
+    // (`MemberList::load`). A house's list means something different from
+    // a gate's, whose knock it answers rather than who may register, but
+    // the file format is the same and a second parser for it would be a
+    // second set of bugs.
+    let friends = std::sync::Arc::new(mosschat_net::gate::MemberList::load(&parsed.friends)?);
+    // Section 7's location rules, the same directory `doctor` writes to,
+    // so a two-machine run's two sides are read the same way. A house that
+    // cannot resolve one still runs and still prints; it writes no record.
+    let diagnostics = mosschat_net::diag::host_diagnostics_dir().ok();
+    if diagnostics.is_none() {
+        eprintln!(
+            "mosschat house: no diagnostics directory could be resolved, so this run writes \
+             no records; its stdout is the only account of what happened"
+        );
+    }
+
+    let config = mosschat_net::house::HouseConfig {
+        identity_seed: parsed.identity_seed,
+        community: parsed.community,
+        gate,
+        gate_key: parsed.gate_key,
+        friends,
+        no_punch: parsed.no_punch,
+        diagnostics,
+    };
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        mosschat_net::house::run(
+            config,
+            mosschat_net::house::print_events(),
+            shutdown_signal(),
+        )
+        .await
+    })?;
+    Ok(())
+}
+
+/// Completes on `SIGTERM` or Ctrl-C, which is what ends a headless house.
+///
+/// Both, not one: a person stops it with Ctrl-C and a service manager
+/// stops it with `SIGTERM`, and a house that ignores the second is one
+/// that gets `SIGKILL`ed a few seconds later with its registration still
+/// seated at the gate and its friends still probing a path that is gone.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
+                // A process that cannot install the handler still stops on
+                // Ctrl-C; pending here leaves that arm to win rather than
+                // completing at once and shutting the house down on start.
+                Err(e) => {
+                    eprintln!("mosschat house: SIGTERM handler could not be installed: {e}");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = terminate => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -560,6 +722,11 @@ async fn run_doctor_steps(
         candidates,
         peer_observed: client.peer_observed_for(session),
         peer_discovered: Vec::new(),
+        // WO-1.5a's hold and its `--no-punch` are the next order's; this
+        // run is the one-shot `doctor --friend` has always been.
+        hold: mosschat_net::punch::Hold::UntilAttemptSettles,
+        no_punch: false,
+        events: None,
         recorder: Some(recorder.clone()),
     };
     let porch = client.porch();

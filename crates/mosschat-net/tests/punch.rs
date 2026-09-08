@@ -259,9 +259,9 @@ mod punch {
     /// in process.
     ///
     /// Deliberate break to fail this test: in `punch.rs::run_doorbell`,
-    /// change `if live_misses >= LIVE_PROBES_TO_STALE` to `if false`. The
-    /// upgrade and the relayed phases still pass; the fall-back assertion
-    /// times out with the path still `Direct`.
+    /// delete the `LivenessChange::WentStale` arm's `fall_back_to_relay`
+    /// call. The upgrade and the relayed phases still pass; the fall-back
+    /// assertion times out with the path still `Direct`.
     #[tokio::test]
     async fn the_doorbell_starts_relayed_upgrades_on_proof_and_falls_back_when_the_path_dies() {
         let community = random_seed();
@@ -417,6 +417,9 @@ mod punch {
                         candidates,
                         peer_observed: bob.peer_observed_for(outcome.session),
                         peer_discovered: Vec::new(),
+                        hold: mosschat_net::punch::Hold::UntilAttemptSettles,
+                        no_punch: false,
+                        events: None,
                         recorder: None,
                     },
                     &bob_control,
@@ -442,6 +445,9 @@ mod punch {
                         candidates,
                         peer_observed: alice.peer_observed_for(outcome.session),
                         peer_discovered: Vec::new(),
+                        hold: mosschat_net::punch::Hold::UntilAttemptSettles,
+                        no_punch: false,
+                        events: None,
                         recorder: Some(alice_recorder_for_task),
                     },
                     &alice_control,
@@ -754,6 +760,9 @@ mod punch {
                         candidates,
                         peer_observed: ninth.peer_observed_for(outcome.session),
                         peer_discovered: Vec::new(),
+                        hold: mosschat_net::punch::Hold::UntilAttemptSettles,
+                        no_punch: false,
+                        events: None,
                         recorder: None,
                     },
                     &ninth_control,
@@ -778,6 +787,9 @@ mod punch {
                         candidates,
                         peer_observed: alice.peer_observed_for(outcome.session),
                         peer_discovered: Vec::new(),
+                        hold: mosschat_net::punch::Hold::UntilAttemptSettles,
+                        no_punch: false,
+                        events: None,
                         recorder: None,
                     },
                     &alice_control,

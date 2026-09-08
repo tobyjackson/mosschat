@@ -70,7 +70,7 @@ opaque `Relay` payloads.
 | 13 | `Relay` (datagram, not a frame) | `[0x01][session: u32 BE][payload]`, payload cap 1200 bytes | H to G and G to H | Every packet of a relayed peer connection. |
 | 14 | `Knock` | `v: u8`, `tag: bytes[32]`, `ttl_s: u16`, `sealed: bytes` | G to H | The gate matched an `Introduce` tag against this registration and forwarded its `sealed` verbatim. It names no key and no address. |
 | 15 | `KnockAnswer` | `v: u8`, `tag: bytes[32]`, `accept: bool` | H to G | Reply to 14, decided by the receiving house alone. Decline and timeout look the same to the asker. |
-| 16 | `Candidates` | `v: u8`, `attempt: bytes[16]`, `addrs: [Addr]` cap 16, `probe_half: bytes[32]` | both ways | First frame each way on the porch stream. |
+| 16 | `Candidates` | `v: u8`, `attempt: bytes[16]`, `addrs: [Addr]` cap 16, `probe_half: bytes[32]`, `no_upgrade: bool` | both ways | First frame each way on the porch stream. `no_upgrade` (amendment 4) says this side will not probe this attempt, so neither side waits on a start signal nobody will ask for. |
 | 17 | `PathUp` | `v: u8`, `attempt: bytes[16]`, `addr: Addr`, `rtt_us: u32` | both ways | The sender has moved its outbound traffic for this peer to `addr`. |
 | 18 | `PathDown` | `v: u8`, `attempt: bytes[16]`, `addr: Addr`, `reason: u8` | both ways | The sender has moved back to the relay. |
 | 19 | `Goodbye` | `v: u8`, `reason: u8` | both ways | Clean exit, so the peer goes straight to dead without passing through stale (section 4). |
@@ -189,7 +189,10 @@ itself, fall back on failure. Nothing waits on a hole punch.
  the Phase 1 target is a first relayed packet under 1 second, knock included.
 3. **Exchange.** `Candidates` each way on the porch stream, inside the sealed connection, so the gate sees candidate
  lists as ciphertext. Each side contributes 32 random bytes and both derive `probe_key = BLAKE3("mosschat-probe-v1"
- || attempt || half_initiator || half_responder)`.
+ || attempt || half_initiator || half_responder)`. The frame also carries `no_upgrade` (amendment 4): a side that has
+ been told not to punch says so here, before the start signal, and a side that reads it skips steps 4 to 6 and records
+ `punch_disabled` rather than waiting out a start that was never requested. The lists are still exchanged both ways, so
+ both records still show what would have been probed.
 4. **Start.** Either side sends `StartRequest`; the gate sends `Start` to both back to back with `fire_in_ms = 200`,
  and each fires 200 ms after receiving it. No clock is synchronised: the skew is the difference in the two one way
  delays from the gate, tens of milliseconds, and research B only needs both first packets inside the same few
@@ -530,3 +533,69 @@ rather than a share of it, so one `doctor` run costs one connection on each port
 one key gets 8 reflections a minute. `Register`'s own bucket is not that bound and never was, its bucket being on the
 primary port while a key that never registers can reach the reflection port regardless; before this amendment the
 secondary port had no per-key connection limit at all.
+
+**Amendment 4, 2026-09-08: what a held visit adds** (WO-1.5a, Konrad). Nothing above described a visit that is still open a
+minute later, because nothing could run one: `doctor --friend` is one-shot and always the caller, and no role stayed running and
+answered a knock. WO-1.5 asks for RTT median and p95, recovery after a 60 second drop, and case (f)'s detection and fall-back
+times, and every one of those is a property of a visit under way. Five changes, each stated where it touches this design.
+
+- **Section 1's keepalive is now sent.** A registration expires 90 s after its last keepalive and nothing sent frame 9, which was
+  invisible while every run finished in seconds and fatal the moment one held a visit open: at 90 s the gate deregisters the
+  house and closes the connection, taking the relay session under the visit with it. The gate client now sends frame 9 every
+  `Registered.keepalive_s` for as long as it is registered.
+- **Section 4 is driven by `live.rs` on every visit.** The doorbell's own monitor counted misses beside `PeerLiveness` rather
+  than through it, so a visit reached the fall-back but never stale, dead or the goodbye. It now drives `PeerLiveness` with
+  `Activity::Visit`, which is the same policy this section already specifies; the numbers did not change.
+- **A fall-back is mutual.** This section says `PathUp` and `PathDown` describe the sender's own choice and say nothing about
+  whether this house can still reach it. That is true of liveness and false of reachability: section 3's porch socket drops a
+  datagram whose source is in no peer's candidate table, so a peer that has fallen back can no longer receive anything sent to
+  its direct address either. A `PathDown` naming the current attempt therefore moves this house back to the relay too. Without
+  it an asymmetric fall-back leaves the porch stream one way and the rerun that follows never completes, which is a real defect
+  this order found and fixed rather than a preference.
+- **A rerun is the initiator's to start, and supersedes the attempt it replaces.** Section 2 step 7 reruns gathering, exchange
+  and probing with a fresh attempt id on the same porch stream. Both sides detect a dead path, but only role 1 writes the next
+  `Candidates`; role 2 falls back and waits for it, because two sides opening an attempt at once would put two `Candidates`
+  frames on one stream with no rule for which is the attempt. A path a rerun supersedes is dropped, which is section 4's own
+  `dead` reached by its second route rather than by the grace elapsing, and the record says so in those words. Recovery is
+  bounded by this section's own budget of 4 `StartRequest`s per session: past it a visit stays relayed and its record says which
+  step ran out.
+- **Section 7's record gains four fields and one reason.** `events[]`, one entry per visit event (`visit_open`, `upgraded`,
+  `path_stale`, `path_dead`, `fell_back`, `recovered`, `goodbye`) with the same `at_ms` clock `steps[]` uses, because two of
+  section 4's transitions are both `path_lost` and a reader cannot tell them apart in a step list that names the same step three
+  times; and `rtt_median_us`, `rtt_p95_us`, `rtt_samples` and `rtt_source`, the round trip over the hold, sampled once a second
+  from the probe pongs on a direct path and from `Connection::rtt()` on a relayed one, which is the only end to end number a
+  relayed visit has. Both lists are capped at 512 entries, because a house holds one attempt open for the length of a visit.
+  The new reason is `punch_disabled`, for a run told not to probe (`--no-punch`, WO-1.5 case (e)): `probe_timeout` and
+  `no_candidates` name failures that did not happen, and `internal` is this design's catch-all for a failure it cannot name,
+  which is the opposite of a path taken on purpose. A record written before this amendment still reads: every new field is
+  optional on the way in.
+
+**Amendment 4, continued: what review changed in it** (Yseult and Wystan on PRs 79 and 80, same day). Six corrections, each
+against the bullet above it that was wrong or thin.
+
+- **`--no-punch` is on the wire**, as frame 16's `no_upgrade` above. It was local to the side that held the flag, so the peer
+  waited out the 10 second start window for a `Start` nobody had asked for and recorded `start_signal` failed and `internal`
+  as its reason: a failure that did not happen, in the field this amendment exists to make trustworthy. WO-1.5 case (e) puts
+  the flag on the caller alone, so this was the row's ordinary shape rather than an edge.
+- **Gathering does rerun**, as step 7 says. The rerun re-offered the list the caller gathered before the path died, which
+  cannot contain the address a machine has after a local address change, so case (f)'s recovery was structurally unreachable.
+  A rerun now offers the union of that list and a fresh gather, keeping what only the caller knew and adding what only this
+  moment knows. The 1 second interface poll section 4 specifies is still not implemented: a rerun picks up a new address
+  because the path died, which in case (f) is the same event.
+- **The reason a held visit ends with describes what happened, not which timer won.** A hold shorter than section 2 step 5's
+  ten second give-up ended before anything had set a reason, and the fall-through said `path_idle_timeout`, whose own
+  definition is a path that was had and lost. A visit that never upgraded now reports what the give-up branch would have
+  reported (`no_candidates`, or section 7's probe-failure inference), and `path_idle_timeout` is reserved for a visit that
+  actually had a direct path.
+- **A house holds at most 8 visits, and at most 2 from one peer.** One relay session carries as many end to end connections
+  as its peer opens, so the gate's cap on sessions bounded nothing here: an accepted friend could spawn a task, a record and
+  a stdout line per connection. Past either cap the dial is refused, the connection closed, and a `refused` event printed,
+  which is a tenth name in the event vocabulary above and stdout only, a refused dial having no attempt and so no record.
+  The same event says when an introduction never arrived and how many gate events had to be dropped, which was silent.
+- **`Hold::For` is clamped at a day**, and `doctor` refuses a longer `--hold` at the command line before any network work. An
+  unbounded value overflowed the deadline arithmetic and panicked after the visit was already open, in a crate that forbids
+  panics, or degraded into "hold forever" through a `checked_add` that quietly returned `None`.
+- **Text from off the machine is capped and stripped before it reaches a house's stdout**, the same two rules the gate's own
+  text already gets: a peer's QUIC close reason is bytes it chose, and it reached an operator's log through a visit that
+  ended before it opened. The `goodbye` event is also stamped when the frame is sent rather than after its acknowledgement,
+  which inflated it by up to a second in exactly the case a reader correlates two logs for: a peer that had already gone.
