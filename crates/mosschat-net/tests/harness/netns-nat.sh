@@ -193,7 +193,7 @@ apply_nft_snat() {
     if [ "$MODE" = "eim" ]; then
         rule="ip saddr ${subnet} oifname \"${out_if}\" masquerade"
     else
-        rule="ip saddr ${subnet} oifname \"${out_if}\" snat to ${out_ip}:1024-65535 random"
+        rule="ip saddr ${subnet} oifname \"${out_if}\" meta l4proto { tcp, udp } snat to ${out_ip}:1024-65535 random"
     fi
     local ruleset
     ruleset=$(cat <<EOF
