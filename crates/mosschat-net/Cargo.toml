@@ -67,6 +67,13 @@ time = { version = "0.3.55", default-features = false, features = ["formatting",
 # transitively (rcgen, x509-parser) at the same 1.0.229.
 serde_json = "1.0"
 
+[dev-dependencies]
+# `test-util`'s paused clock only, for `path::tests::a_full_house_queue_drains_at_the_house_rate`
+# (issue #71): cargo unifies this with the `[dependencies]` entry above for
+# this crate's own test and bench builds, so it never reaches a consumer of
+# the library, only `cargo test`/`cargo bench` here.
+tokio = { version = "1.53.1", features = ["test-util"] }
+
 [[bench]]
 name = "porch_socket"
 harness = false
