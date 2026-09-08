@@ -46,7 +46,7 @@ use tokio::io::Interest;
 use crate::gate::limits::{INBOUND_PROBE_QUEUE_CAP, INBOUND_RELAY_QUEUE_CAP};
 use crate::gate::wire::{decode_relay, encode_relay};
 use crate::lockext::LockExt;
-use crate::path::{PathEntry, PathTable, RelayShaper, ShaperStats};
+use crate::path::{Enqueued, PathEntry, PathTable, RelayShaper, ShaperStats};
 use crate::punch::{PROBE_LEN, Probe, is_probe};
 
 /// Builds the stable synthetic address for `peer_key` (section 3): `fd`, 5
@@ -82,10 +82,78 @@ pub(crate) fn unmap_v4(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+/// A handle to one connection's entry in the live gate-address set
+/// (section 3). Returned by [`PorchSocket::allow_source`] and given back
+/// to [`PorchSocket::forget_source`], so a connection can only withdraw
+/// what it itself added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceLease(u64);
+
+/// The live gate-address set of section 3: "a packet is matched against
+/// the union of the live sets", one set per live connection.
+///
+/// **Why the union is refcounted rather than recomputed.** Section 3's
+/// check runs on every received datagram against reversing condition (b)'s
+/// 20 microsecond budget, so the membership question has to stay one hash
+/// lookup; walking every connection's set per packet would make it linear
+/// in connections. `refcounts` is that union, maintained as a multiset,
+/// and `by_lease` records what each connection put into it so a close can
+/// take back exactly its own contributions.
+///
+/// **What this fixes** (Yseult's latent gap): this used to be a single
+/// `HashSet` with an unconditional `forget_source`, so two live
+/// connections on one address, which a gate naming a `secondary_port`
+/// equal to its primary port produces, collapsed into one entry and the
+/// first close blinded the survivor.
+#[derive(Debug, Default)]
+struct AllowedSources {
+    by_lease: HashMap<u64, Vec<SocketAddr>>,
+    refcounts: HashMap<SocketAddr, usize>,
+}
+
+impl AllowedSources {
+    /// Adds `addr` to `lease`'s set and to the union.
+    fn allow(&mut self, lease: SourceLease, addr: SocketAddr) {
+        self.by_lease.entry(lease.0).or_default().push(addr);
+        *self.refcounts.entry(addr).or_insert(0) += 1;
+    }
+
+    /// Drops `lease`'s whole set, taking each of its addresses out of the
+    /// union only when no other live connection still holds it.
+    fn forget(&mut self, lease: SourceLease) {
+        let Some(addrs) = self.by_lease.remove(&lease.0) else {
+            return;
+        };
+        for addr in addrs {
+            if let Some(count) = self.refcounts.get_mut(&addr) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.refcounts.remove(&addr);
+                }
+            }
+        }
+    }
+
+    /// Whether any live connection's set holds `addr`.
+    fn contains(&self, addr: &SocketAddr) -> bool {
+        self.refcounts.contains_key(addr)
+    }
+
+    /// How many addresses the union holds, for tests.
+    #[cfg(test)]
+    fn union_len(&self) -> usize {
+        self.refcounts.len()
+    }
+}
+
 struct RelayRoutes {
     /// The gate control connection whose `Relay` datagrams carry this
     /// socket's peer traffic. WO-1.3a supports exactly one gate at a time.
     gate: Option<quinn::Connection>,
+    /// The gate connection's own entry in the live gate-address set, so
+    /// its close withdraws exactly that connection's address and not an
+    /// address another live connection still needs.
+    gate_lease: Option<SourceLease>,
     by_synthetic: HashMap<SocketAddr, u32>,
     by_session: HashMap<u32, SocketAddr>,
     /// Synthetic peer addresses whose shaper already has a drain task, so
@@ -151,7 +219,9 @@ pub struct PorchSocket {
     /// The real source addresses whose QUIC packets may reach quinn
     /// unchanged: the gate addresses this house itself dialled. See
     /// [`PorchSocket::allow_source`].
-    allowed_sources: Mutex<HashSet<SocketAddr>>,
+    allowed_sources: Mutex<AllowedSources>,
+    /// Source of the next [`SourceLease`] id.
+    next_source_lease: AtomicU64,
     /// Whether section 3's drop rule is in force.
     ///
     /// Set by [`PorchSocket::arm`] and by [`PorchSocket::attach_gate`], and
@@ -229,6 +299,7 @@ impl PorchSocket {
             local_is_ipv6,
             relay: Mutex::new(RelayRoutes {
                 gate: None,
+                gate_lease: None,
                 by_synthetic: HashMap::new(),
                 by_session: HashMap::new(),
                 drained: HashSet::new(),
@@ -240,7 +311,8 @@ impl PorchSocket {
             probes_unauthenticated: AtomicU64::new(0),
             inbound_probes_dropped: AtomicU64::new(0),
             probe_waker: Mutex::new(None),
-            allowed_sources: Mutex::new(HashSet::new()),
+            allowed_sources: Mutex::new(AllowedSources::default()),
+            next_source_lease: AtomicU64::new(0),
             armed: std::sync::atomic::AtomicBool::new(false),
             unknown_source_dropped: AtomicU64::new(0),
             waker: Mutex::new(None),
@@ -272,7 +344,7 @@ impl PorchSocket {
     /// or a host that took it over, was still shown to quinn.
     pub fn attach_gate(self: &Arc<Self>, gate: quinn::Connection) {
         let gate_addr = gate.remote_address();
-        self.allow_source(gate_addr);
+        let gate_lease = self.allow_source(gate_addr);
         self.arm();
         // Sessions registered before a gate was attached have a shaper
         // queue but no drain task, since there was nothing to drain onto;
@@ -281,6 +353,7 @@ impl PorchSocket {
         let undrained: Vec<SocketAddr> = {
             let mut routes = self.relay.lock_or_recover();
             routes.gate = Some(gate.clone());
+            routes.gate_lease = Some(gate_lease);
             routes
                 .by_synthetic
                 .keys()
@@ -326,14 +399,27 @@ impl PorchSocket {
     /// Section 3's rule is a check on the packet and not a lifetime, and
     /// the set stays armed: an emptied set fails closed.
     pub fn detach_gate(&self, gate_addr: SocketAddr) {
-        self.forget_source(&gate_addr);
-        let mut routes = self.relay.lock_or_recover();
-        if routes
-            .gate
-            .as_ref()
-            .is_some_and(|gate| gate.remote_address() == gate_addr)
-        {
+        let lease = {
+            let mut routes = self.relay.lock_or_recover();
+            if routes
+                .gate
+                .as_ref()
+                .is_none_or(|gate| gate.remote_address() != gate_addr)
+            {
+                return;
+            }
             routes.gate = None;
+            // Every drain task for this gate exits with it, so the
+            // bookkeeping that stops a second one being started must be
+            // cleared too: without this, a later `attach_gate` on the same
+            // socket would leave those queues with no drainer at all, and a
+            // queue that fills and never empties parks `poll_writable`
+            // forever, which is issue #19's own shape (Konrad's finding 1).
+            routes.drained.clear();
+            routes.gate_lease.take()
+        };
+        if let Some(lease) = lease {
+            self.forget_source(lease);
         }
     }
 
@@ -580,18 +666,27 @@ impl PorchSocket {
     /// property the rule exists for, since a stranger's address is one the
     /// house never dialled and never proved, while letting the two gate
     /// connections work. Recorded as a design gap in the pull request.
-    pub fn allow_source(&self, addr: SocketAddr) {
+    /// Returns the lease that connection must give back to
+    /// [`PorchSocket::forget_source`] when it closes; one call, one live
+    /// set, so two connections on one address are two entries and the
+    /// first close leaves the second's packets admitted.
+    pub fn allow_source(&self, addr: SocketAddr) -> SourceLease {
+        let lease = SourceLease(self.next_source_lease.fetch_add(1, Ordering::Relaxed));
         self.allowed_sources
             .lock_or_recover()
-            .insert(unmap_v4(addr));
+            .allow(lease, unmap_v4(addr));
+        lease
     }
 
-    /// Withdraws an address added by [`PorchSocket::allow_source`], for a
-    /// short-lived connection such as a `Reflect` that has finished.
-    pub fn forget_source(&self, addr: &SocketAddr) {
-        self.allowed_sources
-            .lock_or_recover()
-            .remove(&unmap_v4(*addr));
+    /// Withdraws one connection's set, for a short-lived connection such
+    /// as a `Reflect` that has finished.
+    ///
+    /// It takes the lease rather than an address on purpose: an address is
+    /// not a connection, and withdrawing by address withdrew it for
+    /// everyone. An address another live connection still holds stays in
+    /// the union.
+    pub fn forget_source(&self, lease: SourceLease) {
+        self.allowed_sources.lock_or_recover().forget(lease);
     }
 
     /// The number of inbound QUIC segments dropped for arriving from an
@@ -1101,10 +1196,16 @@ impl AsyncUdpSocket for PorchSocket {
                     "no path table entry for a registered relay session",
                 ));
             };
-            if shaper.try_enqueue_all(payloads) {
-                return Ok(());
-            }
-            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            return match shaper.try_enqueue_all(payloads) {
+                Enqueued::Accepted => Ok(()),
+                // The last resort: a `WouldBlock` here clears write
+                // readiness endpoint-wide, so `poll_writable` going
+                // `Pending` above is what should have caught this.
+                Enqueued::Full => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                // Not transient, so not `WouldBlock`: retrying a queue
+                // whose session has ended would spin.
+                Enqueued::Closed => Err(io::Error::other("relay session closed")),
+            };
         }
         self.note_relay_intent(None);
         self.udp.try_io(Interest::WRITABLE, || {
@@ -1342,11 +1443,10 @@ mod tests {
     /// asserts both halves: dropped (the slot is emptied and the buffer
     /// count excludes it) and counted (`unknown_source_dropped`).
     ///
-    /// Deliberate break to fail this test: delete the
-    /// `this.detach_gate(gate_addr)` call from `attach_gate`'s reader task
-    /// and the body of `detach_gate`. The address then stays admissible for
-    /// the life of the process, the packet is kept, and both assertions
-    /// below fail.
+    /// Deliberate break to fail this test: make `AllowedSources::forget` a
+    /// no-op, which is what an address staying admissible after its
+    /// connection closed looks like. The packet is then kept and both
+    /// assertions below fail.
     #[test]
     fn a_datagram_from_a_closed_gate_connections_address_is_dropped_and_counted() {
         let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1357,7 +1457,7 @@ mod tests {
 
         // Registration: the address enters the live set and the rule is
         // armed.
-        socket.allow_source(gate_addr);
+        let lease = socket.allow_source(gate_addr);
         socket.arm();
         assert!(socket.is_source_allowed(gate_addr));
 
@@ -1377,9 +1477,12 @@ mod tests {
         assert_eq!(meta[0].len, 64);
         assert_eq!(socket.unknown_source_dropped(), 0);
 
-        // The connection closes: this is what `attach_gate`'s reader task
-        // runs on its way out.
-        socket.detach_gate(gate_addr);
+        // The connection closes. `detach_gate`, which `attach_gate`'s
+        // reader task runs on its way out, hands back exactly this
+        // connection's lease; that a real close reaches it is asserted in
+        // `gate::a_closed_gate_connections_address_leaves_the_live_set`,
+        // which has a real gate connection to close.
+        socket.forget_source(lease);
         assert!(!socket.is_source_allowed(gate_addr));
 
         meta[0] = RecvMeta {
@@ -1400,6 +1503,76 @@ mod tests {
             1,
             "and it is counted, never silently discarded"
         );
+    }
+
+    /// Section 3's live gate-address set is "the union of the live sets",
+    /// one per connection, so two connections on one address are two
+    /// entries and closing the first leaves the second's packets admitted.
+    ///
+    /// This is the shape a gate naming a `secondary_port` equal to its
+    /// primary port produces: `reflect` dials the same address the
+    /// registration is already on, and its short connection closing used to
+    /// withdraw the address the live registration still needed.
+    ///
+    /// Deliberate break to fail this test: in `AllowedSources::forget`,
+    /// replace the refcount decrement with an unconditional
+    /// `self.refcounts.remove(&addr);`, which is the single-set behaviour
+    /// this replaced. The first close then blinds the survivor and the
+    /// middle assertion fails.
+    #[test]
+    fn one_connection_closing_does_not_withdraw_an_address_another_still_holds() {
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let socket = PorchSocket::new(std_socket).unwrap();
+        let shared: SocketAddr = "203.0.113.12:4433".parse().unwrap();
+        socket.arm();
+
+        // Two live connections, one address: the registration and a
+        // `Reflect` whose secondary port is the primary port.
+        let registration = socket.allow_source(shared);
+        let reflect = socket.allow_source(shared);
+        assert_eq!(
+            socket.allowed_sources.lock_or_recover().union_len(),
+            1,
+            "the union holds one address, however many connections named it"
+        );
+
+        let admitted = |socket: &Arc<PorchSocket>| {
+            let mut storage = [0x40u8; 32];
+            let mut bufs = [IoSliceMut::new(&mut storage)];
+            let mut meta = [RecvMeta {
+                addr: shared,
+                len: 32,
+                stride: 32,
+                ecn: None,
+                dst_ip: None,
+            }];
+            socket.demultiplex(&mut bufs, &mut meta, 1) == 1
+        };
+
+        assert!(admitted(&socket));
+
+        // The reflect connection closes. The registration is still live, so
+        // its packets must still be admitted.
+        socket.forget_source(reflect);
+        assert!(socket.is_source_allowed(shared));
+        assert!(
+            admitted(&socket),
+            "closing one connection must not blind the other"
+        );
+        assert_eq!(socket.unknown_source_dropped(), 0);
+
+        // The registration closes too, and now nothing holds the address.
+        socket.forget_source(registration);
+        assert!(!socket.is_source_allowed(shared));
+        assert!(!admitted(&socket));
+        assert_eq!(socket.unknown_source_dropped(), 1);
+        assert_eq!(socket.allowed_sources.lock_or_recover().union_len(), 0);
+
+        // Handing back a lease twice takes nothing extra out of the union.
+        socket.forget_source(registration);
+        assert_eq!(socket.allowed_sources.lock_or_recover().union_len(), 0);
     }
 
     /// A waker that counts how many times it was woken, for the
@@ -1742,15 +1915,15 @@ mod tests {
             let socket = porch();
             let gate: SocketAddr = "203.0.113.1:4433".parse().unwrap();
             let stranger: SocketAddr = "203.0.113.99:4433".parse().unwrap();
-            socket.allow_source(gate);
+            let lease = socket.allow_source(gate);
             socket.arm();
             assert!(socket.is_armed());
 
             // The exact shape of the hole: a gate naming a `secondary_port`
             // equal to its primary port would have `reflect` withdraw the
             // only allowed address when that short connection closed.
-            socket.forget_source(&gate);
-            assert!(socket.allowed_sources.lock_or_recover().is_empty());
+            socket.forget_source(lease);
+            assert_eq!(socket.allowed_sources.lock_or_recover().union_len(), 0);
             assert!(socket.is_armed(), "nothing clears the armed flag");
 
             let mut storage = [0xC3u8; 40];
@@ -1807,7 +1980,7 @@ mod tests {
             socket.arm();
             let dialled: SocketAddr = "203.0.113.1:4433".parse().unwrap();
             let stranger: SocketAddr = "203.0.113.99:4433".parse().unwrap();
-            socket.allow_source(dialled);
+            let lease = socket.allow_source(dialled);
 
             for (source, expected_len) in [(dialled, 40usize), (stranger, 0usize)] {
                 let mut storage = [0xC3u8; 40];
@@ -1828,7 +2001,7 @@ mod tests {
             // it back outside the rule, and emptying the allow-list
             // altogether does not reopen it: the rule is keyed on the armed
             // flag, not on the set being non-empty.
-            socket.forget_source(&dialled);
+            socket.forget_source(lease);
             let mut storage = [0xC3u8; 40];
             let mut bufs = [IoSliceMut::new(&mut storage)];
             let mut meta = [RecvMeta {

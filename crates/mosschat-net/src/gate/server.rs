@@ -20,7 +20,7 @@ use crate::authed::{self, AuthedConnection};
 use crate::gate::wire::{self, Addr, Frame, decode_relay, encode_relay};
 use crate::gate::{ErrorCode, GateError, MemberList, RateLimiter, limits};
 use crate::lockext::LockExt;
-use crate::path::{RelayShaper, ShaperStats};
+use crate::path::{Enqueued, RelayShaper, ShaperStats};
 
 /// Counters a test (or an operator) can read back from a running gate.
 #[derive(Debug, Default)]
@@ -1245,11 +1245,18 @@ fn forward_relay(state: &Arc<ServerState>, session: u32, sender_key: [u8; 32], p
     // Section 1: unable to push back on unreliable datagrams, the gate
     // drops the newest and counts it, but only when full. 0 for a shaping
     // house; the abuse cap in the open otherwise.
-    if !shaper.enqueue_or_drop(encoded) {
-        state
-            .counters
-            .relay_dropped_at_full
-            .fetch_add(1, Ordering::Relaxed);
+    match shaper.enqueue_or_drop(encoded) {
+        Enqueued::Accepted => {}
+        Enqueued::Full => {
+            state
+                .counters
+                .relay_dropped_at_full
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // The session ended between the lookup above and this call. Not an
+        // overflow, so not counted as one: `relay_dropped_at_full` names a
+        // full queue and nothing else (Konrad's finding 2).
+        Enqueued::Closed => {}
     }
 }
 

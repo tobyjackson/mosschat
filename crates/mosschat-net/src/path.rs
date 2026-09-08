@@ -340,6 +340,22 @@ impl ShaperStats {
     }
 }
 
+/// What a shaper did with a datagram offered to it.
+///
+/// A bool cannot say this: "full" and "closed" are different events with
+/// different counters and different answers to quinn, and returning one
+/// value for both made a session teardown race count as
+/// `relay_dropped_at_full`, a number CI asserts is 0 (Konrad's finding 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enqueued {
+    /// Queued, and it will leave at the rate.
+    Accepted,
+    /// The queue was already at its depth.
+    Full,
+    /// This direction has ended; there is nothing to queue onto.
+    Closed,
+}
+
 #[derive(Debug)]
 struct ShaperState {
     items: VecDeque<(Instant, Vec<u8>)>,
@@ -473,19 +489,19 @@ impl RelayShaper {
     /// buffers it and re-polls), so a half-queued one would go out twice.
     /// A refusal counts [`ShaperStats::relay_socket_backpressure`] once,
     /// however many segments it carried.
-    pub fn try_enqueue_all(&self, payloads: Vec<Vec<u8>>) -> bool {
+    pub fn try_enqueue_all(&self, payloads: Vec<Vec<u8>>) -> Enqueued {
         if payloads.is_empty() {
-            return true;
+            return Enqueued::Accepted;
         }
         let now = Instant::now();
         let mut state = self.inner.state.lock_or_recover();
         if state.closed {
-            return false;
+            return Enqueued::Closed;
         }
         if state.items.len().saturating_add(payloads.len()) > self.inner.depth {
             drop(state);
             self.inner.backpressure.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return Enqueued::Full;
         }
         let count = payloads.len() as u64;
         for payload in payloads {
@@ -494,7 +510,7 @@ impl RelayShaper {
         drop(state);
         self.inner.queued.fetch_add(count, Ordering::Relaxed);
         self.inner.arrivals.notify_one();
-        true
+        Enqueued::Accepted
     }
 
     /// Queues one datagram, dropping this newest arrival and counting it in
@@ -508,25 +524,25 @@ impl RelayShaper {
     /// issue #19.
     ///
     /// Returns `false` if the datagram was dropped.
-    pub fn enqueue_or_drop(&self, payload: Vec<u8>) -> bool {
+    pub fn enqueue_or_drop(&self, payload: Vec<u8>) -> Enqueued {
         let now = Instant::now();
         let mut state = self.inner.state.lock_or_recover();
         if state.closed {
             // Not a drop at full: the session this direction belonged to
             // has ended, and counting that as an overflow would put a
             // number in a diagnostics record that names the wrong cause.
-            return false;
+            return Enqueued::Closed;
         }
         if state.items.len() >= self.inner.depth {
             drop(state);
             self.inner.dropped_at_full.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return Enqueued::Full;
         }
         state.items.push_back((now, payload));
         drop(state);
         self.inner.queued.fetch_add(1, Ordering::Relaxed);
         self.inner.arrivals.notify_one();
-        true
+        Enqueued::Accepted
     }
 
     /// Whether there is room for `wanted` more datagrams, registering
@@ -548,15 +564,19 @@ impl RelayShaper {
     /// drain landing in between wakes it rather than being missed.
     pub fn poll_room(&self, wanted: usize, waker: &Waker) -> bool {
         let mut state = self.inner.state.lock_or_recover();
-        let room =
-            |state: &ShaperState| state.items.len().saturating_add(wanted) <= self.inner.depth;
-        if state.closed || room(&state) {
+        if state.closed || state.items.len().saturating_add(wanted) <= self.inner.depth {
             return true;
         }
+        // The lock is held across the check and the registration, so
+        // nothing can free room in between and a second look could only
+        // return false (Konrad's nit 4). A closed queue answers true and
+        // lets the caller find out from `try_enqueue_all`, which reports
+        // `Closed` rather than `Full`, so a close cannot spin the retry
+        // loop.
         if !state.wakers.iter().any(|w| w.will_wake(waker)) {
             state.wakers.push(waker.clone());
         }
-        room(&state)
+        false
     }
 
     /// Waits until this direction's rate allows one or more queued
@@ -943,10 +963,15 @@ mod tests {
         assert_eq!(shaper.depth(), HOUSE_RELAY_QUEUE_DEPTH);
         for index in 0..HOUSE_RELAY_QUEUE_DEPTH {
             let payload = vec![u8::try_from(index % 256).unwrap_or(0)];
-            assert!(shaper.try_enqueue_all(vec![payload]), "queue {index}");
+            assert_eq!(
+                shaper.try_enqueue_all(vec![payload]),
+                Enqueued::Accepted,
+                "queue {index}"
+            );
         }
-        assert!(
-            !shaper.try_enqueue_all(vec![vec![0xFF]]),
+        assert_eq!(
+            shaper.try_enqueue_all(vec![vec![0xFF]]),
+            Enqueued::Full,
             "a full house queue refuses the transmit"
         );
         assert_eq!(shaper.stats().relay_socket_backpressure, 1);
@@ -1005,12 +1030,17 @@ mod tests {
         assert_eq!(shaper.depth(), GATE_RELAY_QUEUE_DEPTH);
         for index in 0..GATE_RELAY_QUEUE_DEPTH {
             let payload = vec![u8::try_from(index % 256).unwrap_or(0)];
-            assert!(shaper.enqueue_or_drop(payload), "queue {index}");
+            assert_eq!(
+                shaper.enqueue_or_drop(payload),
+                Enqueued::Accepted,
+                "queue {index}"
+            );
         }
         let overflow = 8;
         for _ in 0..overflow {
-            assert!(
-                !shaper.enqueue_or_drop(vec![0xFF]),
+            assert_eq!(
+                shaper.enqueue_or_drop(vec![0xFF]),
+                Enqueued::Full,
                 "past the depth the newest is dropped"
             );
         }
@@ -1059,7 +1089,10 @@ mod tests {
         let shaper = RelayShaper::gate();
         assert!(shaper.poll_room(1, &waker), "an empty queue has room");
         for index in 0..GATE_RELAY_QUEUE_DEPTH {
-            assert!(shaper.enqueue_or_drop(vec![u8::try_from(index % 256).unwrap_or(0)]));
+            assert_eq!(
+                shaper.enqueue_or_drop(vec![u8::try_from(index % 256).unwrap_or(0)]),
+                Enqueued::Accepted
+            );
         }
         assert!(!shaper.poll_room(1, &waker), "a full queue has no room");
         assert_eq!(counter.0.load(Ordering::SeqCst), 0);
@@ -1077,9 +1110,16 @@ mod tests {
         let shaper = RelayShaper::house();
         shaper.close();
         assert!(shaper.drain().await.is_none());
-        assert!(
-            !shaper.try_enqueue_all(vec![vec![1]]),
-            "a closed queue takes nothing more"
+        assert_eq!(
+            shaper.try_enqueue_all(vec![vec![1]]),
+            Enqueued::Closed,
+            "a closed queue reports closed, never a drop at full"
+        );
+        assert_eq!(shaper.enqueue_or_drop(vec![1]), Enqueued::Closed);
+        assert_eq!(
+            shaper.stats().relay_dropped_at_full,
+            0,
+            "a teardown is not an overflow"
         );
     }
 
