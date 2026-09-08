@@ -25,16 +25,21 @@ framing as a house but holding no recordings, no store and no friends. Three inv
 
 Identity is proven once in the TLS handshake (section 5); no frame carries a public key as a claim about its sender.
 
-**Who may register, and the slot table.** The gate holds a member list, a file of ed25519 public keys written by
-whoever runs the gate, read at start and on `SIGHUP` so a member can be added without dropping live registrations; a
-handshake whose proven key is not on it is refused `gate_refused_not_member` and closed before a slot is touched. The
-alternative, a signed community-membership proof carried by the registrant, is right for a gate whose operator cannot
-enumerate its community, and is not slice one: it needs a community signing key, issuance and revocation, none of
-which exist. A list matches what decision 30 assumes, a gate run by the founder who knows the community. The table is
-`min(256, members)` entries, never evicted across keys, since evicting one member to seat another is a denial of
-service a member could drive; a longer member list is a configuration error refused at start, not at 3am. Within one
-key, 2 connections, a third evicting that key's oldest by last keepalive so a house whose mapping died can come back.
-A registration expires 90 s after its last keepalive, three times the firewall assumption.
+**Who may register, and the slot table.** The gate holds a member list, a file of ed25519 public keys written by whoever
+runs the gate, read at start and on `SIGHUP` so a member can be added without dropping live registrations; a handshake
+whose proven key is not on it is refused `gate_refused_not_member` and closed before a slot is touched. The alternative,
+a signed community-membership proof carried by the registrant, is right for a gate whose operator cannot enumerate its
+community, and is not slice one: it needs a community signing key, issuance and revocation, none of which exist. A list
+matches what decision 30 assumes, a gate run by the founder who knows the community. The table is `min(256, members)`
+entries, never evicted across keys, since evicting one member to seat another is a denial of service a member could
+drive; a longer member list is a configuration error refused at start, not at 3am. Within one key the sub-cap is 2 live
+connections: a third is refused in the handshake with `gate_at_capacity` and closed, the two already seated untouched. A
+new connection never displaces an existing one, silently or at all: a house evicted without being told would believe it
+is registered while its knocks went nowhere. One whose mapping died comes back through expiry instead, a registration
+expiring 90 s after its last keepalive, three times the firewall assumption, and `Goodbye` deregistering at once. Both
+checks run as soon as the handshake completes, before the gate awaits any stream, so a refusal holds no slot and no
+state, and the secondary port runs them too, serving `Reflect` to members alone. Sessions die with their registration,
+by goodbye, expiry or lost connection, so the 8 sessions per registration below is a live cap, not a lifetime one.
 
 **Framing.** Control frames ride one bidirectional QUIC stream opened right after the handshake, each a 4 byte
 big-endian length then a deterministic CBOR array whose first element is the frame type (D7). Relayed packets ride
@@ -87,26 +92,28 @@ record says `relay_stream_fallback`; DERP relays over TCP, so a reliable floor i
 **Caps and rate limits, per frame.** All chosen, none measured. Over a rate limit the gate answers
 `Error{gate_rate_limited}` and keeps the registration; over a hard cap it closes. Any control frame: 64 KiB length
 prefix checked before allocating, 32 frames per second per connection with burst 64. `Register`: one per connection, a
-second is a protocol error, and 4 connection attempts per key per minute. `Reflect`: one per connection is the
-intended use, 2 per minute. `Introduce`: `ttl_s` 60 and `sealed` 512 bytes, 6 per minute with burst 6 and 60 per hour
-per registrant. `StartRequest`: 4 per session, then ignored. `Keepalive`: one per `keepalive_s`, 3 per second
-tolerated. `Error`: `detail` 64 bytes. `Relay`: payload 1200 bytes, longer dropped and counted, 2000 datagrams and 3
-MiB/s per session each way, 2 GiB per session per hour then `cap_exceeded`. `Knock`: one per matched `Introduce`,
-`sealed` forwarded verbatim and never opened. `KnockAnswer`: one per outstanding knock, later ones ignored, bounded by
-the `Introduce` limit that caused it. `Candidates`: 16 addresses, once per attempt. Whole gate: 256 registrations, 2
-connections per key, 8 live sessions per registration. 256 is 30 people with a few devices each at 8x headroom and
-bounds memory at a few hundred KiB; 8 sessions is more friends than one person talks to at once; 2 GiB per hour bounds
-the bill on a rented box.
+second is a protocol error, and 4 connection attempts per key per minute. `Reflect`: one per connection is the intended
+use, 2 per minute. `Introduce`: `ttl_s` 60 and `sealed` 512 bytes, 6 per minute with burst 6 and 60 per hour per
+registrant. `StartRequest`: 4 per session, then ignored. `Keepalive`: one per `keepalive_s`, 3 per second tolerated.
+`Error`: `detail` 64 bytes. `Relay`: payload 1200 bytes, longer dropped and counted, 2000 datagrams and 3 MiB/s per
+session each way, 2 GiB per session per hour then `cap_exceeded`. `Knock`: one per matched `Introduce`, `sealed`
+forwarded verbatim and never opened. `KnockAnswer`: one per outstanding knock, later ones ignored, bounded by the
+`Introduce` limit that caused it. `Candidates`: 16 addresses, once per attempt. Whole gate: 256 registrations, 2 live
+connections per key with a third refused, 8 live sessions per registration. 256 is 30 people with a few devices each at
+8x headroom and bounds memory at a few hundred KiB; 8 sessions is more friends than one person talks to at once; 2 GiB
+per hour bounds the bill on a rented box.
 
 **Pair tag** = `BLAKE3("mosschat-gate-pair-v1" || community || min(kA,kB) || max(kA,kB))`, keys compared as byte
 strings. Only someone holding both public keys can compute it, so a stranger who knows a house's key cannot
 manufacture an introduction to it, and no key crosses the gate in the clear.
 
-**Introduction is by request, never by standing list.** House A sends `Introduce` with the tag for B and a `sealed`
-body only B can open. The gate walks its registrations computing A's tag against each registered key, at most 256
-BLAKE3 hashes over 96 bytes, and on a match forwards a `Knock` carrying that body verbatim; on no match it does
-nothing at all. B answers accept or decline; the gate introduces both sides only on accept, and a decline, no answer
-inside `ttl_s` and no match are one silence.
+**Introduction is by request, never by standing list.** House A sends `Introduce` with the tag for B and a `sealed` body
+only B can open. The gate walks its registrations computing A's tag against each registered key, at most 256 BLAKE3
+hashes over 96 bytes, and on a match forwards a `Knock` carrying that body verbatim; on no match it does nothing at all.
+B answers accept or decline; the gate introduces both sides only on accept, and a decline, no answer inside `ttl_s` and
+no match are one silence. The gate takes that answer only from the registration it knocked, matched on that connection's
+proven key and not on the tag alone, since any member holding both keys can compute the same tag and could otherwise
+accept or cancel another house's knock.
 
 **`sealed`, so the gate learns nothing but the fact of an ask.** An ephemeral X25519 public key, then ChaCha20-Poly1305
 over a small CBOR body under `BLAKE3::derive_key("mosschat-introduce-seal-v1", dh || eph_pub || kB)`, the DH being A's
@@ -126,14 +133,18 @@ useless at another gate, being over the identity key of the gate A handshook wit
 otherwise mount by carrying A's blob elsewhere. Freshness at that same gate is B's job, and it covers every seal, friend
 and invite alike, a friend body proving only that A once sealed to B so that one captured `Introduce` would otherwise
 replay forever: every body carries `sent_ms`, B opens one only within 120 s of its own clock, wide enough for skew, and
-holds `BLAKE3(sealed)` cut to 16 bytes for every seal it opens until that window ends. A repeat is dropped in silence.
-Eviction is by expiry alone, swept on insert, since dropping a live entry would reopen the window. The cap is 4096
-entries, above the 3072 the gate's own 6 per minute limit can deliver across 256 registrants in one window, so a full
-set means the gate broke its rate and B refuses knocks rather than evicting; 4096 * (16 byte hash + 8 byte expiry) =
-98304 bytes, under 256 KiB with the map around it. The invite gains an `expires_ms` of its own, default 7 days. A cannot
-bind to a gate session id instead: none exists when A builds the blob, and only the gate being defended against could
-supply one. Redemption stays WO-4.1's: the approval where the inviter sees a key and a name runs inside the end to end
-tunnel, and only on approve do both sides add each other and mark the invite used.
+holds `BLAKE3(sealed)` cut to 16 bytes until that window ends. The entry is inserted only after the seal opens and the
+body verifies as a friend or as an invite proof, which is the accept decision itself, never on receipt and never on an
+open alone (issue #16): B's public key is public, so anyone holding it can mint a seal that opens, and charging the set
+on opening lets a stranger fill it at whatever rate the gate forwards knocks. The later insert loses nothing: a seal
+dropped in silence costs nothing to drop again. A repeat is dropped in silence. Eviction is by expiry alone, swept on
+insert, since dropping a live entry would reopen the window. The cap is 4096 entries, above the 3072 knocks the gate's
+own 6 per minute limit can deliver across 256 registrants in one window, now a bound on knocks offered and not on
+entries made, so a full set still means the gate broke its rate and B refuses knocks rather than evicting; 4096 * (16
+byte hash + 8 byte expiry) = 98304 bytes, under 256 KiB with the map around it. The invite gains an `expires_ms` of its
+own, default 7 days. A cannot bind to a gate session id instead: none exists when A builds the blob, and only the gate
+being defended against could supply one. Redemption stays WO-4.1's: the approval where the inviter sees a key and a name
+runs inside the end to end tunnel, and only on approve do both sides add each other and mark the invite used.
 
 **What the gate learns**, plainly: that two of its registrants attempted contact, and when, held for the life of that
 session. It never receives a friend list, never learns how many friends a house has, never sees a name or an invite,
@@ -260,16 +271,24 @@ making quinn reject any first byte with 0x40 clear. The probe's first byte 0x2A 
 no valid QUIC first byte either way, and at 81 bytes it is below any legal QUIC datagram anyway
 (`quinn-proto/src/endpoint.rs:203-206`).
 
-The filter lives in the porch socket's `poll_recv` and must split by segment, not by buffer: quinn-udp
-opportunistically enables UDP GRO on Linux (`quinn-udp/src/unix.rs:128-129`) and `RecvMeta::stride` documents that one
-buffer may hold several datagrams with the last shorter (`quinn-udp/src/lib.rs:100-110`), so a probe can arrive
-coalesced behind QUIC. The socket walks each buffer in `stride` increments, removes probe segments, repacks the rest,
-and if a whole batch was probes it loops and re-polls rather than returning `Ok(0)`, which quinn's driver would treat
-as progress (`quinn/src/endpoint.rs:793-835`). The send side is the mirror: quinn sets `Transmit::segment_size` to
-`Some(n)` whenever it wrote more than one datagram into the buffer (`quinn-proto/src/connection/mod.rs:1004-1006`,
+The filter lives in the porch socket's `poll_recv` and must split by segment, not by buffer: quinn-udp opportunistically
+enables UDP GRO on Linux (`quinn-udp/src/unix.rs:128-129`) and `RecvMeta::stride` documents that one buffer may hold
+several datagrams with the last shorter (`quinn-udp/src/lib.rs:100-110`), so a probe can arrive coalesced behind QUIC.
+The socket walks each buffer in `stride` increments, removes probe segments, repacks the rest, and if a whole batch was
+probes it loops and re-polls rather than returning `Ok(0)`, which quinn's driver would treat as progress
+(`quinn/src/endpoint.rs:793-835`). The queue of inbound relayed payloads is bounded at 1024 datagrams, 1.2 MiB at the
+1200 byte cap, the newest dropped and counted above it, since unbounded it hands a session peer the recipient's memory,
+and one `poll_recv` draws from it and the real socket in the same call rather than draining either first, so relay
+traffic cannot starve the gate connection carrying it. The send side is the mirror: quinn sets `Transmit::segment_size`
+to `Some(n)` whenever it wrote more than one datagram into the buffer (`quinn-proto/src/connection/mod.rs:1004-1006`,
 through `quinn/src/lib.rs:106-113`), and each segment is its own inner QUIC packet needing its own 5 byte `Relay`
-header, so `poll_send` splits on `segment_size` before wrapping and relays each separately, while a direct path passes
-the batch through untouched with GSO intact. Its test sits beside the GRO one.
+header. The splitting rule, written out because the failure is silent and GSO batching is on by default on Linux and on
+macOS (`quinn-udp/src/unix.rs`), making a multi-segment transmit ordinary: `segment_size: None` relays `contents` as one
+`Relay` payload; `segment_size: Some(n)` relays `contents.chunks(n)`, one `Relay` datagram per chunk, in order, the last
+shorter than `n` whenever `n` does not divide the length; never the whole buffer as one payload. So 3600 bytes with
+`Some(1200)` leaves as three `Relay` datagrams of 1205 bytes, not one 3605 byte payload, which `encode_relay` refuses
+against the 1200 byte cap. A direct path passes the batch through untouched with GSO intact. Its test sits beside the
+GRO one.
 
 **Reversing condition**, either one flips the decision: (a) one probe delivered into quinn or one QUIC packet eaten by
 the filter on any of the three platforms; (b) the porch socket adds more than 20 microseconds at the median per
@@ -332,18 +351,19 @@ cleared and adds no crypto backend.
 
 **The chain is exactly one self-signed certificate.** Both verifiers, each pinning the other side, reject unless
 `intermediates` is empty, the SPKI algorithm is id-Ed25519, the SPKI key is 32 bytes, issuer equals subject, and the
-certificate's signature verifies under its own SPKI key. Today intermediates are ignored, not rejected, carrying an
-unverified input for no reason: the ticket pins a key, so a chain adds nothing. The check is made twice, in the
-verifier where it fails closed with a TLS alert mid-handshake, and again as the length check in
-`AuthedConnection::new`.
+certificate's signature verifies under its own SPKI key, that check and every application signature against `peer_key`
+going through `mosschat-core`'s strict verification (`verify_strict`), which rejects low-order keys that plain `verify`
+accepts. Today intermediates are ignored, not rejected, carrying an unverified input for no reason: the ticket pins a
+key, so a chain adds nothing. The check is made twice, in the verifier where it fails closed with a TLS alert
+mid-handshake, and again as the length check in `AuthedConnection::new`.
 
 **Recorded as a decision, not an oversight** (Yseult finding 6): validity dates and server name are deliberately not
-checked. There is no certificate authority and no clock we trust; the certificate carries a key pinned out of band,
-its lifetime is the process, and rotating it does not rotate the identity. A module doc says so in those words so the
-next reader does not "fix" it. Also from that review: every read on the control and porch streams carries a deadline
-(`tokio::time::timeout`), 10 s for a frame that should follow immediately and 30 s of porch idle; every length prefix
-is checked against its cap before allocation (invariant 4); and the identity seed is held in a `Zeroizing` wrapper
-wherever it is persisted or copied.
+checked. There is no certificate authority and no clock we trust; the certificate carries a key pinned out of band, its
+lifetime is the process, and rotating it does not rotate the identity. A module doc says so in those words so the next
+reader does not "fix" it. Also from that review: every read on the control and porch streams carries a deadline
+(`tokio::time::timeout`), 10 s for a frame that should follow immediately and 30 s of porch idle; every length prefix is
+checked against its cap before allocation (invariant 4); and the identity seed is held in a `Zeroizing` wrapper wherever
+it is persisted or copied, read from a file 0600 on Unix, never a command line argument where `ps` would publish it.
 
 ## 6. Same-network discovery
 
