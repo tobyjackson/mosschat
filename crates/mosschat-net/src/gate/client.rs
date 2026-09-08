@@ -364,11 +364,22 @@ struct Inner {
     /// A `Start` naming anything else is ignored (Yseult's Medium): the
     /// gate supplies the session id, so `entry(session).or_default()` on
     /// every `Start` let a hostile gate walk session ids and grow this map
-    /// without bound. Bounded by
-    /// [`limits::MAX_SESSIONS_PER_REGISTRATION`], which is the gate's own
-    /// cap on how many a registration may hold, with each session's
-    /// `peer_observed` beside it.
-    sessions: StdMutex<HashMap<u32, std::net::SocketAddr>>,
+    /// without bound.
+    ///
+    /// **Bounded, and it lets go** (Konrad's new must). The cap is
+    /// [`limits::MAX_SESSIONS_PER_REGISTRATION`], the gate's own cap on how
+    /// many a registration may hold, and it is a *live* cap in section 1's
+    /// words, not a lifetime one. Refusing the newest arrival at the cap,
+    /// as this used to, made it a lifetime cap here: nothing removed an
+    /// entry, so the ninth introduction in a process lifetime had its
+    /// `Start` dropped and that peer stayed relayed forever with nothing
+    /// said. Entries now end three ways: when the attempt for them ends
+    /// ([`GateClient::attempt_finished`]), when they pass
+    /// [`limits::REGISTRATION_TTL`], which is when the gate would have
+    /// expired the registration they hang off, and by eviction when the cap
+    /// is reached, oldest finished first and oldest outright if none has
+    /// finished, so the newest is never the one refused.
+    sessions: StdMutex<HashMap<u32, SessionEntry>>,
     starts: StdMutex<HashMap<u32, StartSlot>>,
 }
 
@@ -393,6 +404,15 @@ pub struct StartSignal {
 /// did not ask for it gets round to waiting, so an arrival with no waiter
 /// is kept rather than dropped; otherwise the responder would wait out its
 /// whole timeout for a frame it had already been sent.
+/// One session this house holds: the peer's gate-observed address, when it
+/// was opened, and whether the doorbell attempt for it has finished.
+#[derive(Debug, Clone, Copy)]
+struct SessionEntry {
+    peer_observed: std::net::SocketAddr,
+    opened_at: std::time::Instant,
+    finished: bool,
+}
+
 #[derive(Default)]
 struct StartSlot {
     received: Option<StartSignal>,
@@ -484,6 +504,10 @@ impl GateClient {
         // allowed explicitly, and before the dial rather than after, since
         // the handshake's own packets come back from it.
         porch.allow_source(primary_addr);
+        // Armed here, before the dial, so the rule covers the handshake
+        // too and `arm`'s doc is true of the code (Konrad's item 2:
+        // `attach_gate` alone left it off until the handshake completed).
+        porch.arm();
         let connecting = endpoint.connect(primary_addr, "gate")?;
         let connection = connecting.await?;
         let authed_conn = AuthedConnection::new(connection)?;
@@ -565,7 +589,27 @@ impl GateClient {
     /// range a peer may name as a candidate.
     #[must_use]
     pub fn peer_observed_for(&self, session: u32) -> Option<std::net::SocketAddr> {
-        self.inner.sessions.lock_or_recover().get(&session).copied()
+        self.inner
+            .sessions
+            .lock_or_recover()
+            .get(&session)
+            .map(|entry| entry.peer_observed)
+    }
+
+    /// Marks `session`'s doorbell attempt as over, so its entry is the
+    /// first evicted when room is needed, and drops any `Start` slot still
+    /// held for it. Called by [`crate::punch::run_doorbell`] on every exit.
+    pub fn attempt_finished(&self, session: u32) {
+        if let Some(entry) = self.inner.sessions.lock_or_recover().get_mut(&session) {
+            entry.finished = true;
+        }
+        self.inner.starts.lock_or_recover().remove(&session);
+    }
+
+    /// How many sessions this house currently holds, for tests.
+    #[must_use]
+    pub fn held_sessions(&self) -> usize {
+        self.inner.sessions.lock_or_recover().len()
     }
 
     /// How many `Start` slots are outstanding, for tests: a slot exists
@@ -819,18 +863,52 @@ pub fn pair_tag(community: &[u8; 32], a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 }
 
 impl Inner {
-    /// Records a session this house holds, bounded by the gate's own cap on
-    /// sessions per registration.
+    /// Records a session this house holds, making room for it rather than
+    /// refusing it. See [`Inner::sessions`].
     fn remember_session(&self, session: u32, peer_observed: Option<std::net::SocketAddr>) {
-        let mut sessions = self.sessions.lock_or_recover();
-        if sessions.len() >= limits::MAX_SESSIONS_PER_REGISTRATION
-            && !sessions.contains_key(&session)
-        {
+        let Some(peer_observed) = peer_observed else {
             return;
+        };
+        let now = std::time::Instant::now();
+        let mut sessions = self.sessions.lock_or_recover();
+
+        // A session dies with the registration it hangs off, and the gate
+        // expires a registration `REGISTRATION_TTL` after its last
+        // keepalive, so anything older than that is already gone at the
+        // gate whatever this map still says. Swept on insert, which is the
+        // only moment the size matters.
+        sessions.retain(|_, entry| now.duration_since(entry.opened_at) < limits::REGISTRATION_TTL);
+
+        if !sessions.contains_key(&session) {
+            while sessions.len() >= limits::MAX_SESSIONS_PER_REGISTRATION {
+                // Oldest finished first, since its attempt is over and
+                // nothing is waiting on its `Start`; oldest outright if none
+                // has finished, because refusing the newest is the bug this
+                // replaces and the gate's own cap means a house never
+                // legitimately holds more than this many live.
+                let victim = sessions
+                    .iter()
+                    .filter(|(_, entry)| entry.finished)
+                    .min_by_key(|(_, entry)| entry.opened_at)
+                    .or_else(|| sessions.iter().min_by_key(|(_, entry)| entry.opened_at))
+                    .map(|(id, _)| *id);
+                match victim {
+                    Some(id) => {
+                        sessions.remove(&id);
+                    }
+                    None => break,
+                }
+            }
         }
-        if let Some(peer_observed) = peer_observed {
-            sessions.insert(session, peer_observed);
-        }
+
+        sessions.insert(
+            session,
+            SessionEntry {
+                peer_observed,
+                opened_at: now,
+                finished: false,
+            },
+        );
     }
 }
 

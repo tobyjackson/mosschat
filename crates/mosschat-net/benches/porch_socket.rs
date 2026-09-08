@@ -7,7 +7,7 @@
 //! median" (`Instant`, sorting, no statistics library).
 //!
 //! Run: `cargo bench -p mosschat-net --bench porch_socket`. The committed
-//! run's output lives at `docs/measurements/2026-09-07-porch-socket-bench.txt`.
+//! run's output lives at `docs/measurements/2026-09-08-porch-socket-bench.txt`.
 
 #![forbid(unsafe_code)]
 

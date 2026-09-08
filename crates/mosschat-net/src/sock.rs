@@ -72,7 +72,7 @@ pub fn synthetic_addr(process_salt: [u8; 5], peer_key: &[u8; 32]) -> SocketAddr 
 /// is plain IPv4. Both forms name one host and port, so both must compare
 /// equal wherever a source address is matched against a known one.
 #[must_use]
-fn unmap_v4(addr: SocketAddr) -> SocketAddr {
+pub(crate) fn unmap_v4(addr: SocketAddr) -> SocketAddr {
     match addr.ip() {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),

@@ -1,0 +1,14 @@
+Run 2026-09-08 05:31 MDT, `cargo bench -p mosschat-net --bench porch_socket`.
+
+Supersedes 2026-09-07-porch-socket-bench.txt, which measured a porch socket
+with the drop rule unarmed, an empty allow-list and an empty path table: that
+configuration short-circuits both receive-path lookups, so it timed the wrong
+thing (Konrad's should 3 on PR #29). The bench now arms the rule, allows the
+sender's address the way a house allows its gate's, and puts one peer on a
+proved direct path, so `classify_source` does the allow-list hit with a
+non-empty path table behind it.
+
+plain tokio socket recv median: 22.834µs (2000 iterations)
+porch socket recv median:       15.375µs (2000 iterations)
+delta (porch - plain):           -7 microseconds
+reversing condition (b) [held]: porch socket adds no more than 20 microseconds at the median

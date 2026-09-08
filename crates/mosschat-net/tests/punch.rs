@@ -485,6 +485,220 @@ mod punch {
         let _ = tokio::time::timeout(Duration::from_secs(20), bob_doorbell).await;
     }
 
+    /// Konrad's new must: the session map is a *live* cap, not a lifetime
+    /// one. It was insert-only and refused the newest arrival at eight, so
+    /// the ninth introduction in one process had its `Start` dropped and
+    /// that peer stayed relayed forever with nothing said. The ninth peer
+    /// here does the whole doorbell and must reach a direct path.
+    ///
+    /// The first eight peers say goodbye after their introduction, which is
+    /// what frees their sessions at the gate; nothing freed them in the
+    /// house, which is the bug. None of them ran an attempt, so none is
+    /// marked finished, and the ninth only gets in because eviction falls
+    /// back to the oldest outright rather than refusing the newest.
+    ///
+    /// Deliberate break to fail this test: in `Inner::remember_session`,
+    /// replace the eviction `while` loop with
+    /// `if sessions.len() >= limits::MAX_SESSIONS_PER_REGISTRATION
+    /// && !sessions.contains_key(&session) { return; }`, which is what it
+    /// used to do. The ninth peer then never upgrades and the wait for its
+    /// direct path times out.
+    #[tokio::test]
+    async fn the_ninth_introduction_in_one_process_still_upgrades() {
+        let community = random_seed();
+        let alice_seed = random_seed();
+        let alice_key = public_key_of(&alice_seed);
+        let peer_seeds: Vec<[u8; 32]> = (0..9).map(|_| random_seed()).collect();
+        let peer_keys: Vec<[u8; 32]> = peer_seeds.iter().map(public_key_of).collect();
+
+        let mut members = vec![alice_key];
+        members.extend(peer_keys.iter().copied());
+        let gate = GateServer::bind(GateServerConfig {
+            community,
+            identity_seed: random_seed(),
+            members: MemberList::from_keys(members),
+            primary_bind: "127.0.0.1:0".parse().unwrap(),
+            secondary_bind: "127.0.0.1:0".parse().unwrap(),
+            max_registrations: 256,
+        })
+        .unwrap();
+
+        let alice_friends = Arc::new(InMemoryFriendStore::new());
+        for key in &peer_keys {
+            alice_friends.add(*key);
+        }
+        let alice = Arc::new(
+            GateClient::connect(
+                gate.primary_addr(),
+                alice_seed,
+                community,
+                None,
+                Arc::clone(&alice_friends) as Arc<InMemoryFriendStore>,
+                Arc::new(InMemoryInviteStore::new()),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let connect_peer = async |seed: [u8; 32]| {
+            let friends = Arc::new(InMemoryFriendStore::new());
+            friends.add(alice_key);
+            GateClient::connect(
+                gate.primary_addr(),
+                seed,
+                community,
+                None,
+                friends,
+                Arc::new(InMemoryInviteStore::new()),
+            )
+            .await
+            .unwrap()
+        };
+
+        // Eight peers come and go. Each one *introduces to alice*, rather
+        // than alice to it: `Introduce` is 6 per minute per registrant
+        // (section 1), so nine asks from one house in one process is not
+        // something the gate allows, while nine asks from nine houses is
+        // ordinary. Alice therefore fills her map through the responder
+        // path, which is the one Konrad cited. Each peer then says
+        // goodbye, which frees its session at the gate and, before this
+        // change, freed nothing in alice.
+        for seed in peer_seeds.iter().take(8) {
+            let peer = connect_peer(*seed).await;
+            peer.introduce(alice_key, 30, None).await.unwrap();
+            // The responder records its session when the `Introduction`
+            // reaches its reader loop, which trails the asker's return.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            peer.goodbye(0).await.unwrap();
+            drop(peer);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            alice.held_sessions(),
+            8,
+            "the map is full before the ninth arrives"
+        );
+
+        // The ninth, doing the whole doorbell. It is the initiator, since
+        // it is the one that asked.
+        let ninth_seed = peer_seeds[8];
+        let ninth_key = peer_keys[8];
+        let ninth = Arc::new(connect_peer(ninth_seed).await);
+        let outcome = ninth.introduce(alice_key, 30, None).await.unwrap();
+        assert_eq!(outcome.role, 1);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            alice.peer_observed_for(outcome.session).is_some(),
+            "the ninth session was kept, not refused"
+        );
+
+        authed::install_crypto_provider();
+        let alice_epoch = alice.porch().path_for(&ninth_key).unwrap().epoch();
+        let (alice_cert, alice_key_der) = authed::self_signed_cert(&alice_seed).unwrap();
+        let alice_tls = authed::server_tls_config(alice_cert, alice_key_der, b"moss-gate").unwrap();
+        let mut alice_server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(alice_tls).unwrap(),
+        ));
+        alice_server_config.transport_config(peer_transport_config(alice_epoch));
+        let alice_server_config = Arc::new(alice_server_config);
+        let alice_endpoint = alice.endpoint();
+        let accept = tokio::spawn(async move {
+            let incoming = alice_endpoint.accept().await.expect("alice sees the dial");
+            incoming
+                .accept_with(alice_server_config)
+                .unwrap()
+                .await
+                .unwrap()
+        });
+
+        let ninth_epoch = ninth.porch().path_for(&alice_key).unwrap().epoch();
+        let (ninth_cert, ninth_key_der) = authed::self_signed_cert(&ninth_seed).unwrap();
+        let ninth_tls = authed::client_tls_config(ninth_cert, ninth_key_der, b"moss-gate").unwrap();
+        let mut ninth_client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(ninth_tls).unwrap(),
+        ));
+        ninth_client_config.transport_config(peer_transport_config(ninth_epoch));
+        let ninth_peer = ninth
+            .endpoint()
+            .connect_with(
+                ninth_client_config,
+                ninth.synthetic_addr_for(&alice_key),
+                "peer",
+            )
+            .unwrap()
+            .await
+            .unwrap();
+        let alice_peer = accept.await.unwrap();
+
+        let alice_control = DoorbellControl::new();
+        let ninth_control = DoorbellControl::new();
+        let alice_candidate = loopback_candidate(&alice);
+        let ninth_candidate = loopback_candidate(&ninth);
+
+        let ninth_doorbell = {
+            let ninth = Arc::clone(&ninth);
+            let ninth_control = Arc::clone(&ninth_control);
+            let ninth_peer = ninth_peer.clone();
+            let candidates = vec![ninth_candidate];
+            tokio::spawn(async move {
+                run_doorbell(
+                    &ninth.porch(),
+                    &ninth,
+                    &ninth_peer,
+                    DoorbellParams {
+                        session: outcome.session,
+                        role: 1,
+                        peer_key: alice_key,
+                        candidates,
+                        peer_observed: ninth.peer_observed_for(outcome.session),
+                    },
+                    &ninth_control,
+                )
+                .await
+            })
+        };
+        let alice_doorbell = {
+            let alice = Arc::clone(&alice);
+            let alice_control = Arc::clone(&alice_control);
+            let alice_peer = alice_peer.clone();
+            let candidates = vec![alice_candidate];
+            tokio::spawn(async move {
+                run_doorbell(
+                    &alice.porch(),
+                    &alice,
+                    &alice_peer,
+                    DoorbellParams {
+                        session: outcome.session,
+                        role: 2,
+                        peer_key: ninth_key,
+                        candidates,
+                        peer_observed: alice.peer_observed_for(outcome.session),
+                    },
+                    &alice_control,
+                )
+                .await
+            })
+        };
+
+        let upgraded = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(direct) = alice.porch().path_for(&ninth_key).unwrap().direct_addr() {
+                    return direct;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the ninth introduction must still reach a direct path");
+        assert_eq!(upgraded, ninth_candidate);
+
+        alice_control.stop_answering_probes();
+        ninth_control.stop_answering_probes();
+        ninth_peer.close(0u32.into(), b"done");
+        let _ = tokio::time::timeout(Duration::from_secs(10), alice_doorbell).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), ninth_doorbell).await;
+    }
+
     /// Yseult's Medium: a `Start` naming a session this house does not hold
     /// is ignored, so a hostile gate cannot walk session ids and grow the
     /// `starts` map, and a taken signal leaves no slot behind.

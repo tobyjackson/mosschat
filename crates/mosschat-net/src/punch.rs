@@ -782,6 +782,17 @@ impl Attempt {
     /// candidates at about 37 probes each is a scan, and a keyed hash does
     /// not make it not one.
     pub fn add_candidate(&mut self, addr: SocketAddr, source: CandidateSource) -> bool {
+        // Unmapped first, and before anything classifies it (Yseult's
+        // remaining Medium). `Addr` family 6 decodes `::ffff:a.b.c.d`
+        // unchanged, no V6 predicate matches that form, and
+        // `PorchSocket::map_destination` passes a V6 destination through,
+        // so on a dual-stack porch socket a peer naming
+        // `[::ffff:127.0.0.1]:631` had its probes land on loopback while
+        // `127.0.0.1:631` was refused. One address, two spellings, one
+        // verdict. Storing the unmapped form also makes a candidate compare
+        // equal to the pong source the socket reports, which is unmapped
+        // for the same reason.
+        let addr = crate::sock::unmap_v4(addr);
         if self.candidates.len() >= MAX_CANDIDATES
             || !is_probeable(addr)
             || self.candidates.iter().any(|c| c.addr == addr)
@@ -1300,7 +1311,7 @@ pub async fn run_doorbell(
     // dropped and counted there rather than queued (Yseult's High). The
     // guard disarms on every exit, including an error return, so a
     // finished attempt cannot leave a key live.
-    let _armed = ArmedProbeKey::arm(porch, attempt, key);
+    let _attempt_guard = AttemptGuard::arm(porch, gate, attempt, key, params.session);
 
     let mut state = Attempt::new(attempt, key, params.peer_observed);
     for addr in peer_addrs {
@@ -1462,28 +1473,42 @@ pub async fn run_doorbell(
     }
 }
 
-/// Arms an attempt's probe key on the porch socket for as long as the
-/// attempt runs, and disarms it on drop, whichever way `run_doorbell`
-/// leaves.
-struct ArmedProbeKey<'a> {
+/// Holds an attempt's live state for as long as `run_doorbell` runs: the
+/// probe key armed on the porch socket, and the session marked live on the
+/// gate client. Both are released on drop, whichever way the function
+/// leaves, including an error return.
+struct AttemptGuard<'a> {
     porch: &'a std::sync::Arc<crate::sock::PorchSocket>,
+    gate: &'a crate::gate::client::GateClient,
     attempt: [u8; 16],
+    session: u32,
 }
 
-impl<'a> ArmedProbeKey<'a> {
+impl<'a> AttemptGuard<'a> {
     fn arm(
         porch: &'a std::sync::Arc<crate::sock::PorchSocket>,
+        gate: &'a crate::gate::client::GateClient,
         attempt: [u8; 16],
         key: [u8; 32],
+        session: u32,
     ) -> Self {
         porch.arm_probe_key(attempt, key);
-        Self { porch, attempt }
+        Self {
+            porch,
+            gate,
+            attempt,
+            session,
+        }
     }
 }
 
-impl Drop for ArmedProbeKey<'_> {
+impl Drop for AttemptGuard<'_> {
     fn drop(&mut self) {
         self.porch.disarm_probe_key(&self.attempt);
+        // The attempt is over, so its session entry is the first the client
+        // evicts when it needs room (Konrad's new must): a house that has
+        // finished with eight peers must not refuse the ninth.
+        self.gate.attempt_finished(self.session);
     }
 }
 
@@ -2038,6 +2063,55 @@ mod tests {
         // globally routable addresses.
         let mut bare = Attempt::new(ID, KEY, None);
         assert!(!bare.add_candidate(reflected, CandidateSource::PeerReported));
+    }
+
+    /// Yseult's remaining Medium: one address, two spellings, one verdict.
+    /// `Addr` family 6 decodes `::ffff:a.b.c.d` unchanged and no V6
+    /// predicate matches that form, so the mapped spellings of loopback and
+    /// of RFC1918 slipped past a rule that refused their IPv4 forms, and a
+    /// dual-stack porch socket sends a V6 destination through untouched.
+    ///
+    /// Deliberate break to fail this test: in `Attempt::add_candidate`,
+    /// delete the `let addr = crate::sock::unmap_v4(addr);` line.
+    /// `[::ffff:127.0.0.1]:631` and `[::ffff:10.0.0.1]:53` are then both
+    /// accepted from a peer.
+    #[test]
+    fn an_ipv4_mapped_candidate_is_classified_as_its_ipv4_form() {
+        let mut attempt = Attempt::new(ID, KEY, None);
+        for refused in [
+            "[::ffff:127.0.0.1]:631",
+            "[::ffff:10.0.0.1]:53",
+            "[::ffff:192.168.1.1]:53",
+            "[::ffff:169.254.1.1]:4433",
+        ] {
+            let addr: SocketAddr = refused.parse().unwrap();
+            assert!(
+                !attempt.add_candidate(addr, CandidateSource::PeerReported),
+                "{refused} must be refused exactly as its IPv4 form is"
+            );
+        }
+        // A mapped globally routable address is still fine, and is stored
+        // unmapped so it compares equal to the pong source the porch socket
+        // reports, which is unmapped for the same reason.
+        let mapped: SocketAddr = "[::ffff:203.0.113.5]:4433".parse().unwrap();
+        assert!(attempt.add_candidate(mapped, CandidateSource::PeerReported));
+        assert_eq!(
+            attempt.source_of(addr(4433)),
+            Some(CandidateSource::PeerReported),
+            "stored in its IPv4 form"
+        );
+        // And the mapped spelling of an address already held is a duplicate.
+        assert!(!attempt.add_candidate(mapped, CandidateSource::PeerReported));
+        assert_eq!(attempt.candidate_count(), 1);
+
+        // The gate-reflection exception works through the mapped spelling
+        // too, since both sides are unmapped before they are compared.
+        let reflected: SocketAddr = "192.168.7.7:4433".parse().unwrap();
+        let mut vouched = Attempt::new(ID, KEY, Some(reflected));
+        assert!(vouched.add_candidate(
+            "[::ffff:192.168.7.7]:4433".parse().unwrap(),
+            CandidateSource::PeerReported
+        ));
     }
 
     /// Yseult's Medium: a captured ping replays for the life of an
