@@ -46,7 +46,25 @@ pub fn peer_transport_config(epoch: Arc<AtomicU64>) -> Arc<quinn::TransportConfi
     transport.initial_mtu(1200);
     transport.min_mtu(1200);
     transport.congestion_controller_factory(Arc::new(EpochControllerFactory::new(epoch)));
+    // Section 4's "quinn's timers, set so they do not fight ours". The
+    // idle timeout is stated rather than inherited even though 30 s is
+    // also quinn's default, and the keepalive, `None` by default, is set
+    // below both peers' idle timeouts as its setter's doc requires: our
+    // probes are not QUIC packets, so without it an idle connection would
+    // hit the idle timer on a perfectly live path. Built from
+    // `VarInt::from_u32` rather than `IdleTimeout::try_from(Duration)`,
+    // which is fallible and would need an unwrap in library code.
+    transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
+        idle_timeout_ms(),
+    ))));
+    transport.keep_alive_interval(Some(crate::live::KEEP_ALIVE_INTERVAL));
     Arc::new(transport)
+}
+
+/// [`crate::live::MAX_IDLE_TIMEOUT`] in milliseconds, saturating, which is
+/// the form `quinn::VarInt::from_u32` takes.
+fn idle_timeout_ms() -> u32 {
+    u32::try_from(crate::live::MAX_IDLE_TIMEOUT.as_millis()).unwrap_or(u32::MAX)
 }
 
 /// The kind of path a peer is currently using.

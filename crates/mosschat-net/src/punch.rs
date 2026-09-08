@@ -1109,15 +1109,14 @@ impl Attempt {
 
 /// Section 4's shape, in the one slice section 2 step 7 cannot do without:
 /// on a live path, one probe every 500 ms, and three consecutive
-/// unanswered probes mean the path is gone. The rest of section 4 (the
-/// idle keepalive clamp, the dead grace, local address change) is a later
-/// work order; without at least this much, "fall back on path failure"
-/// has no failure to fall back on.
-pub const LIVE_PROBE_INTERVAL: Duration = Duration::from_millis(500);
-
-/// Section 4: three consecutive unanswered probes make a live path stale,
-/// which is when traffic moves back to the relay.
-pub const LIVE_PROBES_TO_STALE: u32 = 3;
+/// unanswered probes mean the path is gone.
+///
+/// Both are [`crate::live`]'s, which owns section 4 whole; they are named
+/// here because step 7's fall-back is decided in [`run_doorbell`] and one
+/// number in two files is one number that can differ.
+pub use crate::live::{
+    PROBES_TO_STALE as LIVE_PROBES_TO_STALE, VISIT_PROBE_INTERVAL as LIVE_PROBE_INTERVAL,
+};
 
 /// The ceiling on pongs one attempt will emit per second (Yseult's Medium).
 ///
