@@ -326,6 +326,40 @@ parse_row_file() {
     fi
 }
 
+# $1 row id -> seconds between the row's command starting and its fault
+# actually landing, if this row has one, else empty. Only blackout-60s
+# (a netem row with a nonzero start_delay) and gatehouse-killed (a
+# killgate row, whose spec's second field is its kill delay) have this;
+# every other row applies its condition from the first packet, so
+# "finished before the fault landed" cannot happen for it. Reads the
+# already-built ROWS_TABLE, so it reflects whatever --blackout-start-
+# delay was passed this run (default 5s, matching both committed runs).
+row_delay_seconds() {
+    local id="$1" row rid type spec desc sdelay hold pidfile_name kdelay
+    for row in "${ROWS_TABLE[@]}"; do
+        IFS='|' read -r rid type spec desc _ sdelay hold <<<"$row"
+        if [ "$rid" = "$id" ]; then
+            if [ "$type" = "netem" ] && [ "$sdelay" != "0" ]; then
+                printf '%s' "$sdelay"
+            elif [ "$type" = "killgate" ]; then
+                IFS=':' read -r pidfile_name kdelay <<<"$spec"
+                printf '%s' "$kdelay"
+            fi
+            return
+        fi
+    done
+}
+
+# $1 json (one line) -> the LAST step object's at_ms, whichever step
+# that is (not a named lookup like step_at_ms), i.e. how far the doctor
+# got before it finished on its own.
+last_step_at_ms() {
+    local json="$1"
+    printf '%s' "$json" \
+        | grep -oE '"at_ms":[0-9]+,"detail":"[^"]*","outcome":"[a-z_]+","step":"[a-z_]+"' \
+        | tail -n1 | grep -oE '^"at_ms":[0-9]+' | grep -oE '[0-9]+'
+}
+
 # $1 file -> that row's exit code, from its own "# fault-matrix.sh:
 # exit N" line if present, else the fallback described above.
 row_exit_code_of() {
@@ -347,9 +381,11 @@ row_exit_code_of() {
     fi
 }
 
-# $1 file $2 exit code -> sets CARD_CONDITION, CARD_VERDICT, CARD_NOTE.
+# $1 row id $2 file $3 exit code -> sets CARD_CONDITION, CARD_VERDICT,
+# CARD_NOTE, and tallies the verdict into TALLY_PASS/TALLY_FAIL/
+# TALLY_SUSPECT/TALLY_NOT_TESTED (reset_tally between cards).
 compute_card() {
-    local file="$1" ec="$2" dial reg reflect
+    local id="$1" file="$2" ec="$3" dial reg reflect delay_s delay_ms last_ms
     parse_row_file "$file"
     CARD_CONDITION="$ROW_CONDITION"
     if [ -z "$ROW_JSON" ]; then
@@ -362,33 +398,85 @@ compute_card() {
             CARD_VERDICT="FAIL"
         fi
         CARD_NOTE="no doctor record in output"
+        tally_verdict "$CARD_VERDICT"
         return
     fi
-    if [ "$ec" -eq 0 ] && [ "$ROW_FAILED_STEP" = "null" ] && [ "$ROW_REASON" = "ok" ] && [ "$ROW_STEPS_COUNT" -ge 4 ]; then
-        CARD_VERDICT="PASS"
-        dial="$(step_at_ms "$ROW_JSON" gate_dial)"
-        reg="$(step_at_ms "$ROW_JSON" gate_register)"
-        reflect="$(step_at_ms "$ROW_JSON" reflect_secondary)"
-        CARD_NOTE="dial ${dial:-?} ms, register ${reg:-?} ms, reflect ${reflect:-?} ms"
-    elif [ "$ec" -ne 0 ] || { [ -n "$ROW_FAILED_STEP" ] && [ "$ROW_FAILED_STEP" != "null" ]; }; then
+    if [ "$ec" -ne 0 ] || { [ -n "$ROW_FAILED_STEP" ] && [ "$ROW_FAILED_STEP" != "null" ]; }; then
         CARD_VERDICT="FAIL"
         if [ -n "$ROW_FAILED_STEP" ] && [ "$ROW_FAILED_STEP" != "null" ]; then
             CARD_NOTE="failed at $(step_words "$ROW_FAILED_STEP"): $(reason_words "$ROW_REASON")"
         else
             CARD_NOTE="exited $ec: $(reason_words "$ROW_REASON")"
         fi
+        tally_verdict "$CARD_VERDICT"
+        return
+    fi
+    # exit 0 and no failed step from here on. A row whose fault only
+    # lands after a start delay (blackout-60s, gatehouse-killed) proves
+    # nothing about that fault if the doctor was already done before the
+    # delay elapsed -- exactly the "PASS" misread this card exists to
+    # catch (Toby, PR 78 review), so it is checked before PASS/SUSPECT.
+    delay_s="$(row_delay_seconds "$id")"
+    if [ -n "$delay_s" ]; then
+        last_ms="$(last_step_at_ms "$ROW_JSON")"
+        delay_ms=$((delay_s * 1000))
+        if [ -n "$last_ms" ] && [ "$last_ms" -lt "$delay_ms" ]; then
+            CARD_VERDICT="NOT TESTED"
+            CARD_NOTE="command finished in ${last_ms} ms, before the fault was applied at ${delay_s} s; needs a long-lived command"
+            tally_verdict "$CARD_VERDICT"
+            return
+        fi
+    fi
+    if [ "$ROW_FAILED_STEP" = "null" ] && [ "$ROW_REASON" = "ok" ] && [ "$ROW_STEPS_COUNT" -ge 4 ]; then
+        CARD_VERDICT="PASS"
+        dial="$(step_at_ms "$ROW_JSON" gate_dial)"
+        reg="$(step_at_ms "$ROW_JSON" gate_register)"
+        reflect="$(step_at_ms "$ROW_JSON" reflect_secondary)"
+        CARD_NOTE="dial ${dial:-?} ms, register ${reg:-?} ms, reflect ${reflect:-?} ms"
     else
         CARD_VERDICT="SUSPECT"
         CARD_NOTE="exit 0 but the record does not show a complete run"
     fi
+    tally_verdict "$CARD_VERDICT"
+}
+
+TALLY_PASS=0
+TALLY_FAIL=0
+TALLY_SUSPECT=0
+TALLY_NOT_TESTED=0
+
+reset_tally() {
+    TALLY_PASS=0
+    TALLY_FAIL=0
+    TALLY_SUSPECT=0
+    TALLY_NOT_TESTED=0
+}
+
+tally_verdict() {
+    case "$1" in
+        PASS) TALLY_PASS=$((TALLY_PASS + 1)) ;;
+        FAIL) TALLY_FAIL=$((TALLY_FAIL + 1)) ;;
+        SUSPECT) TALLY_SUSPECT=$((TALLY_SUSPECT + 1)) ;;
+        "NOT TESTED") TALLY_NOT_TESTED=$((TALLY_NOT_TESTED + 1)) ;;
+    esac
+}
+
+print_totals_text() {
+    printf 'totals: %d PASS, %d FAIL, %d SUSPECT, %d NOT TESTED\n' \
+        "$TALLY_PASS" "$TALLY_FAIL" "$TALLY_SUSPECT" "$TALLY_NOT_TESTED"
+}
+
+print_totals_md() {
+    printf -- '- totals: %d PASS, %d FAIL, %d SUSPECT, %d NOT TESTED\n' \
+        "$TALLY_PASS" "$TALLY_FAIL" "$TALLY_SUSPECT" "$TALLY_NOT_TESTED"
 }
 
 print_card_header() {
-    printf '%-20s %-58s %-8s %-5s %s\n' "row" "condition" "verdict" "exit" "note"
+    printf '%-20s %-58s %-10s %-5s %s\n' "row" "condition" "verdict" "exit" "note"
 }
 
 emit_row_text() {
-    printf '%-20s %-58s %-8s %-5s %s\n' "$1" "$2" "$3" "$4" "$5"
+    printf '%-20s %-58s %-10s %-5s %s\n' "$1" "$2" "$3" "$4" "$5"
 }
 
 # Escapes a literal "|" so a condition or note with one in it cannot
@@ -406,7 +494,7 @@ print_md_header() {
     echo "- host: $host (\`uname -r\`)"
     echo "- command: \`$cmd\`"
     echo
-    echo "PASS: the row's own record shows a complete run, reason ok, no failed step. FAIL: the command exited non-zero, or the record names a failed step. SUSPECT: exit 0 but the record is incomplete (fewer than four steps) or its reason is not ok."
+    echo "PASS: the row's own record shows a complete run, reason ok, no failed step, and (for a row whose fault lands after a start delay) the doctor was still running when it did. FAIL: the command exited non-zero, or the record names a failed step. SUSPECT: exit 0 but the record is incomplete (fewer than four steps) or its reason is not ok. NOT TESTED: the doctor finished on its own before a delayed fault (blackout-60s, gatehouse-killed) ever landed, so the row proves nothing about that fault either way."
     echo
     echo "| row | condition | verdict | exit | note |"
     echo "|---|---|---|---|---|"
@@ -434,12 +522,14 @@ report_only() {
 
     echo "== fault-matrix.sh: report card (from $dir) =="
     print_card_header
+    reset_tally
     for id in "${ordered[@]}"; do
         file="$dir/$id.txt"
         ec="$(row_exit_code_of "$file")"
-        compute_card "$file" "$ec"
+        compute_card "$id" "$file" "$ec"
         emit_row_text "$id" "$CARD_CONDITION" "$CARD_VERDICT" "$ec" "$CARD_NOTE"
     done
+    print_totals_text
 }
 
 if [ -n "$REPORT_ONLY_DIR" ]; then
@@ -723,19 +813,23 @@ done < <(selected_rows)
 echo
 echo "== fault-matrix.sh: report card =="
 print_card_header
+reset_tally
 for i in "${!RESULT_IDS[@]}"; do
-    compute_card "${RESULT_FILES[$i]}" "${RESULT_CODES[$i]}"
+    compute_card "${RESULT_IDS[$i]}" "${RESULT_FILES[$i]}" "${RESULT_CODES[$i]}"
     emit_row_text "${RESULT_IDS[$i]}" "$CARD_CONDITION" "$CARD_VERDICT" "${RESULT_CODES[$i]}" "$CARD_NOTE"
 done
+print_totals_text
 
 if [ "$DRY_RUN" -eq 0 ]; then
     REPORT_MD="$OUT_DIR/REPORT.md"
+    reset_tally
     {
         print_md_header "$DATE_TAG" "$(uname -r)" "${CMD[*]}"
         for i in "${!RESULT_IDS[@]}"; do
-            compute_card "${RESULT_FILES[$i]}" "${RESULT_CODES[$i]}"
+            compute_card "${RESULT_IDS[$i]}" "${RESULT_FILES[$i]}" "${RESULT_CODES[$i]}"
             emit_row_md "${RESULT_IDS[$i]}" "$CARD_CONDITION" "$CARD_VERDICT" "${RESULT_CODES[$i]}" "$CARD_NOTE"
         done
+        print_totals_md
     } >"$REPORT_MD"
     echo
     echo "== report card written to $REPORT_MD =="
