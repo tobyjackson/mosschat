@@ -20,15 +20,21 @@
 #   conntrack NAT reuses the same external port for a given internal
 #   (address, port) regardless of destination, when that port is free --
 #   endpoint-independent, full-cone-like mapping.
-# --mode edm: nat-a and nat-b SNAT with the `random` port flag, which
-#   allocates a fresh external port per new conntrack entry rather than
-#   preserving the internal port. Because a new destination is a new
-#   conntrack entry, this makes the external port vary by destination --
-#   endpoint-dependent (symmetric) mapping. This is a stricter symmetric
-#   NAT than some routers (it also re-picks a port for a second flow to
-#   the SAME destination once the first entry expires), which is fine for
-#   this harness: the property under test is "does a second destination
-#   get a different mapped port", and this rule guarantees it.
+# --mode edm: nat-a and nat-b SNAT with the `random` port flag. Corrected
+#   rationale (Konrad's review on PR 48 caught the first version wrong):
+#   `random` does not mean "a fresh literal-random port on every new
+#   conntrack entry". The kernel seeds its port search with a hash over
+#   (source address, destination address, destination port) when this
+#   flag is set (RFC 4787's definition of endpoint-dependent mapping,
+#   `net/netfilter/nf_nat_core.c`'s `random` path via
+#   `secure_ipv4_port_ephemeral()`), so the mapped port is a function of
+#   the destination rather than reused verbatim from the internal port.
+#   Two flows from the same internal (address, port) to two different
+#   destinations land on two different external ports; two flows to the
+#   SAME destination tend to land on the same one, while it stays free.
+#   That is what makes it endpoint-dependent (symmetric), and it is what
+#   the conntrack check below in this script's own output, and the one in
+#   README.md, must actually observe rather than assume.
 #
 # This script does not start the gatehouse process; see
 # crates/mosschat-net/tests/harness/README.md for that step, run
@@ -100,31 +106,15 @@ run() {
     fi
 }
 
-# Runs `cmd` but treats a non-zero exit as success when stderr matches an
-# "already exists" style message, so re-running the script is a no-op on
-# the second pass. Only used for the handful of `ip` subcommands that have
-# no idempotent form of their own (`addr replace`, `route replace`, and
-# `link set ... up` are already idempotent and do not need this).
-run_ok_if_exists() {
-    if [ "$DRY_RUN" -eq 1 ]; then
-        printf '%q ' "$@"
-        printf '  # (no-op if it already exists)\n'
-        return 0
-    fi
-    local out
-    if out=$("$@" 2>&1); then
-        [ -n "$out" ] && echo "$out"
-        return 0
-    fi
-    if printf '%s' "$out" | grep -qiE 'exist|already'; then
-        return 0
-    fi
-    echo "$out" >&2
-    return 1
-}
-
+# `ip netns list` prints a bare name only until the kernel has allocated
+# that namespace an nsid (which happens the first time it is referenced
+# from another namespace, e.g. by the veth pairs this script creates
+# right after); from then on the line reads "house-a (id: 0)" and a
+# plain `grep -qx "$1"` against it stops matching (Konrad's review on
+# PR 48). `ip netns` namespaces are bind mounts under /run/netns, so
+# testing for the mount is exact and unaffected by any nsid suffix.
 ns_exists() {
-    ip netns list | grep -qx "$1"
+    [ -e "/run/netns/$1" ]
 }
 
 ensure_netns() {
@@ -279,15 +269,21 @@ echo
 echo "house-a and house-b reach it as 203.0.113.1:443 / :444 through their own NAT."
 echo
 echo "== confirm the NAT mode with conntrack, never assume it =="
-echo "After each house has sent at least one packet through its NAT to two"
-echo "different destinations (for example two spike 'dial' attempts, or two"
-echo "gatehouse registrations), run:"
+echo "Only one address exists past nat-a's outward side (203.0.113.1, the"
+echo "internet bridge), so the probe below varies the DESTINATION PORT, not"
+echo "the destination address, and it must be sent from one FIXED local"
+echo "source port -- two different ephemeral source ports would get two"
+echo "different mappings under EITHER mode and prove nothing. See"
+echo "README.md 'Confirming which NAT mode is really in effect' for the"
+echo "exact socat commands, then run:"
 echo
 echo "  ip netns exec nat-a conntrack -L -n -s 10.1.0.2"
 echo
-echo "Interpretation: if every entry for that source shows the SAME mapped"
-echo "port (e.g. sport=... dport=... all sharing one 203.0.113.11:PORT), the"
-echo "NAT is behaving endpoint-independently (EIM). If entries to two"
-echo "different destination addresses show two DIFFERENT mapped ports on"
-echo "203.0.113.11, the NAT is behaving endpoint-dependently, i.e."
-echo "symmetric (EDM). Do this for nat-b with -s 10.2.0.2 too."
+echo "Interpretation: each line shows two tuples, the original request and"
+echo "the reply tuple as the NAT sees it. The mapped external port is the"
+echo "reply tuple's dport= field (e.g. '... src=203.0.113.1 dport=41234"
+echo "dst=203.0.113.11 ...'), not the sport on the request side. If the"
+echo "two probes (dest port 443, then 444) show the SAME reply dport=, the"
+echo "NAT is endpoint-independent (EIM). If they show two DIFFERENT reply"
+echo "dport= values, it is endpoint-dependent, i.e. symmetric (EDM)."
+echo "Do this for nat-b with -s 10.2.0.2 too."

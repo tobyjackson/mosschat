@@ -10,6 +10,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_DIR="$SCRIPT_DIR/.run"
+
 DRY_RUN=0
 
 usage() {
@@ -54,8 +57,11 @@ run() {
     fi
 }
 
+# See netns-nat.sh's own ns_exists for why this checks the bind mount
+# rather than grepping `ip netns list`, whose lines grow an "(id: N)"
+# suffix once any namespace has been cross-referenced.
 ns_exists() {
-    ip netns list | grep -qx "$1"
+    [ -e "/run/netns/$1" ]
 }
 
 delete_netns() {
@@ -78,8 +84,20 @@ for ns in house-a nat-a house-b nat-b internet; do
     delete_netns "$ns"
 done
 
+if [ -d "$RUN_DIR" ]; then
+    run rm -rf "$RUN_DIR"
+    [ "$DRY_RUN" -eq 0 ] && echo "teardown.sh: removed $RUN_DIR (pidfiles, members file)"
+else
+    [ "$DRY_RUN" -eq 0 ] && echo "teardown.sh: $RUN_DIR already absent"
+fi
+
 echo "== teardown.sh: done =="
-echo "Note: this does not reset any tc qdisc left on a host interface by"
-echo "fault-matrix.sh outside a namespace. fault-matrix.sh resets its own"
-echo "qdisc between rows and at exit; if it was killed mid-row, clear the"
-echo "qdisc it names by hand: tc qdisc del dev <iface> root"
+echo "Every veth, the bridge and every qdisc fault-matrix.sh applied all"
+echo "live inside the five namespaces just deleted, so there is nothing"
+echo "left on the host to clear by hand. To verify that yourself:"
+echo
+echo "  ip netns list | grep -E '^(house-a|nat-a|house-b|nat-b|internet)( |\$)' && echo STILL PRESENT || echo clean"
+echo
+echo "If fault-matrix.sh was interrupted mid-row before this ran, its own"
+echo "trap already reset the qdisc it had applied and killed the row's"
+echo "process by pid before exiting; nothing from it should be left either."
