@@ -5,7 +5,10 @@
 # network namespace created by netns-nat.sh. Resets the condition between
 # rows. Captures each row's raw stdout, with a header proving what was
 # actually applied, under docs/measurements/<date>-faults/<row-id>.txt,
-# and prints a table citing the files at the end.
+# and prints a plain-English report card at the end, also written to
+# <output dir>/REPORT.md. `--report-only <dir>` regenerates and prints
+# that same card from an existing output directory without running
+# anything (no root needed); see README.md.
 #
 # No `pkill -f` anywhere in this script (PR 48 review, Ursula and Konrad
 # both flagged it: `ip netns exec` only changes network namespace, not
@@ -94,12 +97,14 @@ build_rows_table() {
 DRY_RUN=0
 ROWS_FILTER=""
 CMD=()
+REPORT_ONLY_DIR=""
 
 usage() {
     cat <<'EOF'
 Usage: fault-matrix.sh [--rows id1,id2,...] [--row-timeout SECONDS]
                         [--blackout-start-delay SECONDS] [--blackout-hold SECONDS]
                         [--dry-run] -- <command...>
+       fault-matrix.sh --report-only <dir>
 
   --rows id1,id2          Run only these row ids (default: all, table order).
   --row-timeout SECONDS   Max wall time per row's command (default: 180).
@@ -111,6 +116,12 @@ Usage: fault-matrix.sh [--rows id1,id2,...] [--row-timeout SECONDS]
   --blackout-hold         Seconds the blackout row stays applied (default: 60).
   --dry-run               Print every command this script would run, run
                            nothing, and do not execute <command...>.
+  --report-only <dir>     Regenerate and print the report card from an
+                           existing output directory's <row-id>.txt files
+                           instead of running anything. No root needed,
+                           does not require <command...>, and never
+                           writes into <dir> (REPORT.md is only written
+                           by a real run, not by --report-only).
   --                      Everything after this is the command to run per row.
 
 If a row hangs or you interrupt with Ctrl-C, a trap on EXIT/INT/TERM
@@ -154,6 +165,14 @@ while [ $# -gt 0 ]; do
             DRY_RUN=1
             shift
             ;;
+        --report-only)
+            REPORT_ONLY_DIR="${2:-}"
+            shift 2
+            ;;
+        --report-only=*)
+            REPORT_ONLY_DIR="${1#--report-only=}"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -173,16 +192,18 @@ done
 
 build_rows_table
 
-if [ "${#CMD[@]}" -eq 0 ]; then
-    echo "fault-matrix.sh: no command given; pass it after --" >&2
-    usage >&2
-    exit 2
-fi
+if [ -z "$REPORT_ONLY_DIR" ]; then
+    if [ "${#CMD[@]}" -eq 0 ]; then
+        echo "fault-matrix.sh: no command given; pass it after --" >&2
+        usage >&2
+        exit 2
+    fi
 
-if [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
-    echo "fault-matrix.sh: requires root (tc, ip netns exec)." >&2
-    echo "fault-matrix.sh: re-run under sudo, or pass --dry-run to preview." >&2
-    exit 1
+    if [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+        echo "fault-matrix.sh: requires root (tc, ip netns exec)." >&2
+        echo "fault-matrix.sh: re-run under sudo, or pass --dry-run to preview." >&2
+        exit 1
+    fi
 fi
 
 run() {
@@ -207,6 +228,224 @@ selected_rows() {
         esac
     done
 }
+
+# --- report card: turns a row's raw output into a plain-English verdict ---
+#
+# Toby, who owns this harness, is not a network engineer; the exit-code
+# table this used to print names files, not what happened. These
+# functions read a row's own output file the same way whether it just
+# ran (this script's own end-of-matrix card) or was written by an
+# earlier run (`--report-only <dir>`), so both paths share one reading
+# of what "passed" means.
+#
+# Every real run also appends "# fault-matrix.sh: exit N" to the row's
+# outfile right after the row's exit code is known, so a later
+# `--report-only` run of the same directory reads the real code back.
+# Row files written before this existed (docs/measurements/2026-09-08-
+# hewn-mini{,-run2}) have no such line; row_exit_code_of() falls back to
+# inferring 0 when the row printed anything after its header sentinel
+# and 1 (assumed failed) when it printed nothing, which is what both of
+# those directories' real exit codes were (confirmed from their own
+# NOTES.md and run.log, not guessed).
+
+# Section 7 of gatehouse-design.md's reason enum, in plain English.
+reason_words() {
+    case "$1" in
+        ok) echo "everything worked" ;;
+        gate_unreachable) echo "no answer from the gate" ;;
+        gate_refused_not_member) echo "the gate refused this house, it is not a member" ;;
+        gate_at_capacity) echo "the gate was full" ;;
+        gate_rate_limited) echo "the gate rate limited this house" ;;
+        relay_stream_fallback) echo "fell back to the relay's stream path" ;;
+        relay_datagram_too_large) echo "a relay datagram was too large to send" ;;
+        introduce_timeout) echo "no introduction arrived in time" ;;
+        peer_handshake_failed) echo "the handshake with the peer failed" ;;
+        peer_key_mismatch) echo "the peer's key did not match" ;;
+        no_candidates) echo "no connection candidates were found" ;;
+        probe_timeout) echo "no probe answered in time" ;;
+        endpoint_dependent_mapping) echo "the NAT changes its mapping per destination" ;;
+        hairpin_failure) echo "the direct path could not hairpin through the router" ;;
+        udp_blocked) echo "UDP looks blocked on this network" ;;
+        path_idle_timeout) echo "the path went idle and timed out" ;;
+        local_address_changed) echo "the local address changed mid-visit" ;;
+        peer_goodbye) echo "the peer said goodbye" ;;
+        cap_exceeded) echo "a connection cap was exceeded" ;;
+        internal) echo "an internal error, not a network condition" ;;
+        "") echo "no reason recorded" ;;
+        *) echo "an unrecognized reason ($1)" ;;
+    esac
+}
+
+# Section 7's step enum, in plain English.
+step_words() {
+    case "$1" in
+        gate_dial) echo "dialing the gate" ;;
+        gate_register) echo "registering with the gate" ;;
+        reflect_primary) echo "the primary reflection" ;;
+        reflect_secondary) echo "the secondary reflection" ;;
+        introduce) echo "the introduction" ;;
+        relay_open) echo "opening the relay" ;;
+        peer_handshake) echo "the peer handshake" ;;
+        candidate_exchange) echo "exchanging candidates" ;;
+        start_signal) echo "the start signal" ;;
+        probe_burst) echo "the probe burst" ;;
+        upgrade) echo "upgrading the path" ;;
+        live) echo "the live path" ;;
+        path_lost) echo "losing the path" ;;
+        relay_fallback) echo "falling back to the relay" ;;
+        closed) echo "closing" ;;
+        *) echo "step '$1'" ;;
+    esac
+}
+
+# $1 json (one line) $2 step name -> that step's at_ms, empty if absent.
+# Steps always serialize as {"at_ms":N,"detail":"...","outcome":"...",
+# "step":"name"} (alphabetical field order), so at_ms is always the
+# first field of the object whose "step" field names $2.
+step_at_ms() {
+    local json="$1" step="$2"
+    printf '%s' "$json" \
+        | grep -oE '"at_ms":[0-9]+,"detail":"[^"]*","outcome":"[a-z_]+","step":"'"$step"'"' \
+        | grep -oE '^"at_ms":[0-9]+' | grep -oE '[0-9]+' | head -n1
+}
+
+# $1 file -> sets ROW_CONDITION, ROW_JSON, ROW_FAILED_STEP, ROW_REASON,
+# ROW_STEPS_COUNT from that row's own output file.
+parse_row_file() {
+    local file="$1"
+    ROW_CONDITION="$(grep -m1 '^# condition: ' "$file" 2>/dev/null | sed 's/^# condition: //')"
+    [ -n "$ROW_CONDITION" ] || ROW_CONDITION="(condition unknown, no header line found)"
+    ROW_JSON="$(grep '^{' "$file" 2>/dev/null | tail -n1 || true)"
+    ROW_FAILED_STEP=""
+    ROW_REASON=""
+    ROW_STEPS_COUNT=0
+    if [ -n "$ROW_JSON" ]; then
+        ROW_FAILED_STEP="$(printf '%s' "$ROW_JSON" | grep -oE '"failed_step":(null|"[a-z_]+")' | sed -E 's/^"failed_step":"?//; s/"$//')"
+        ROW_REASON="$(printf '%s' "$ROW_JSON" | grep -oE '"reason":"[a-z_]+"' | sed -E 's/^"reason":"//; s/"$//')"
+        ROW_STEPS_COUNT="$(printf '%s' "$ROW_JSON" | grep -oE '"step":"[a-z_]+"' | wc -l | tr -d ' ')"
+    fi
+}
+
+# $1 file -> that row's exit code, from its own "# fault-matrix.sh:
+# exit N" line if present, else the fallback described above.
+row_exit_code_of() {
+    local file="$1" marker after
+    marker="$(grep -m1 '^# fault-matrix.sh: exit ' "$file" 2>/dev/null | sed -E 's/^# fault-matrix.sh: exit //')"
+    if [ -n "$marker" ]; then
+        printf '%s' "$marker"
+        return
+    fi
+    if grep -q '^# --- command output follows ---' "$file" 2>/dev/null; then
+        after="$(sed -n '/^# --- command output follows ---/,$p' "$file" | tail -n +2 | grep -c '[^[:space:]]' || true)"
+        if [ "${after:-0}" -gt 0 ]; then
+            printf '0'
+        else
+            printf '1'
+        fi
+    else
+        printf '1'
+    fi
+}
+
+# $1 file $2 exit code -> sets CARD_CONDITION, CARD_VERDICT, CARD_NOTE.
+compute_card() {
+    local file="$1" ec="$2" dial reg reflect
+    parse_row_file "$file"
+    CARD_CONDITION="$ROW_CONDITION"
+    if [ -z "$ROW_JSON" ]; then
+        # No doctor record in this row's output at all: the command run
+        # by this row was not the doctor (or produced nothing), so the
+        # only evidence left is the exit code.
+        if [ "$ec" -eq 0 ]; then
+            CARD_VERDICT="PASS"
+        else
+            CARD_VERDICT="FAIL"
+        fi
+        CARD_NOTE="no doctor record in output"
+        return
+    fi
+    if [ "$ec" -eq 0 ] && [ "$ROW_FAILED_STEP" = "null" ] && [ "$ROW_REASON" = "ok" ] && [ "$ROW_STEPS_COUNT" -ge 4 ]; then
+        CARD_VERDICT="PASS"
+        dial="$(step_at_ms "$ROW_JSON" gate_dial)"
+        reg="$(step_at_ms "$ROW_JSON" gate_register)"
+        reflect="$(step_at_ms "$ROW_JSON" reflect_secondary)"
+        CARD_NOTE="dial ${dial:-?} ms, register ${reg:-?} ms, reflect ${reflect:-?} ms"
+    elif [ "$ec" -ne 0 ] || { [ -n "$ROW_FAILED_STEP" ] && [ "$ROW_FAILED_STEP" != "null" ]; }; then
+        CARD_VERDICT="FAIL"
+        if [ -n "$ROW_FAILED_STEP" ] && [ "$ROW_FAILED_STEP" != "null" ]; then
+            CARD_NOTE="failed at $(step_words "$ROW_FAILED_STEP"): $(reason_words "$ROW_REASON")"
+        else
+            CARD_NOTE="exited $ec: $(reason_words "$ROW_REASON")"
+        fi
+    else
+        CARD_VERDICT="SUSPECT"
+        CARD_NOTE="exit 0 but the record does not show a complete run"
+    fi
+}
+
+print_card_header() {
+    printf '%-20s %-58s %-8s %-5s %s\n' "row" "condition" "verdict" "exit" "note"
+}
+
+emit_row_text() {
+    printf '%-20s %-58s %-8s %-5s %s\n' "$1" "$2" "$3" "$4" "$5"
+}
+
+# Escapes a literal "|" so a condition or note with one in it cannot
+# break the markdown table.
+emit_row_md() {
+    local id="$1" cond="${2//|/\\|}" verdict="$3" ec="$4" note="${5//|/\\|}"
+    printf '| %s | %s | %s | %s | %s |\n' "$id" "$cond" "$verdict" "$ec" "$note"
+}
+
+print_md_header() {
+    local date="$1" host="$2" cmd="$3"
+    echo "# fault-matrix.sh report card"
+    echo
+    echo "- date: $date"
+    echo "- host: $host (\`uname -r\`)"
+    echo "- command: \`$cmd\`"
+    echo
+    echo "PASS: the row's own record shows a complete run, reason ok, no failed step. FAIL: the command exited non-zero, or the record names a failed step. SUSPECT: exit 0 but the record is incomplete (fewer than four steps) or its reason is not ok."
+    echo
+    echo "| row | condition | verdict | exit | note |"
+    echo "|---|---|---|---|---|"
+}
+
+# --report-only <dir>: reads <dir>/<row-id>.txt for every row in the
+# table plus any other *.txt file found, in that order, and prints the
+# card. Runs nothing, needs no root, and never writes into <dir>.
+report_only() {
+    local dir="$1" row rid file ec extra id
+    local -a ordered=()
+    [ -d "$dir" ] || { echo "fault-matrix.sh: --report-only: not a directory: $dir" >&2; exit 2; }
+    for row in "${ROWS_TABLE[@]}"; do
+        IFS='|' read -r rid _ <<<"$row"
+        [ -f "$dir/$rid.txt" ] && ordered+=("$rid")
+    done
+    while IFS= read -r extra; do
+        [ -z "$extra" ] && continue
+        id="$(basename "$extra" .txt)"
+        case " ${ordered[*]-} " in
+            *" $id "*) ;;
+            *) ordered+=("$id") ;;
+        esac
+    done < <(find "$dir" -maxdepth 1 -name '*.txt' 2>/dev/null | sort)
+
+    echo "== fault-matrix.sh: report card (from $dir) =="
+    print_card_header
+    for id in "${ordered[@]}"; do
+        file="$dir/$id.txt"
+        ec="$(row_exit_code_of "$file")"
+        compute_card "$file" "$ec"
+        emit_row_text "$id" "$CARD_CONDITION" "$CARD_VERDICT" "$ec" "$CARD_NOTE"
+    done
+}
+
+if [ -n "$REPORT_ONLY_DIR" ]; then
+    report_only "$REPORT_ONLY_DIR"
+    exit 0
+fi
 
 # --- netem target application, fixed IFS-scoping bug from PR 48 review ---
 # The previous version set `local IFS=';'` for the whole function body,
@@ -469,14 +708,35 @@ while IFS= read -r row; do
         exit 2
     fi
 
+    # Recorded on the row's own outfile so a later `--report-only` run
+    # of this same directory reads the real exit code back, not a
+    # fallback guess (DRY_RUN never reaches here with a real outfile).
+    if [ "$DRY_RUN" -eq 0 ]; then
+        echo "# fault-matrix.sh: exit $rc" >>"$outfile"
+    fi
+
     RESULT_IDS+=("$id")
     RESULT_FILES+=("$outfile")
     RESULT_CODES+=("$rc")
 done < <(selected_rows)
 
 echo
-echo "== fault-matrix.sh: summary =="
-printf '%-20s %-10s %s\n' "row" "exit" "file"
+echo "== fault-matrix.sh: report card =="
+print_card_header
 for i in "${!RESULT_IDS[@]}"; do
-    printf '%-20s %-10s %s\n' "${RESULT_IDS[$i]}" "${RESULT_CODES[$i]}" "${RESULT_FILES[$i]}"
+    compute_card "${RESULT_FILES[$i]}" "${RESULT_CODES[$i]}"
+    emit_row_text "${RESULT_IDS[$i]}" "$CARD_CONDITION" "$CARD_VERDICT" "${RESULT_CODES[$i]}" "$CARD_NOTE"
 done
+
+if [ "$DRY_RUN" -eq 0 ]; then
+    REPORT_MD="$OUT_DIR/REPORT.md"
+    {
+        print_md_header "$DATE_TAG" "$(uname -r)" "${CMD[*]}"
+        for i in "${!RESULT_IDS[@]}"; do
+            compute_card "${RESULT_FILES[$i]}" "${RESULT_CODES[$i]}"
+            emit_row_md "${RESULT_IDS[$i]}" "$CARD_CONDITION" "$CARD_VERDICT" "${RESULT_CODES[$i]}" "$CARD_NOTE"
+        done
+    } >"$REPORT_MD"
+    echo
+    echo "== report card written to $REPORT_MD =="
+fi

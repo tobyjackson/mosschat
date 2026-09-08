@@ -366,7 +366,50 @@ input (both were real bugs in an earlier version, PR 48 review).
 
 Each row's raw stdout (and stderr, merged) lands in
 `docs/measurements/<today's date>-faults/<row-id>.txt`. When it finishes
-it prints a summary table naming every file it wrote.
+it prints a report card, one line per row: condition, verdict, the exit
+code, and a plain-English note.
+
+### The report card
+
+Toby is not a network engineer, so the end-of-run table reads as a
+report card rather than a bare exit-code list. Each row's own
+`<row-id>.txt` (its header plus the doctor's `--json` record, if the row
+command was the doctor) is read back into one of three verdicts:
+
+- **PASS** -- the command exited 0 and the record shows a complete run
+  (`failed_step` null, `reason` `ok`, all four gate steps present). The
+  note is the step timing: `dial N ms, register N ms, reflect N ms`.
+- **FAIL** -- the command exited non-zero, or the record names a
+  `failed_step`. The note names the failed step and the reason in
+  words, for example "failed at registering with the gate: the gate
+  rate limited this house".
+- **SUSPECT** -- exit 0, but the record's `reason` is not `ok` or it has
+  fewer than four steps (an unrecorded post-dial failure, see the
+  2026-09-08 hewn-mini run below). The note says so.
+
+A row whose command was not the doctor, or whose output has no JSON
+record at all, gets PASS or FAIL from its exit code alone, noted "no
+doctor record in output" -- the card does not assume the row command is
+`mosschat doctor --json`.
+
+The same card is written to `<output dir>/REPORT.md` as a markdown
+table (date, host, the command run, a one-line PASS/FAIL/SUSPECT
+legend, then the rows) every time `fault-matrix.sh` finishes a real run.
+Every row's `<row-id>.txt` also gets a trailing `# fault-matrix.sh: exit
+N` line so the real exit code survives being read back later.
+
+**`--report-only <dir>`** regenerates and prints this same card from an
+existing output directory's `<row-id>.txt` files, without running
+anything and without root. It never writes into `<dir>` (no
+`REPORT.md`, no edits to the row files), so it is safe to point at
+`docs/measurements/2026-09-08-hewn-mini/faults` or
+`docs/measurements/2026-09-08-hewn-mini-run2/faults` to see, without a
+Linux box, what the report card says about those two runs: the first
+shows 9 SUSPECT rows and 3 PASS (the doctor defect described in that
+run's own NOTES.md, fixed by PR 69); the second shows 12 PASS. Row
+files written before the `# fault-matrix.sh: exit N` line existed (both
+of those) fall back to inferring 0 when the row printed anything after
+its header and 1 when it printed nothing at all.
 
 ## What to paste back into the repo
 
