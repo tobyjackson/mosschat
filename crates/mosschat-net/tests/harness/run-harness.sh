@@ -192,9 +192,15 @@ matrix(){
     echo "stderr:"; cat "$RUN/house-b.stderr.log" 2>/dev/null
     return 1
   }
+  # By pattern, not by field position: the "house <64 hex>" text is
+  # inside the registered line's "detail" value today, but which key that
+  # is and where it falls in the object is a serde_json implementation
+  # detail (its default map happens to sort alphabetically; that changes
+  # the moment a preserve_order feature or a struct field does), so this
+  # greps the line as text rather than assuming a field order.
   local MOSS_HOUSE_B
-  MOSS_HOUSE_B="$(grep -m1 '"event":"registered"' "$RUN/house-b.jsonl" | grep -oE '"detail":"house [0-9a-f]{64}' | grep -oE '[0-9a-f]{64}')"
-  [ ${#MOSS_HOUSE_B} -eq 64 ] || { echo "could not read house-b's public key off its registered line:"; cat "$RUN/house-b.jsonl"; return 1; }
+  MOSS_HOUSE_B="$(grep -m1 '"event":"registered"' "$RUN/house-b.jsonl" | grep -o 'house [0-9a-f]\{64\}' | head -1 | cut -d' ' -f2)"
+  [ -n "$MOSS_HOUSE_B" ] && [ "${#MOSS_HOUSE_B}" -eq 64 ] || { echo "could not read house-b's public key off its registered line:"; cat "$RUN/house-b.jsonl"; return 1; }
   echo "house-b public key: $MOSS_HOUSE_B" | tee -a "$f"
   export MOSS_HOUSE_B
 

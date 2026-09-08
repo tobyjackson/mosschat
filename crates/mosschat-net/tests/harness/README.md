@@ -317,7 +317,10 @@ from.
 After the gatehouse is up, `run-harness.sh` starts `house --headless`
 inside the `house-b` namespace on its own identity, waits up to 10
 seconds for its `registered` line, and reads house-b's public key off
-that line's `detail` field rather than typing it anywhere. Every row's
+that line by pattern (`house <64 hex>`) rather than typing it anywhere or
+assuming which JSON field carries it or where that field falls in the
+object, since field order is a `serde_json` implementation detail, not
+something this script should depend on. Every row's
 command is then `doctor --gate 203.0.113.1:443 --community $MOSS_COMMUNITY
 --identity-file <next seed> --friend <house-b's key> --hold 90 --json`
 from house-a; the unshaped smoke run is the same command with `--hold 5`.
