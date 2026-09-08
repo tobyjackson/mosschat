@@ -108,27 +108,32 @@ BLAKE3 hashes over 96 bytes, and on a match forwards a `Knock` carrying that bod
 nothing at all. B answers accept or decline; the gate introduces both sides only on accept, and a decline, no answer
 inside `ttl_s` and no match are one silence.
 
-**`sealed`, so the gate learns nothing but the fact of an ask.** An ephemeral X25519 public key, then
-ChaCha20-Poly1305 over a small CBOR body under `BLAKE3::derive_key("mosschat-introduce-seal-v1", dh || eph_pub ||
-kB)`, the DH being A's ephemeral against B's identity key in Montgomery form
-(`ed25519-dalek-3.0.0/src/verifying.rs:484`, whose doc discourages reusing a signing key for key exchange and cites
-eprint 2021/509). It is used anyway because B's identity key is the only one A holds before any connection exists, and
-only B's long-term half enters the DH; the clean fix, an encryption key in the ticket and friend record, is a D4/D7
-change this order does not own. Body: `v`, `from: kA`, and for a first contact `invite: {id: bytes[16], secret:
-bytes[32], bind: bytes[32]}`.
+**`sealed`, so the gate learns nothing but the fact of an ask.** An ephemeral X25519 public key, then ChaCha20-Poly1305
+over a small CBOR body under `BLAKE3::derive_key("mosschat-introduce-seal-v1", dh || eph_pub || kB)`, the DH being A's
+ephemeral against B's identity key in Montgomery form (`ed25519-dalek-3.0.0/src/verifying.rs:484`, whose doc discourages
+reusing a signing key for key exchange and cites eprint 2021/509). It is used anyway because B's identity key is the
+only one A holds before any connection exists, and only B's long-term half enters the DH; the clean fix, an encryption
+key in the ticket and friend record, is a D4/D7 change this order does not own. Body: `v`, `from: kA`, `sent_ms: u64`,
+and for a first contact `invite: {id: bytes[16], secret: bytes[32], bind: bytes[32]}`.
 
-**B decides on two lists, friends then invites.** B opens `sealed`, recomputes the pair tag from `from`, and accepts
-if that key is a friend. Otherwise it checks its outstanding invites: it holds `BLAKE3(secret)` per unredeemed invite
-(D4/D7), so it accepts when `BLAKE3(secret)` matches one still open and `bind` equals
+**B decides on two lists, friends then invites.** B opens `sealed`, recomputes the pair tag from `from`, and accepts if
+that key is a friend. Otherwise it checks its outstanding invites: it holds `BLAKE3(secret)` per unredeemed invite
+(D4/D7), so it accepts when `BLAKE3(secret)` matches one still open and unexpired and `bind` equals
 `BLAKE3("mosschat-invite-bind-v1" || secret || kB || gate_key)`. Anything else, a seal that will not open, a stranger
 carrying no proof, a spent invite, is dropped in silence with no `KnockAnswer` at all, so neither the gate nor a
 stranger gets an oracle. The bind makes a proof useless for another invite, being over that invite's own secret, and
-useless at another gate, being over the identity key of the gate A handshook with, which closes the replay a gate
-could otherwise mount by carrying A's blob elsewhere; freshness at that same gate is B's job, remembering
-`BLAKE3(sealed)` for the invite's life and dropping a repeat. A cannot bind to a gate session id instead: none exists
-when A builds the blob, and only the gate being defended against could supply one. Redemption stays WO-4.1's: the
-approval where the inviter sees a key and a name runs inside the end to end tunnel, and only on approve do both sides
-add each other and mark the invite used.
+useless at another gate, being over the identity key of the gate A handshook with, which closes the replay a gate could
+otherwise mount by carrying A's blob elsewhere. Freshness at that same gate is B's job, and it covers every seal, friend
+and invite alike, a friend body proving only that A once sealed to B so that one captured `Introduce` would otherwise
+replay forever: every body carries `sent_ms`, B opens one only within 120 s of its own clock, wide enough for skew, and
+holds `BLAKE3(sealed)` cut to 16 bytes for every seal it opens until that window ends. A repeat is dropped in silence.
+Eviction is by expiry alone, swept on insert, since dropping a live entry would reopen the window. The cap is 4096
+entries, above the 3072 the gate's own 6 per minute limit can deliver across 256 registrants in one window, so a full
+set means the gate broke its rate and B refuses knocks rather than evicting; 4096 * (16 byte hash + 8 byte expiry) =
+98304 bytes, under 256 KiB with the map around it. The invite gains an `expires_ms` of its own, default 7 days. A cannot
+bind to a gate session id instead: none exists when A builds the blob, and only the gate being defended against could
+supply one. Redemption stays WO-4.1's: the approval where the inviter sees a key and a name runs inside the end to end
+tunnel, and only on approve do both sides add each other and mark the invite used.
 
 **What the gate learns**, plainly: that two of its registrants attempted contact, and when, held for the life of that
 session. It never receives a friend list, never learns how many friends a house has, never sees a name or an invite,
@@ -219,14 +224,19 @@ appears nowhere under `quinn-0.11.11/src`.
 - **MTU, capped, because no hook exists.** A peer connection sets `mtu_discovery_config(None)`
   (`quinn-proto/src/config/transport.rs:214`) and leaves `initial_mtu` at its 1200 default (`:378`,
   `quinn-proto/src/lib.rs:332`), pinning every packet on it at 1200 bytes: QUIC's own minimum, which every path must
-  carry by specification and which is the floor `initial_mtu` and `min_mtu` clamp up to (`:185`, `:207`), so one
-  number is safe on the relay, on a LAN and through a 1280 byte IPv6 tunnel. Without it the default `upper_bound` of
-  1452 (`:743`), learned direct, would be carried onto the relay, whose payload cap is 1200; packets would die
-  silently and `black_hole_cooldown` is 60 s (`:744`), missing the 1 s fall-back criterion by two orders of magnitude.
-  **The cost is real:** about 17 percent more packets for the same bytes against a direct path's likely 1452, paid
-  forever to make every fall-back safe, and bought back the day quinn exposes `path_changed`, the cap becoming a per
-  path kind `upper_bound`. The gate connection is a different connection over one real path and keeps quinn's
-  defaults.
+  carry by specification and which is the floor `initial_mtu` and `min_mtu` clamp up to (`:185`, `:207`), so one number
+  is safe on the relay, on a LAN and through a 1280 byte IPv6 tunnel. Without it the default `upper_bound` of 1452
+  (`:743`), learned direct, would be carried onto the relay, whose payload cap is 1200; packets would die silently and
+  `black_hole_cooldown` is 60 s (`:744`), missing the 1 s fall-back criterion by two orders of magnitude. **The cost is
+  real:** 1452 / 1200 = 1.21, so 21 percent more packets for the same bytes against a direct path's likely 1452, paid to
+  make every fall-back safe and bought back the day quinn exposes `path_changed`. **The porch socket must override
+  `AsyncUdpSocket::may_fragment` to return false**, its `true` default (`quinn/src/runtime.rs:86-88`) becoming
+  `allow_mtud = !socket.may_fragment()` (`quinn/src/endpoint.rs:140`) and killing MTU discovery for every connection on
+  the endpoint, the gate connection among them, since it registers and relays over this same socket. Undiscovered it
+  sits at 1200 and never reports the 1205 the relay needs (`Datagrams::max_size` is `current_mtu` less overhead,
+  `quinn-proto/src/connection/datagrams.rs:70-76`), so every session silently takes `relay_stream_fallback` while the 10
+  MiB test passes. The false is the wrapped `quinn_udp::UdpSocketState`'s own (`quinn-udp/src/unix.rs:281`), false on
+  all three platforms.
 - **Congestion and pacing, a real hook, ours.** `TransportConfig::congestion_controller_factory` is public
   (`quinn-proto/src/config/transport.rs:326-332`) and `congestion::Controller` and `ControllerFactory` are re-exported
   by quinn (`quinn/src/lib.rs:69`), so a peer connection gets a factory of ours wrapping the default `CubicConfig`
@@ -412,22 +422,23 @@ ms 0 of 9 candidates answered`), then mapping, path and RTT, gate bytes and reas
 
 ## 8. Work orders
 
-**WO-1.3a, the gatehouse and the relay path** (Jerome, agent-executable). Scope: the `gatehouse` subcommand and the
-gate protocol of section 1 (the member list and slot table, registration, address reflection on two ports,
-introduction by knock with the sealed request carried verbatim, relay by session with the sender-membership check,
-keepalive, goodbye, and every cap section 1 lists); the house side gate client, including sealing a request and
-answering a knock from the local friend list and outstanding invites; the porch socket and the path table of section 3
-with one path kind, relay, and no probes, with the MTU cap and the epoch-resetting congestion factory in place from
-the start; the identity binding of section 5. Not touched: `punch.rs`, `live.rs`, `discovery.rs`, `diag.rs`. Files:
+**WO-1.3a, the gatehouse and the relay path** (Jerome, agent-executable). Scope: the `gatehouse` subcommand and the gate
+protocol of section 1 (the member list and slot table, registration, address reflection on two ports, introduction by
+knock with the sealed request carried verbatim, relay by session with the sender-membership check, keepalive, goodbye,
+and every cap section 1 lists); the house side gate client, including sealing a request and answering a knock from the
+local friend list and outstanding invites; the porch socket and the path table of section 3 with one path kind, relay,
+and no probes, with the MTU cap and the epoch-resetting congestion factory in place from the start; the identity binding
+of section 5. Not touched: `punch.rs`, `live.rs`, `discovery.rs`, `diag.rs`. Files:
 `crates/mosschat-net/src/gate/{mod,server,client,wire}.rs`, `src/sock.rs`, `src/path.rs`, `src/authed.rs`, and the
 subcommand in `crates/mosschat/src/main.rs`. Verify, from WO-1.3's verify line: `cargo test -p mosschat-net gate::`
-passes, including a relay path carrying 10 MiB unchanged; a key absent from the member list refused in the handshake;
-an `Introduce` whose tag matches nobody, one the other house declines and one it never answers all yielding the asker
-the same silence and the same `introduce_timeout`; a first contact accepted on an unredeemed invite proof, and that
-proof refused at a second gate and against a second invite; a `Relay` datagram whose sender is neither key of its
-session dropped and counted rather than answered; and the registration cap rejecting the connection past it while
-still serving those below. Plus a chain of two certificates rejected in the handshake, a signature verified against
-the TLS key, and section 3's reversing-condition benchmark run and its median recorded.
+passes, including a relay path carrying 10 MiB unchanged; a key absent from the member list refused in the handshake; an
+`Introduce` whose tag matches nobody, one the other house declines and one it never answers all yielding the asker the
+same silence and the same `introduce_timeout`; a first contact accepted on an unredeemed invite proof, and that proof
+refused at a second gate and against a second invite; a `Relay` datagram whose sender is neither key of its session
+dropped and counted rather than answered; and the registration cap rejecting the connection past it while still serving
+those below; and the gate connection reporting a `max_datagram_size()` of 1205 or better, which fails if the porch
+socket leaves `may_fragment` at its default. Plus a chain of two certificates rejected in the handshake, a signature
+verified against the TLS key, and section 3's reversing-condition benchmark run and its median recorded.
 
 **WO-1.3b, the doorbell, liveness and discovery** (Jerome, agent-executable). Scope: sections 2, 4 and 6 on WO-1.3a's
 path table and porch socket. Files: `crates/mosschat-net/src/{punch.rs,live.rs,discovery.rs}`, edits to `src/sock.rs`
