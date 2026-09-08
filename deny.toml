@@ -25,6 +25,10 @@ allow = [
     "ISC", # ring, rustls-webpki, untrusted
     "Unicode-3.0", # unicode-ident
 ]
+# WO-1.3a fix 3: zeroize (mosschat-core's identity seed wrapper) is
+# "MIT OR Apache-2.0", already covered by the two entries above; already a
+# transitive dependency of ed25519-dalek, so becoming a direct one adds no
+# new licence or version to the tree.
 confidence-threshold = 0.8
 
 [licenses.private]

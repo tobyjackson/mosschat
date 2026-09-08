@@ -17,5 +17,10 @@ thiserror = "2.0.20"
 blake3 = "1.8.7"
 rand = "0.10"
 minicbor = { version = "2.3.0", features = ["std"] }
+# WO-1.3a fix 3 (Yseult finding 9): wraps the identity seed while it is held
+# here, so a temporary owned copy is zeroized promptly rather than left for
+# the allocator; already a transitive dependency of ed25519-dalek, so this
+# adds no new version to the tree.
+zeroize = "1.9"
 
 [dev-dependencies]

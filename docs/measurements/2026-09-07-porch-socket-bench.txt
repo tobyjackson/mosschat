@@ -1,0 +1,8 @@
+Run 2026-09-07 (MDT, UTC-6), `cargo bench -p mosschat-net --bench porch_socket`.
+
+    Finished `bench` profile [optimized] target(s) in 2.58s
+     Running benches/porch_socket.rs (target/release/deps/porch_socket-f8f5b8737c1d2774)
+plain tokio socket recv median: 23µs (2000 iterations)
+porch socket recv median:       15.458µs (2000 iterations)
+delta (porch - plain):           -8 microseconds
+reversing condition (b) [held]: porch socket adds no more than 20 microseconds at the median

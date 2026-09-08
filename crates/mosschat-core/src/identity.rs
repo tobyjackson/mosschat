@@ -5,6 +5,7 @@
 //! nothing in this module knows what a QUIC connection or a TLS certificate is.
 
 use ed25519_dalek::{Signature, Signer as EdSigner, SigningKey, VerifyingKey};
+use zeroize::Zeroizing;
 
 use crate::error::CoreError;
 
@@ -31,8 +32,16 @@ impl AuthorKey {
     }
 
     /// Builds an `AuthorKey` from 32 raw secret key bytes.
+    ///
+    /// The identity seed (Yseult finding 9): the owned copy this function
+    /// makes of `bytes` while building the underlying `SigningKey` is held
+    /// in a [`Zeroizing`] wrapper and scrubbed the moment it goes out of
+    /// scope here, rather than left for the allocator. `ed25519-dalek`'s own
+    /// `SigningKey` already zeroizes its internal copy on drop; this covers
+    /// the one further copy this crate makes of the caller's bytes.
     pub fn from_bytes(bytes: &[u8; 32]) -> Self {
-        Self(SigningKey::from_bytes(bytes))
+        let seed = Zeroizing::new(*bytes);
+        Self(SigningKey::from_bytes(&seed))
     }
 
     /// Returns the 32 byte public key that verifies signatures from this key.
