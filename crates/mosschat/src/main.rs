@@ -437,20 +437,49 @@ async fn run_doctor_steps(
     };
     let client = match dialled {
         Ok(client) => client,
-        Err(_) => {
-            // `connect` has already recorded the step that failed, so
-            // nothing is recorded a second time here (Konrad's should 4:
-            // a refusal printed two failure lines, the second carrying
-            // UDP-blocked wording that did not apply). This only chooses
-            // the record's reason: the one the gate itself named through
-            // frame 12's code where there is one, and otherwise what the
-            // failed step says.
-            let reason = recorder
-                .reason_hint()
-                .unwrap_or(match recorder.failed_step() {
-                    Some(Step::GateDial) => Reason::GateUnreachable,
+        Err(err) => {
+            // Where `connect` recorded the step that failed, nothing is
+            // recorded a second time (Konrad's should 4: a refusal printed
+            // two failure lines, the second carrying UDP-blocked wording
+            // that did not apply), and this only chooses the record's
+            // reason: the one the gate itself named through frame 12's
+            // code where there is one, and otherwise what the failed step
+            // says.
+            //
+            // Where it recorded nothing, the step that was in flight is
+            // recorded here with the error's own text. A connect that
+            // returns an error must never leave `failed_step` null: that
+            // is what made `exit_for` exit **0** on nine rows of the
+            // 2026-09-08 fault matrix, every one of them a doctor that
+            // dialled its gate and then failed to register.
+            let reason = if let Some(hint) = recorder.reason_hint() {
+                hint
+            } else if let Some(step) = recorder.failed_step() {
+                match step {
+                    Step::GateDial => Reason::GateUnreachable,
                     _ => Reason::Internal,
-                });
+                }
+            } else {
+                // No step recorded at all means the dial never got off the
+                // ground (the endpoint, its socket or the certificate); a
+                // recorded step means the dial succeeded and this
+                // connection was in the middle of registering. Section 7
+                // names no reason for "the gate closed the connection
+                // without saying why", so it stays `internal`, section 7's
+                // own stated catch-all, with the step and the error's text
+                // carrying what actually happened.
+                let in_flight = match recorder.last_step() {
+                    None => Step::GateDial,
+                    Some(_) => Step::GateRegister,
+                };
+                mosschat_net::diag::record(
+                    Some(&recorder),
+                    in_flight,
+                    StepOutcome::Fail,
+                    err.to_string(),
+                );
+                Reason::Internal
+            };
             let (record, written) = recorder.finish(reason);
             report_write(written);
             return Ok(record);
@@ -465,14 +494,22 @@ async fn run_doctor_steps(
     let Some(friend_key) = friend_key else {
         // A gate-only run stops here: there is no peer to introduce, and
         // the mapping is the answer it came for.
-        let reason = gate_only_reason(reflected_ok);
+        let reason = gate_only_reason(reflected_ok, recorder.reason_hint());
+        deregister(&client).await;
         let (record, written) = recorder.finish(reason);
         report_write(written);
         return Ok(record);
     };
 
+    // Held behind an `Arc` from here so the doorbell task can own a handle
+    // and this function keeps one to say goodbye with: every exit from a
+    // `doctor` run deregisters, on the friend path as much as the gate-only
+    // one.
+    let client = std::sync::Arc::new(client);
+
     let introduced = client.introduce(friend_key, 30, None).await;
     if introduced.is_err() {
+        deregister(&client).await;
         let (record, written) = recorder.finish(Reason::IntroduceTimeout);
         report_write(written);
         return Ok(record);
@@ -480,6 +517,7 @@ async fn run_doctor_steps(
     let peer_connection = match client.dial_peer(&friend_key).await {
         Ok(connection) => connection,
         Err(_) => {
+            deregister(&client).await;
             let (record, written) = recorder.finish(Reason::PeerHandshakeFailed);
             report_write(written);
             return Ok(record);
@@ -515,11 +553,12 @@ async fn run_doctor_steps(
     // whichever way the attempt ends.
     let doorbell = {
         let porch_for_task = porch.clone();
+        let client_for_task = std::sync::Arc::clone(&client);
         let peer_connection = peer_connection.clone();
         tokio::spawn(async move {
             mosschat_net::punch::run_doorbell(
                 &porch_for_task,
-                &client,
+                &client_for_task,
                 &peer_connection,
                 params,
                 &control,
@@ -559,26 +598,61 @@ async fn run_doctor_steps(
     } else {
         recorder.probe_failure_reason()
     };
+    deregister(&client).await;
     let (record, written) = recorder.finish(reason);
     report_write(written);
     Ok(record)
 }
 
+/// The `Goodbye.reason` a finished `doctor` run sends. The frame carries a
+/// `u8` and section 1 defines no enum of values for it, so 0 is the plain
+/// clean exit, the value every caller in the workspace already uses.
+const GOODBYE_DOCTOR_DONE: u8 = 0;
+
+/// Deregisters at the gate, which is what ends a `doctor` run cleanly.
+///
+/// Section 1 has `Goodbye` "deregistering at once" and section 4 makes it
+/// the clean exit's own frame. Without it a run leaves its registration
+/// seated at the gate: [`exit_for`] ends the process through
+/// `std::process::exit`, which runs no destructor, so nothing closes the
+/// QUIC connection and the gate holds the slot until quinn's 30 s idle
+/// timeout expires it. Section 1's per-key sub-cap is two live connections,
+/// so a third run inside that window was refused `gate_at_capacity` before
+/// it could register: rows 3 to 10 of the 2026-09-08 fault matrix, one
+/// after another, none of them caused by the fault its row was applying.
+///
+/// The error is deliberately ignored. The run's result is already decided
+/// by the time this is called, and a gate that has gone away cannot be said
+/// goodbye to; section 4 calls a goodbye a courtesy whose absence the peer
+/// is entitled to handle.
+async fn deregister(client: &mosschat_net::gate::client::GateClient) {
+    let _ = client.goodbye(GOODBYE_DOCTOR_DONE).await;
+}
+
 /// The reason a `--gate` run ends with, given whether the secondary port
-/// answered.
+/// answered and any reason the gate named while refusing it.
 ///
 /// A secondary port that did not answer is **not** `udp_blocked` (Konrad's
 /// must 2 on PR #49): section 7 defines that reason as neither gate port
 /// being reachable, and a run that reaches this point registered on the
-/// primary. Section 7 names no reason for one port of two, so it is
+/// primary.
+///
+/// `named_by_gate` is the gate's own answer where it gave one, which is the
+/// difference between a report saying `gate_rate_limited` and one saying
+/// nothing useful: the secondary port refuses an over-rate `Reflect` by
+/// closing, and the close carries section 7's code. Section 7 names no
+/// reason for one port of two failing on its own, so without one it stays
 /// `internal`, its own stated catch-all, with the `reflect_secondary` step
 /// saying what failed and the mapping staying `unknown`, which is all one
 /// reflection can prove.
-fn gate_only_reason(reflected_ok: bool) -> mosschat_net::diag::Reason {
+fn gate_only_reason(
+    reflected_ok: bool,
+    named_by_gate: Option<mosschat_net::diag::Reason>,
+) -> mosschat_net::diag::Reason {
     if reflected_ok {
         mosschat_net::diag::Reason::Ok
     } else {
-        mosschat_net::diag::Reason::Internal
+        named_by_gate.unwrap_or(mosschat_net::diag::Reason::Internal)
     }
 }
 
@@ -622,14 +696,36 @@ mod tests {
     /// else arm, which is what this code did.
     #[test]
     fn a_failed_secondary_reflection_is_not_udp_blocked() {
-        assert_eq!(gate_only_reason(true), mosschat_net::diag::Reason::Ok);
+        assert_eq!(gate_only_reason(true, None), mosschat_net::diag::Reason::Ok);
         assert_eq!(
-            gate_only_reason(false),
+            gate_only_reason(false, None),
             mosschat_net::diag::Reason::Internal
         );
         assert_ne!(
-            gate_only_reason(false),
+            gate_only_reason(false, None),
             mosschat_net::diag::Reason::UdpBlocked
+        );
+    }
+
+    /// A gate that named its refusal is reported by that name, not as
+    /// `internal`: the secondary port refuses an over-rate `Reflect` by
+    /// closing with section 7's `gate_rate_limited` code, and a record
+    /// saying `internal` for a refusal the gate spelled out is the
+    /// untruthful half of the 2026-09-08 fault matrix's exit-0 bug.
+    ///
+    /// Deliberate break to fail this test: drop the `named_by_gate`
+    /// parameter and return `Reason::Internal` for every failed
+    /// reflection, which is what this code did.
+    #[test]
+    fn a_reason_the_gate_named_survives_into_the_record() {
+        assert_eq!(
+            gate_only_reason(false, Some(mosschat_net::diag::Reason::GateRateLimited)),
+            mosschat_net::diag::Reason::GateRateLimited
+        );
+        // A successful reflection is `ok` whatever else was hinted.
+        assert_eq!(
+            gate_only_reason(true, Some(mosschat_net::diag::Reason::GateRateLimited)),
+            mosschat_net::diag::Reason::Ok
         );
     }
 }

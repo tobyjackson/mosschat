@@ -298,6 +298,30 @@ in house-b between rows, or write a small wrapper script that does that
 and pass the wrapper as the command instead. `fault-matrix.sh --help`
 lists every row id if you want to run a subset with `--rows`.
 
+### One identity cannot run every row
+
+`mosschat doctor` is a real house session: it registers on the gate's
+primary port and then reflects off the secondary one, on a second
+connection. Section 1 of `docs/dev/gatehouse-design.md` rate limits both
+**per key**, and the matrix runs twelve rows back to back, so pointing
+every row at one `--identity-file` hits those limits from the third row
+on, whatever netem is doing:
+
+- `Reflect`, 2 per minute per key: from the third run the secondary
+  reflection is refused, and the run exits 1 with reason
+  `gate_rate_limited` and `failed_step reflect_secondary`.
+- `Register`, 4 connection attempts per key per minute: from the fifth
+  run the registration itself is refused, same reason, `failed_step
+  gate_register`.
+
+Neither is the row's own fault condition. Give each row its own identity
+(one seed file per row, every one of those public keys in the gate's
+members file), or pace the rows at least 60 seconds apart, and say which
+you did beside the results. The 2026-09-08 run did neither: its rows 3 to
+10 ran inside four seconds on one identity and measured the gate's per-key
+limits, not netem, and rows 11 and 12 passed only because the
+`blackout-60s` row's own 60 second hold had let the buckets refill.
+
 Every row is bounded by `timeout --kill-after=5 <row-timeout>` (default
 180 seconds, `--row-timeout` to change it), and `timeout` kills its
 child by pid, not by name. **If a row hangs or you interrupt with

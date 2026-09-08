@@ -612,9 +612,30 @@ impl GateClient {
         // connection's own lease was taken before this line.
         porch.forget_source(primary_lease);
 
-        let (mut send, mut recv) = authed_conn.connection().open_bi().await?;
-        wire::write_frame(&mut send, &Frame::Register { v: 1, community }).await?;
-        let reply = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
+        // Every one of the three below used to be a bare `?`: the dial had
+        // been recorded `ok` and the next step recorded nothing at all, so a
+        // gate that closed the connection during registration (it refuses
+        // `gate_at_capacity` and `gate_rate_limited` by closing, not always
+        // by frame 12) produced a record with no failed step, which reads as
+        // a run that simply stopped. `register_step` records `gate_register`
+        // against whichever of them failed, so the record names the step the
+        // house was on when the gate went away, and says why where the gate
+        // said.
+        let register_step = |e: GateError| {
+            record_gate_close(rec, Step::GateRegister, &e, authed_conn.connection());
+            e
+        };
+        let (mut send, mut recv) = authed_conn
+            .connection()
+            .open_bi()
+            .await
+            .map_err(|e| register_step(e.into()))?;
+        wire::write_frame(&mut send, &Frame::Register { v: 1, community })
+            .await
+            .map_err(register_step)?;
+        let reply = wire::read_frame(&mut recv, authed::control_read_deadline())
+            .await
+            .map_err(register_step)?;
         let (registered_observed, registered_secondary_port) = match reply {
             Frame::Registered {
                 observed,
@@ -850,14 +871,39 @@ impl GateClient {
         wire::write_frame(&mut send, &Frame::Keepalive { v: 1 }).await
     }
 
-    /// Sends `Goodbye` and closes the gate connection.
+    /// Sends `Goodbye` and closes the gate connection, returning once the
+    /// gate has let the registration go.
+    ///
+    /// Section 1 has `Goodbye` "deregistering at once", and the gate drops
+    /// the connection as soon as it has: waiting for that close is the
+    /// acknowledgement that the slot is free, and the only one the protocol
+    /// offers. Closing straight after the write instead, which is what this
+    /// did, is a race quinn is documented to lose (`close` abandons data
+    /// not yet transmitted), and a caller that ends the process next
+    /// (`mosschat doctor`, through `std::process::exit`) leaves the driver
+    /// no chance to send either frame: the registration then sat at the
+    /// gate until its 30 s idle timeout, and with section 1's sub-cap of
+    /// two live connections per key the third run inside that window was
+    /// refused before it could register.
+    ///
+    /// The wait is bounded by section 5's deadline for a frame that should
+    /// follow immediately, so a gate that never lets go, or one that has
+    /// already gone, cannot hold the caller; the close below runs either
+    /// way.
     ///
     /// # Errors
     ///
     /// Returns a [`GateError`] if the write fails.
     pub async fn goodbye(&self, reason: u8) -> Result<(), GateError> {
-        let mut send = self.inner.control_send.lock().await;
-        wire::write_frame(&mut send, &Frame::Goodbye { v: 1, reason }).await?;
+        {
+            let mut send = self.inner.control_send.lock().await;
+            wire::write_frame(&mut send, &Frame::Goodbye { v: 1, reason }).await?;
+        }
+        let _ = tokio::time::timeout(
+            authed::control_read_deadline(),
+            self.inner.gate.connection().closed(),
+        )
+        .await;
         self.inner.gate.connection().close(0u32.into(), b"goodbye");
         Ok(())
     }
@@ -900,9 +946,25 @@ impl GateClient {
                 return Err(e.into());
             }
         };
-        let (mut send, mut recv) = connection.open_bi().await?;
-        wire::write_frame(&mut send, &Frame::Reflect { v: 1 }).await?;
-        let reply = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
+        // The same gap the registration window had, and the same fix: the
+        // secondary port refuses an over-rate `Reflect` by closing the
+        // connection with no frame at all, so a bare `?` here left the
+        // record with no failed step and `doctor --gate` exited 0 on a
+        // reflection that never happened.
+        let reflect_step = |e: GateError| {
+            record_gate_close(rec, Step::ReflectSecondary, &e, &connection);
+            e
+        };
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| reflect_step(e.into()))?;
+        wire::write_frame(&mut send, &Frame::Reflect { v: 1 })
+            .await
+            .map_err(reflect_step)?;
+        let reply = wire::read_frame(&mut recv, authed::control_read_deadline())
+            .await
+            .map_err(reflect_step)?;
         // Closes promptly so the gate's secondary-port handler (which waits
         // for this before dropping its own `Connection`, see `server.rs`)
         // does not sit on its bounded wait for no reason.
@@ -1155,6 +1217,50 @@ impl GateClient {
             "end to end connection open over the relay",
         );
         Ok(authed_conn.connection().clone())
+    }
+}
+
+/// Records `step` as failed, carrying whatever the gate said as it closed:
+/// its wording in the detail, and, when the close named one of section 7's
+/// codes, that as the record's reason.
+fn record_gate_close(
+    rec: Option<&Recorder>,
+    step: Step,
+    e: &GateError,
+    connection: &quinn::Connection,
+) {
+    if let (Some(recorder), Some(reason)) = (rec, gate_close_reason(connection)) {
+        recorder.set_reason_hint(reason);
+    }
+    diag::record(rec, step, StepOutcome::Fail, closed_detail(e, connection));
+}
+
+/// Section 7's reason from a connection the gate closed, when the close
+/// carried one of [`crate::gate::ErrorCode`]'s values as its QUIC
+/// application error code (`server.rs::close_refused`). Code 0 is an
+/// ordinary close and names no reason.
+fn gate_close_reason(connection: &quinn::Connection) -> Option<Reason> {
+    let quinn::ConnectionError::ApplicationClosed(closed) = connection.close_reason()? else {
+        return None;
+    };
+    let code = u8::try_from(u64::from(closed.error_code)).ok()?;
+    (code != 0).then(|| reason_for_error_code(code))
+}
+
+/// The detail a failed control exchange is recorded with: the error, plus
+/// the connection's own close reason where it has one.
+///
+/// quinn folds every stream error on a dead connection into "connection
+/// lost", which says nothing about why it died. A gate refusal that cannot
+/// be answered with frame 12, because no stream is open yet (the connection
+/// attempt rate limit) or because the frame did not outrun the close, puts
+/// its reason in the CONNECTION_CLOSE instead, and this is the only place
+/// the house can read it. Without it the record's detail was "stream read
+/// error: connection lost" for a refusal the gate had named.
+fn closed_detail(e: &GateError, connection: &quinn::Connection) -> String {
+    match connection.close_reason() {
+        Some(reason) => format!("{e} ({reason})"),
+        None => e.to_string(),
     }
 }
 

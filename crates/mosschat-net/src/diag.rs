@@ -1639,6 +1639,23 @@ impl Recorder {
         self.inner.state.lock_or_recover().failed_step
     }
 
+    /// The last step recorded, whatever its outcome, or `None` when nothing
+    /// has been recorded yet.
+    ///
+    /// It is how a caller holding an error that recorded no step of its own
+    /// works out which step was in flight: section 7's steps are recorded in
+    /// the order they were tried, so the one that failed is the one that
+    /// would have followed this.
+    #[must_use]
+    pub fn last_step(&self) -> Option<Step> {
+        self.inner
+            .state
+            .lock_or_recover()
+            .steps
+            .last()
+            .map(|recorded| recorded.step)
+    }
+
     /// Section 7's inference for a probe burst that answered nothing,
     /// applied to what this attempt has observed:
     /// `endpoint_dependent_mapping` when the two reflections differed,
