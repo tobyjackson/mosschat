@@ -612,9 +612,30 @@ impl GateClient {
         // connection's own lease was taken before this line.
         porch.forget_source(primary_lease);
 
-        let (mut send, mut recv) = authed_conn.connection().open_bi().await?;
-        wire::write_frame(&mut send, &Frame::Register { v: 1, community }).await?;
-        let reply = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
+        // Every one of the three below used to be a bare `?`: the dial had
+        // been recorded `ok` and the next step recorded nothing at all, so a
+        // gate that closed the connection during registration (it refuses
+        // `gate_at_capacity` and `gate_rate_limited` by closing, not always
+        // by frame 12) produced a record with no failed step, which reads as
+        // a run that simply stopped. `register_step` records `gate_register`
+        // against whichever of them failed, so the record names the step the
+        // house was on when the gate went away, and says why where the gate
+        // said.
+        let register_step = |e: GateError| {
+            record_gate_close(rec, Step::GateRegister, &e, authed_conn.connection());
+            e
+        };
+        let (mut send, mut recv) = authed_conn
+            .connection()
+            .open_bi()
+            .await
+            .map_err(|e| register_step(e.into()))?;
+        wire::write_frame(&mut send, &Frame::Register { v: 1, community })
+            .await
+            .map_err(register_step)?;
+        let reply = wire::read_frame(&mut recv, authed::control_read_deadline())
+            .await
+            .map_err(register_step)?;
         let (registered_observed, registered_secondary_port) = match reply {
             Frame::Registered {
                 observed,
@@ -664,10 +685,14 @@ impl GateClient {
                     rec,
                     Step::GateRegister,
                     StepOutcome::Fail,
-                    format!("gate refused registration: code={code} detail={detail}"),
+                    format!(
+                        "gate refused registration: code={code} detail={}",
+                        gate_text(&detail)
+                    ),
                 );
                 return Err(GateError::Protocol(format!(
-                    "gate refused registration: code={code} detail={detail}"
+                    "gate refused registration: code={code} detail={}",
+                    gate_text(&detail)
                 )));
             }
             other => {
@@ -850,16 +875,64 @@ impl GateClient {
         wire::write_frame(&mut send, &Frame::Keepalive { v: 1 }).await
     }
 
-    /// Sends `Goodbye` and closes the gate connection.
+    /// Sends `Goodbye` and closes the gate connection, returning once the
+    /// gate has let the registration go.
+    ///
+    /// Section 1 has `Goodbye` "deregistering at once", and the gate drops
+    /// the connection as soon as it has: waiting for that close is the
+    /// acknowledgement that the slot is free, and the only one the protocol
+    /// offers. Closing straight after the write instead, which is what this
+    /// did, is a race quinn is documented to lose (`close` abandons data
+    /// not yet transmitted), and a caller that ends the process next
+    /// (`mosschat doctor`, through `std::process::exit`) leaves the driver
+    /// no chance to send either frame: the registration then sat at the
+    /// gate until its 30 s idle timeout, and with section 1's sub-cap of
+    /// two live connections per key the third run inside that window was
+    /// refused before it could register.
+    ///
+    /// **The whole call is bounded**, on one budget of section 5's deadline
+    /// for a frame that should follow immediately (Yseult's M1 on PR 69).
+    /// Not just the wait: taking the control stream's lock and writing to
+    /// it both block with no deadline of their own, `write_all` on stream
+    /// flow control, so a peer that stops issuing `MAX_STREAM_DATA` could
+    /// hang a caller that had already finished its work. Every other
+    /// network step of a `doctor` run is bounded at its call site, and
+    /// `main.rs` says in as many words that a doctor which does not return
+    /// is not a doctor.
+    ///
+    /// The close runs whether the budget was spent or not: it frees the
+    /// gate's slot as surely as the `Goodbye` does, and a gate that has
+    /// already gone cannot be waited on.
     ///
     /// # Errors
     ///
-    /// Returns a [`GateError`] if the write fails.
+    /// Returns [`GateError::Timeout`] if the frame could not be written
+    /// inside the deadline, or a [`GateError`] if the write itself failed.
+    /// Waiting for the gate to let go is best effort: running out of budget
+    /// there is not an error, since the frame is already gone.
     pub async fn goodbye(&self, reason: u8) -> Result<(), GateError> {
-        let mut send = self.inner.control_send.lock().await;
-        wire::write_frame(&mut send, &Frame::Goodbye { v: 1, reason }).await?;
-        self.inner.gate.connection().close(0u32.into(), b"goodbye");
-        Ok(())
+        let deadline = tokio::time::Instant::now() + authed::control_read_deadline();
+        let connection = self.inner.gate.connection().clone();
+        let written = tokio::time::timeout_at(deadline, async {
+            let mut send = self.inner.control_send.lock().await;
+            wire::write_frame(&mut send, &Frame::Goodbye { v: 1, reason }).await
+        })
+        .await;
+        // Whatever happened above, stop holding this connection.
+        let outcome = match written {
+            Ok(Ok(())) => {
+                // The gate deregisters on `Goodbye` and then drops the
+                // connection, so its close is the acknowledgement that the
+                // slot is free, and the only one the protocol offers. What
+                // is left of the same budget bounds it.
+                let _ = tokio::time::timeout_at(deadline, connection.closed()).await;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(GateError::Timeout),
+        };
+        connection.close(0u32.into(), b"goodbye");
+        outcome
     }
 
     /// Reflects off the gate's secondary port, returning the address it
@@ -900,9 +973,25 @@ impl GateClient {
                 return Err(e.into());
             }
         };
-        let (mut send, mut recv) = connection.open_bi().await?;
-        wire::write_frame(&mut send, &Frame::Reflect { v: 1 }).await?;
-        let reply = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
+        // The same gap the registration window had, and the same fix: the
+        // secondary port refuses an over-rate `Reflect` by closing the
+        // connection with no frame at all, so a bare `?` here left the
+        // record with no failed step and `doctor --gate` exited 0 on a
+        // reflection that never happened.
+        let reflect_step = |e: GateError| {
+            record_gate_close(rec, Step::ReflectSecondary, &e, &connection);
+            e
+        };
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| reflect_step(e.into()))?;
+        wire::write_frame(&mut send, &Frame::Reflect { v: 1 })
+            .await
+            .map_err(reflect_step)?;
+        let reply = wire::read_frame(&mut recv, authed::control_read_deadline())
+            .await
+            .map_err(reflect_step)?;
         // Closes promptly so the gate's secondary-port handler (which waits
         // for this before dropping its own `Connection`, see `server.rs`)
         // does not sit on its bounded wait for no reason.
@@ -1156,6 +1245,82 @@ impl GateClient {
         );
         Ok(authed_conn.connection().clone())
     }
+}
+
+/// Records `step` as failed, carrying whatever the gate said as it closed:
+/// its wording in the detail, and, when the close named one of section 7's
+/// codes, that as the record's reason.
+fn record_gate_close(
+    rec: Option<&Recorder>,
+    step: Step,
+    e: &GateError,
+    connection: &quinn::Connection,
+) {
+    if let (Some(recorder), Some(reason)) = (rec, gate_close_reason(connection)) {
+        recorder.set_reason_hint(reason);
+    }
+    diag::record(rec, step, StepOutcome::Fail, closed_detail(e, connection));
+}
+
+/// Section 7's reason from a connection the gate closed, when the close
+/// carried one of [`crate::gate::ErrorCode`]'s values as its QUIC
+/// application error code (`server.rs::close_refused`). Code 0 is an
+/// ordinary close and names no reason.
+fn gate_close_reason(connection: &quinn::Connection) -> Option<Reason> {
+    let quinn::ConnectionError::ApplicationClosed(closed) = connection.close_reason()? else {
+        return None;
+    };
+    let code = u8::try_from(u64::from(closed.error_code)).ok()?;
+    (code != 0).then(|| reason_for_error_code(code))
+}
+
+/// The detail a failed control exchange is recorded with: the error, plus
+/// the connection's own close reason where it has one.
+///
+/// quinn folds every stream error on a dead connection into "connection
+/// lost", which says nothing about why it died. A gate refusal that cannot
+/// be answered with frame 12, because no stream is open yet (the connection
+/// attempt rate limit) or because the frame did not outrun the close, puts
+/// its reason in the CONNECTION_CLOSE instead, and this is the only place
+/// the house can read it. Without it the record's detail was "stream read
+/// error: connection lost" for a refusal the gate had named.
+fn closed_detail(e: &GateError, connection: &quinn::Connection) -> String {
+    match connection.close_reason() {
+        Some(reason) => format!("{e} ({})", gate_text(&reason.to_string())),
+        None => e.to_string(),
+    }
+}
+
+/// Text the gate authored, made safe to put in a record a person reads.
+///
+/// Control characters are dropped and the rest is cut to
+/// [`wire::ERROR_DETAIL_CAP`], the cap section 1 already puts on the one
+/// field the gate fills in (Yseult's L1 on PR 69). Two reasons, both about
+/// the human report, which interpolates a step's detail raw where the JSON
+/// form caps it: a QUIC close reason is whatever bytes the peer sent, up to
+/// about a packet's worth, rendered by `String::from_utf8_lossy`, so
+/// without this a hostile or impersonated gate can forge or hide lines in a
+/// report section 7 expects to be pasted into an issue, and can put ANSI
+/// escapes on the terminal it is printed to. `char::is_control` is exactly
+/// Unicode's Cc: C0, DEL and C1.
+fn gate_text(text: &str) -> String {
+    /// Cutting is marked rather than silent, for the reason `diag.rs`'s own
+    /// cap marks it: a record that quietly says something other than what
+    /// it was given is worse than one that says it was cut.
+    const CUT: &str = "...";
+    let mut out = String::with_capacity(text.len().min(wire::ERROR_DETAIL_CAP));
+    let mut cut = false;
+    for c in text.chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > wire::ERROR_DETAIL_CAP - CUT.len() {
+            cut = true;
+            break;
+        }
+        out.push(c);
+    }
+    if cut {
+        out.push_str(CUT);
+    }
+    out
 }
 
 /// Section 7's reason for a gate refusal, from frame 12's `code`, which is
@@ -1440,6 +1605,33 @@ pub fn verify_signature(
 )]
 mod tests {
     use super::*;
+
+    /// Gate-authored text cannot forge lines in a report or move a
+    /// terminal's cursor, and cannot outrun section 1's own cap on the one
+    /// field the gate fills in (Yseult's L1 on PR 69).
+    ///
+    /// Deliberate break to fail this test: return `text.to_string()` from
+    /// `gate_text`, which is what interpolating the close reason did.
+    #[test]
+    fn gate_authored_text_is_stripped_of_control_characters_and_capped() {
+        let hostile = "ok\u{1b}[2K\rfailed step gate_dial\nreason ok";
+        let safe = gate_text(hostile);
+        assert!(
+            !safe.chars().any(char::is_control),
+            "no C0, DEL or C1 survives: {safe:?}"
+        );
+        assert!(!safe.contains('\n') && !safe.contains('\r'));
+        assert_eq!(safe, "ok[2Kfailed step gate_dialreason ok");
+
+        // Cut on a char boundary, never through one, never past the cap,
+        // and visibly: a close reason is up to a packet's worth of peer
+        // bytes.
+        let long = "e\u{e9}".repeat(wire::ERROR_DETAIL_CAP);
+        let capped = gate_text(&long);
+        assert!(capped.len() <= wire::ERROR_DETAIL_CAP, "{}", capped.len());
+        assert!(capped.ends_with("..."), "{capped:?}");
+        assert!(long.starts_with(capped.trim_end_matches('.')));
+    }
 
     #[test]
     fn seal_and_open_round_trip_a_friend_body() {

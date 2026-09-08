@@ -534,7 +534,7 @@ async fn handle_secondary_connection(
         members.contains(&authed.peer_key())
     };
     if !is_member {
-        authed.connection().close(0u32.into(), b"not a member");
+        close_refused(&authed, ErrorCode::RefusedNotMember, b"not a member");
         return Ok(());
     }
 
@@ -551,7 +551,7 @@ async fn handle_secondary_connection(
             .counters
             .reflect_rate_limited
             .fetch_add(1, Ordering::Relaxed);
-        authed.connection().close(0u32.into(), b"gate_rate_limited");
+        close_refused(&authed, ErrorCode::RateLimited, b"gate_rate_limited");
         return Ok(());
     }
 
@@ -653,7 +653,7 @@ async fn handle_primary_connection(
         members.contains(&peer_key)
     };
     if !is_member {
-        authed.connection().close(0u32.into(), b"not a member");
+        close_refused(&authed, ErrorCode::RefusedNotMember, b"not a member");
         return Ok(());
     }
 
@@ -664,7 +664,7 @@ async fn handle_primary_connection(
             .counters
             .pending_connections_refused
             .fetch_add(1, Ordering::Relaxed);
-        authed.connection().close(0u32.into(), b"gate at capacity");
+        close_refused(&authed, ErrorCode::AtCapacity, b"gate at capacity");
         return Ok(());
     };
 
@@ -680,7 +680,7 @@ async fn handle_primary_connection(
         limiter.try_take()
     };
     if !attempt_allowed {
-        authed.connection().close(0u32.into(), b"gate_rate_limited");
+        close_refused(&authed, ErrorCode::RateLimited, b"gate_rate_limited");
         return Ok(());
     }
 
@@ -1327,7 +1327,41 @@ async fn send_error_and_close(
     };
     let _ = wire::write_frame(send, &frame).await;
     let _ = send.finish();
-    authed.connection().close(0u32.into(), detail.as_bytes());
+    // Closing here used to be immediate, which discarded the frame just
+    // written more often than it delivered it: `close` is documented to
+    // abandon data not yet transmitted, so section 1's "the gate answers
+    // `Error{...}`" reached the house only by luck, and a refused house saw
+    // an unexplained dead connection instead of a code. The house closes as
+    // soon as it has read the frame, so waiting for that is both the
+    // acknowledgement and the cue to let go; bounded, so a house that never
+    // closes cannot hold this task. Same shape as the secondary port's wait
+    // after a `Reflected`.
+    let _ = tokio::time::timeout(
+        authed::control_read_deadline(),
+        authed.connection().closed(),
+    )
+    .await;
+    close_refused(authed, code, detail.as_bytes());
+}
+
+/// Closes a connection the gate is refusing, carrying the refusal's
+/// [`ErrorCode`] as the QUIC application error code and its wording as the
+/// close reason.
+///
+/// Beyond the design's letter, and deliberately (see PR): section 1 has the
+/// gate answer a refusal with frame 12, but two of its refusals happen
+/// before any stream exists (the membership check and the connection
+/// attempt rate limit, both run "as soon as the handshake completes, before
+/// the gate awaits any stream"), so there is nothing to write a frame on.
+/// Those closed with error code 0 and a human-readable reason, which left
+/// the house nothing machine-readable: section 7's `gate_refused_not_member`
+/// and `gate_rate_limited` exist as reasons and a refused house could not
+/// name either, so its record said `internal`. The code carried here is the
+/// same enum frame 12 carries, so a house reads one vocabulary either way.
+fn close_refused(authed: &AuthedConnection, code: ErrorCode, reason: &[u8]) {
+    authed
+        .connection()
+        .close(u32::from(code as u8).into(), reason);
 }
 
 /// Generates a fresh random ed25519 identity seed for a gate that was not
