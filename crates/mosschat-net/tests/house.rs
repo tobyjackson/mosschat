@@ -253,10 +253,17 @@ mod house {
             (caller, connection, outcome.session)
         }
 
-        async fn stop(mut self) {
+        /// Asks the house to stop without waiting for it or removing its
+        /// diagnostics directory, so a test can read the record its
+        /// visits settle on the way out.
+        fn ask_to_stop(&mut self) {
             if let Some(stop) = self.stop_house.take() {
                 let _ = stop.send(());
             }
+        }
+
+        async fn stop(mut self) {
+            self.ask_to_stop();
             let stopped = tokio::time::timeout(Duration::from_secs(10), self.house_task).await;
             assert!(stopped.is_ok(), "the house must stop when it is asked to");
             let _ = std::fs::remove_dir_all(&self.house_diagnostics);
@@ -540,42 +547,63 @@ mod house {
     }
 
     /// Run 3, finding 1 of issue 84: section 4 covers the relay path, so a
-    /// relayed visit whose peer stops answering is reported as
-    /// `path_stale` then `path_dead` and settles with a reason that names
-    /// the path death, instead of dying in silence under whatever the
-    /// upgrade had failed of earlier.
+    /// relayed visit whose relay goes quiet is reported as `path_stale`
+    /// then `path_dead` **on both sides**, and both settle with a reason
+    /// that names the path death instead of whatever the upgrade had
+    /// failed of earlier.
     ///
     /// Both ends run `--no-punch`, which is the shortest way to a visit
-    /// that is relayed for its whole life, and the caller then stops
-    /// answering probes, which is what a blackout looks like from the
-    /// house's end. The house's probes go to the caller's synthetic
-    /// address, so they travel as `Relay` payloads through the real gate:
-    /// nothing here is simulated but the silence.
+    /// that is relayed for its whole life. The blackout is the caller
+    /// detaching its gate from its own porch socket, which stops its relay
+    /// leg in both directions at once: its probes queue and never leave,
+    /// and nothing the house sends arrives. That is what a blackout is,
+    /// and it is why both sides are asserted here rather than one: a
+    /// one-way silence would leave the silenced side's own probes answered
+    /// and prove only half of this. The probes themselves are real
+    /// `Relay` payloads through a real gate up to the moment it is
+    /// detached; nothing here is simulated but the outage.
     ///
     /// Deliberate break to fail this test: change `Phase::Relayed`'s arm
     /// in `run_doorbell` back to `Phase::Relayed => {}`, which is the code
-    /// this fixes. The house then sends no relay probe, never goes stale
-    /// or dead, and both event assertions below fail on a visit that ran
-    /// for a minute with nothing to say. Second break: move the
+    /// this fixes. Neither side then sends a relay probe, neither goes
+    /// stale or dead, and the first event assertion fails on a visit that
+    /// ran for a minute with nothing to say. Second break: move the
     /// `if relay_dead` early return in `end_of_visit_reason` below the
-    /// `no_punch` branch, and the reason assertion reads `punch_disabled`.
+    /// `no_punch` branch, and both reasons read `punch_disabled`.
     #[tokio::test]
     async fn a_relayed_visit_that_goes_quiet_is_reported_stale_then_dead() {
-        let (fixture, caller_seed) = Fixture::start("relaydead", true).await;
+        let (mut fixture, caller_seed) = Fixture::start("relaydead", true).await;
         let (caller, connection, session) = fixture.call(caller_seed).await;
 
         let caller_diagnostics = diag_dir("relaydead-caller");
+        let caller_events = Collected::default();
+        let sink = {
+            let collected = Arc::clone(&caller_events.0);
+            VisitEventSink::new(move |kind, detail| {
+                collected.lock().unwrap().push(HouseEvent {
+                    at_ms: 0,
+                    kind,
+                    peer: None,
+                    detail: detail.to_string(),
+                });
+            })
+        };
         let control = DoorbellControl::new();
         let held = Held {
             caller: &caller,
             connection: &connection,
             session,
             peer_key: fixture.house_key,
-            hold: Hold::For(Duration::from_secs(60)),
+            // Long enough for stale (about 2 s) and dead (5 s of grace
+            // after it) with room to spare, short enough that the record
+            // this asserts arrives without waiting out a QUIC idle
+            // timeout: the hold elapsing is what settles it, the relay it
+            // would say goodbye on being gone.
+            hold: Hold::For(Duration::from_secs(12)),
             no_punch: true,
             control: &control,
             diagnostics: &caller_diagnostics,
-            events: None,
+            events: Some(sink),
             candidates: None,
             vouch_peer: true,
         }
@@ -586,38 +614,68 @@ mod house {
             .wait_for(VisitEventKind::VisitOpen, Duration::from_secs(10))
             .await
             .expect("the visit must open on the relay");
-
-        // The blackout: the caller's porch stops answering, so the house's
-        // relay probes go out and nothing comes back.
-        control.stop_answering_probes();
-
-        let stale = fixture
-            .events
-            .wait_for(VisitEventKind::PathStale, Duration::from_secs(15))
+        caller_events
+            .wait_for(VisitEventKind::VisitOpen, Duration::from_secs(10))
             .await
-            .expect("section 4 must notice a relay that stopped answering");
-        assert!(
-            stale.detail.contains("relay"),
-            "the event names the path that went quiet: {}",
-            stale.detail
-        );
-        let dead = fixture
-            .events
-            .wait_for(VisitEventKind::PathDead, Duration::from_secs(30))
+            .expect("the caller must see its own visit open");
+
+        // The blackout, both directions at once.
+        caller
+            .porch()
+            .detach_gate(caller.gate_connection().remote_address());
+
+        for (whose, events) in [("callee", &fixture.events), ("caller", &caller_events)] {
+            let stale = events
+                .wait_for(VisitEventKind::PathStale, Duration::from_secs(15))
+                .await
+                .unwrap_or_else(|| {
+                    panic!("section 4 must notice a relay that stopped answering ({whose})")
+                });
+            assert!(
+                stale.detail.contains("relay"),
+                "the {whose}'s event names the path that went quiet: {}",
+                stale.detail
+            );
+            let dead = events
+                .wait_for(VisitEventKind::PathDead, Duration::from_secs(30))
+                .await
+                .unwrap_or_else(|| {
+                    panic!("a relay that never answers again is dead, not stale ({whose})")
+                });
+            assert!(
+                dead.detail.contains("relay"),
+                "the {whose}'s event names the path that died: {}",
+                dead.detail
+            );
+        }
+
+        // The caller's own record, settled when its hold elapses.
+        let caller_record = tokio::time::timeout(Duration::from_secs(30), held)
             .await
-            .expect("a relay that never answers again is dead, not merely stale");
+            .expect("the caller's hold must end")
+            .unwrap();
+        assert_eq!(
+            caller_record.reason,
+            Reason::PathIdleTimeout,
+            "the caller's reason names the path death, not the flag it ran under: {:?}",
+            caller_record.steps
+        );
         assert!(
-            dead.detail.contains("relay"),
-            "the event names the path that died: {}",
-            dead.detail
+            caller_record
+                .events
+                .iter()
+                .any(|event| event.event == VisitEventKind::PathDead),
+            "the caller's record carries the death as an event too: {:?}",
+            caller_record.events
         );
 
-        // The house's own record for this visit, once its peer hangs up:
-        // the reason names what ended it.
-        connection.close(0u32.into(), b"blackout over");
+        // The callee's, settled on its way out: its relay is gone, so
+        // nothing else will end its visit.
+        let house_diagnostics = fixture.house_diagnostics.clone();
+        fixture.ask_to_stop();
         let house_record = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if let Some(record) = records_in(&fixture.house_diagnostics)
+                if let Some(record) = records_in(&house_diagnostics)
                     .into_iter()
                     .find(|record| record.reason != Reason::Internal)
                 {
@@ -627,15 +685,15 @@ mod house {
             }
         })
         .await
-        .expect("the house must settle its record once the visit ends");
+        .expect("the house must settle its record once its visit ends");
         assert_eq!(
             house_record.reason,
             Reason::PathIdleTimeout,
-            "the reason names the path death, not the upgrade that was never asked for: {:?}",
+            "the callee's reason names the same thing from its own side: {:?}",
             house_record.steps
         );
 
-        let _ = tokio::time::timeout(Duration::from_secs(10), held).await;
+        connection.close(0u32.into(), b"test over");
         let _ = std::fs::remove_dir_all(&caller_diagnostics);
         fixture.stop().await;
     }
