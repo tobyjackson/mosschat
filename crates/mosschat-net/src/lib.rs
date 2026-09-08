@@ -8,7 +8,9 @@
 
 pub mod authed;
 pub mod diag;
+pub mod discovery;
 pub mod gate;
+pub mod live;
 pub(crate) mod lockext;
 pub mod path;
 pub mod punch;

@@ -379,6 +379,7 @@ mod punch {
                         peer_key: alice_key,
                         candidates,
                         peer_observed: bob.peer_observed_for(outcome.session),
+                        peer_discovered: Vec::new(),
                     },
                     &bob_control,
                 )
@@ -401,6 +402,7 @@ mod punch {
                         peer_key: bob_key,
                         candidates,
                         peer_observed: alice.peer_observed_for(outcome.session),
+                        peer_discovered: Vec::new(),
                     },
                     &alice_control,
                 )
@@ -651,6 +653,7 @@ mod punch {
                         peer_key: alice_key,
                         candidates,
                         peer_observed: ninth.peer_observed_for(outcome.session),
+                        peer_discovered: Vec::new(),
                     },
                     &ninth_control,
                 )
@@ -673,6 +676,7 @@ mod punch {
                         peer_key: ninth_key,
                         candidates,
                         peer_observed: alice.peer_observed_for(outcome.session),
+                        peer_discovered: Vec::new(),
                     },
                     &alice_control,
                 )

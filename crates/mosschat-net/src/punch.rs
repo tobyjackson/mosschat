@@ -58,6 +58,19 @@ pub const PROBE_SLOW_INTERVAL: Duration = Duration::from_secs(1);
 /// the attempt stays on the relay for good.
 pub const PROBE_GIVE_UP: Duration = Duration::from_secs(10);
 
+/// How many of an attempt's [`MAX_CANDIDATES`] slots discovery may take
+/// (Yseult's High 2).
+///
+/// The design states no number, so this is the smallest one that does the
+/// job: 4, because a house has at most one address per family per
+/// interface on a network it shares with a peer, and two of each is
+/// already generous. Discovery is the one candidate source a stranger on
+/// the LAN can drive, so uncapped it fills all 16 slots and the peer's own
+/// list never enters the attempt at all, which leaves a pair that could
+/// have gone direct on the relay for good. Peer-listed and gate-reflected
+/// candidates are added first and are never evicted by a discovery.
+pub const DISCOVERY_CANDIDATE_SLOTS: usize = 4;
+
 /// Section 2 step 6: the first candidate to answer this many *consecutive*
 /// probes wins. Three because one answer can be a duplicate or a
 /// reflection while three in a row show a mapping that persists, and at
@@ -716,14 +729,20 @@ pub struct Winner {
 pub struct Attempt {
     id: [u8; 16],
     key: [u8; 32],
-    /// The peer's address as the gate observed it for this attempt (frame
-    /// 6's `peer_observed`), which is the one address a peer may name that
-    /// is not globally routable: the gate saw the packet come from it, so
-    /// it is not a third party this peer picked. See
-    /// [`Attempt::add_candidate`].
-    gate_reflected_peer: Option<SocketAddr>,
+    /// The addresses something other than this peer's own say-so vouches
+    /// for **in this attempt**, and so the only addresses outside the
+    /// globally routable range its `Candidates` frame may name: the gate's
+    /// reflection of that peer (frame 6's `peer_observed`), and every
+    /// address this house heard that peer announce from on its own network
+    /// (section 6). Held unmapped, so one address has one spelling here
+    /// and cannot be vouched for in a form the classifier does not read
+    /// (issue #37). See [`Attempt::add_candidate`].
+    vouched: Vec<SocketAddr>,
     fire_at: Option<Instant>,
     candidates: Vec<Candidate>,
+    /// How many of the table's slots discovery has taken, capped at
+    /// [`DISCOVERY_CANDIDATE_SLOTS`] (Yseult's High 2).
+    discovery_candidates: usize,
     winner: Option<Winner>,
 }
 
@@ -744,19 +763,23 @@ impl Attempt {
     /// A fresh attempt with no candidates and no start signal yet.
     ///
     /// `gate_reflected_peer` is the peer's address as the gate observed it
-    /// for this attempt (frame 6's `peer_observed`). It is the one
-    /// non-globally-routable address the peer is allowed to name, because
-    /// the gate saw a packet arrive from it rather than taking the peer's
-    /// word; `None` means the peer may name only globally routable
-    /// addresses.
+    /// for this attempt (frame 6's `peer_observed`). It is one of the
+    /// non-globally-routable addresses the peer is allowed to name,
+    /// because the gate saw a packet arrive from it rather than taking the
+    /// peer's word; the others are whatever [`Attempt::add_discovered`]
+    /// puts in. `None` means the gate vouches for nothing here.
     #[must_use]
     pub fn new(id: [u8; 16], key: [u8; 32], gate_reflected_peer: Option<SocketAddr>) -> Self {
         Self {
             id,
             key,
-            gate_reflected_peer,
+            vouched: gate_reflected_peer
+                .map(crate::sock::unmap_v4)
+                .into_iter()
+                .collect(),
             fire_at: None,
             candidates: Vec::new(),
+            discovery_candidates: 0,
             winner: None,
         }
     }
@@ -771,16 +794,21 @@ impl Attempt {
     /// [`MAX_CANDIDATES`] cap is already reached, or the address is one a
     /// peer may not point this house at.
     ///
-    /// **What a peer may name** (Yseult's Medium). An address this house
-    /// gathered for itself, or discovered on its own network, is trusted
-    /// because this house found it. An address the *peer* named is trusted
-    /// only if the wider internet could have routed it here, or if it is
-    /// exactly the address the gate observed that peer at for this attempt,
-    /// which is the same-LAN case section 6 exists for and which the gate,
-    /// not the peer, vouches for. Anything else, a peer naming
-    /// `127.0.0.1:631` or a router on this house's LAN, is refused: 16
-    /// candidates at about 37 probes each is a scan, and a keyed hash does
-    /// not make it not one.
+    /// **What a peer may name** (Yseult's Medium, issue #37). An address
+    /// this house gathered for itself, or discovered on its own network,
+    /// is trusted because this house found it. An address the *peer* named
+    /// is trusted only if the wider internet could have routed it here, or
+    /// if it is one of this attempt's vouched addresses: the address the
+    /// gate observed that peer at, or an address this house itself heard
+    /// that peer announce from on its own network (section 6). That
+    /// second one is the relaxation issue #37 asks for, and it is exactly
+    /// as wide as the design allows: a private-range, link-local or
+    /// IPv4-mapped LAN address is admissible when local discovery or the
+    /// gate's reflection produced it **for this attempt**, and never
+    /// because a peer's candidate list said so. Anything else, a peer
+    /// naming `127.0.0.1:631` or a router on this house's LAN, is refused:
+    /// 16 candidates at about 37 probes each is a scan, and a keyed hash
+    /// does not make it not one.
     pub fn add_candidate(&mut self, addr: SocketAddr, source: CandidateSource) -> bool {
         // Unmapped first, and before anything classifies it (Yseult's
         // remaining Medium). `Addr` family 6 decodes `::ffff:a.b.c.d`
@@ -801,7 +829,7 @@ impl Attempt {
         }
         if source == CandidateSource::PeerReported
             && !is_globally_routable(addr)
-            && self.gate_reflected_peer != Some(addr)
+            && !self.vouched.contains(&addr)
         {
             return false;
         }
@@ -818,10 +846,94 @@ impl Attempt {
         true
     }
 
+    /// Adds an address this house heard the peer announce from on its own
+    /// network (section 6), which both makes it a [`CandidateSource::Discovery`]
+    /// candidate and vouches for it for the rest of this attempt.
+    ///
+    /// Vouching and adding are one call on purpose (issue #37): the whole
+    /// relaxation rests on the address having come from a multicast
+    /// announce this house received itself, whose source address the
+    /// kernel wrote and whose key `mosschat_core::identity::verify`
+    /// checked, so there is no way to vouch for an address without also
+    /// naming where it came from. A peer's `Candidates` frame reaches
+    /// [`Attempt::add_peer_candidates`] instead, which cannot produce a
+    /// `Discovery` candidate and cannot vouch for anything.
+    ///
+    /// Returns `false` on a duplicate or past the cap, exactly as
+    /// [`Attempt::add_candidate`] does; the address is vouched for either
+    /// way, since a peer naming an address this house already discovered
+    /// is naming a discovered address.
+    pub fn add_discovered(&mut self, addr: SocketAddr) -> bool {
+        self.vouch(addr);
+        // Yseult's High 2: discovery gets its own slot count and never
+        // takes a slot from anything else. The vouching above is
+        // deliberately outside the cap, since hearing a peer at an address
+        // is a fact about this network whether or not there is room to
+        // probe it, and vouching costs one address in a `Vec` bounded by
+        // the same [`MAX_CANDIDATES`] the table is.
+        if self.discovery_candidates >= DISCOVERY_CANDIDATE_SLOTS {
+            return false;
+        }
+        if self.add_candidate(addr, CandidateSource::Discovery) {
+            self.discovery_candidates = self.discovery_candidates.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    /// Records that something other than the peer's own say-so vouches for
+    /// `addr` in this attempt, without adding it as a candidate.
+    ///
+    /// `pub(crate)` rather than `pub` (Konrad's nit 7): "a property of the
+    /// type" is only true if nothing outside this crate can vouch for an
+    /// address without having heard the announce itself.
+    ///
+    /// The two halves are separable because they can genuinely come apart:
+    /// an announce that arrives once the table is already at
+    /// [`MAX_CANDIDATES`] still means this house heard the peer at that
+    /// address, so the peer naming it is not the peer inventing it. The
+    /// address is unmapped first, so one address is vouched for in one
+    /// spelling and cannot slip through the classifier in the other
+    /// (Yseult, issue #37).
+    pub(crate) fn vouch(&mut self, addr: SocketAddr) {
+        let addr = crate::sock::unmap_v4(addr);
+        if !self.vouched.contains(&addr) {
+            self.vouched.push(addr);
+        }
+    }
+
+    /// Adds every address a peer's `Candidates` frame (frame 16) named, as
+    /// [`CandidateSource::PeerReported`] and nothing else.
+    ///
+    /// The one entry point the porch stream's decoded frame takes, so
+    /// "never from a peer's candidate list" (issue #37) is a property of
+    /// the type rather than of a call site remembering to pass the right
+    /// source: nothing a peer sends can reach this house's candidate table
+    /// as `Discovery`, `Local` or `GateReflected`, and so nothing a peer
+    /// sends can vouch for a private-range address.
+    ///
+    /// Returns how many were accepted.
+    pub fn add_peer_candidates(&mut self, addrs: &[Addr]) -> usize {
+        addrs
+            .iter()
+            .filter_map(|addr| addr.to_socket_addr())
+            .filter(|addr| self.add_candidate(*addr, CandidateSource::PeerReported))
+            .count()
+    }
+
     /// How many candidates are under probe.
     #[must_use]
     pub fn candidate_count(&self) -> usize {
         self.candidates.len()
+    }
+
+    /// Whether this attempt holds something other than the peer's word for
+    /// `addr`, which is the whole of the test [`Attempt::add_candidate`]
+    /// applies to a peer-named address outside the globally routable range
+    /// (issue #37). Either spelling of one address answers the same.
+    #[must_use]
+    pub fn vouched_for(&self, addr: SocketAddr) -> bool {
+        self.vouched.contains(&crate::sock::unmap_v4(addr))
     }
 
     /// The source recorded for `addr`, if it is a candidate.
@@ -1031,15 +1143,14 @@ impl Attempt {
 
 /// Section 4's shape, in the one slice section 2 step 7 cannot do without:
 /// on a live path, one probe every 500 ms, and three consecutive
-/// unanswered probes mean the path is gone. The rest of section 4 (the
-/// idle keepalive clamp, the dead grace, local address change) is a later
-/// work order; without at least this much, "fall back on path failure"
-/// has no failure to fall back on.
-pub const LIVE_PROBE_INTERVAL: Duration = Duration::from_millis(500);
-
-/// Section 4: three consecutive unanswered probes make a live path stale,
-/// which is when traffic moves back to the relay.
-pub const LIVE_PROBES_TO_STALE: u32 = 3;
+/// unanswered probes mean the path is gone.
+///
+/// Both are [`crate::live`]'s, which owns section 4 whole; they are named
+/// here because step 7's fall-back is decided in [`run_doorbell`] and one
+/// number in two files is one number that can differ.
+pub use crate::live::{
+    PROBES_TO_STALE as LIVE_PROBES_TO_STALE, VISIT_PROBE_INTERVAL as LIVE_PROBE_INTERVAL,
+};
 
 /// The ceiling on pongs one attempt will emit per second (Yseult's Medium).
 ///
@@ -1123,6 +1234,16 @@ pub struct DoorbellParams {
     /// 6's `peer_observed`), which is the one address outside the globally
     /// routable range the peer may name. See [`Attempt::add_candidate`].
     pub peer_observed: Option<SocketAddr>,
+    /// The addresses this house has heard this peer announce from on its
+    /// own network (section 6), each already verified there against
+    /// `mosschat_core::identity::verify` and each carrying the source
+    /// address the kernel wrote rather than one the peer chose.
+    ///
+    /// They enter the attempt as [`CandidateSource::Discovery`] and vouch
+    /// for themselves for the length of the attempt, which is what lets a
+    /// same-LAN pair upgrade to a private-range address at all (issue
+    /// #37). Empty is the ordinary case: no discovery, no relaxation.
+    pub peer_discovered: Vec<SocketAddr>,
 }
 
 /// A live doorbell's one control: whether it still answers pings.
@@ -1314,10 +1435,22 @@ pub async fn run_doorbell(
     let _attempt_guard = AttemptGuard::arm(porch, gate, attempt, key, params.session);
 
     let mut state = Attempt::new(attempt, key, params.peer_observed);
-    for addr in peer_addrs {
-        if let Some(addr) = addr.to_socket_addr() {
-            state.add_candidate(addr, CandidateSource::PeerReported);
-        }
+    // Vouching first, candidates in priority order after it (Yseult's High
+    // 2). Vouching has to come first for issue #37: an address this house
+    // heard the peer announce on its own network must already be vouched
+    // for by the time that peer's own list is read, or the same LAN
+    // address arrives as a private range nobody but the peer stands
+    // behind. Taking *slots* is the other way round: the peer's list and
+    // the gate's reflection go in first and discovery fills what is left,
+    // up to its own `DISCOVERY_CANDIDATE_SLOTS`, so a LAN stranger
+    // replaying announces cannot crowd the real candidates out of the
+    // attempt.
+    for addr in &params.peer_discovered {
+        state.vouch(*addr);
+    }
+    state.add_peer_candidates(&peer_addrs);
+    for addr in &params.peer_discovered {
+        state.add_discovered(*addr);
     }
 
     // Step 4. Either side may ask; the initiator does, so exactly one
@@ -1340,37 +1473,47 @@ pub async fn run_doorbell(
     let mut live_misses = 0u32;
     let mut live_outstanding: Option<[u8; 8]> = None;
     let mut live_last_sent: Option<Instant> = None;
+    // When the oldest unanswered live probe went out, which is what
+    // section 4's loss deadline is measured from.
+    let mut live_unanswered_since: Option<Instant> = None;
     let mut pongs = PongLimiter::new(Instant::now());
 
     loop {
         let now = Instant::now();
 
         if let Some(winner) = outcome.upgraded_to {
-            // Step 7's precondition, and section 4's smallest slice: one
-            // probe every 500 ms on the live path, three unanswered in a
-            // row and it is gone.
+            // Step 7's precondition, and section 4's live path: one probe
+            // every 500 ms, and a probe counts as lost after
+            // `max(4 * srtt, 500 ms)` (Konrad's should 3), read from this
+            // path's own smoothed RTT and never from `Connection::rtt()`.
+            // Counting a miss per probe interval instead, which is what
+            // this did, called a 400 ms path dead after 1.5 s of packets
+            // section 4 does not consider lost at all.
+            let srtt = path.as_ref().and_then(crate::path::PathEntry::srtt);
+            if live_unanswered_since.is_some_and(|sent| live_probe_lost(sent, now, srtt)) {
+                live_unanswered_since = None;
+                live_outstanding = None;
+                live_misses = live_misses.saturating_add(1);
+            }
+            if live_misses >= LIVE_PROBES_TO_STALE {
+                if let Some(path) = path.as_ref() {
+                    path.fall_back_to_relay();
+                }
+                outcome.fell_back = true;
+                let _ = write_porch_frame(
+                    &mut send,
+                    &PorchFrame::PathDown {
+                        v: 1,
+                        attempt,
+                        addr: Addr::from_socket_addr(winner),
+                        // Section 7's reason enum: `path_idle_timeout`.
+                        reason: 16,
+                    },
+                )
+                .await;
+                return Ok(outcome);
+            }
             if live_last_sent.is_none_or(|last| now.duration_since(last) >= LIVE_PROBE_INTERVAL) {
-                if live_outstanding.take().is_some() {
-                    live_misses = live_misses.saturating_add(1);
-                }
-                if live_misses >= LIVE_PROBES_TO_STALE {
-                    if let Some(path) = path.as_ref() {
-                        path.fall_back_to_relay();
-                    }
-                    outcome.fell_back = true;
-                    let _ = write_porch_frame(
-                        &mut send,
-                        &PorchFrame::PathDown {
-                            v: 1,
-                            attempt,
-                            addr: Addr::from_socket_addr(winner),
-                            // Section 7's reason enum: `path_idle_timeout`.
-                            reason: 16,
-                        },
-                    )
-                    .await;
-                    return Ok(outcome);
-                }
                 let mut tx = [0u8; 8];
                 rand::rng().fill(&mut tx);
                 let ping = Probe {
@@ -1382,6 +1525,12 @@ pub async fn run_doorbell(
                 let _ = porch.send_probe(winner, &ping.encode(&key));
                 live_outstanding = Some(tx);
                 live_last_sent = Some(now);
+                // The oldest unanswered probe is the one the deadline runs
+                // from: a second probe sent while the first is outstanding
+                // does not restart the clock.
+                if live_unanswered_since.is_none() {
+                    live_unanswered_since = Some(now);
+                }
             }
         } else {
             for (to, bytes) in state.due_probes(now, || {
@@ -1426,6 +1575,7 @@ pub async fn run_doorbell(
                                 path.record_rtt(arrived.duration_since(sent));
                             }
                             live_outstanding = None;
+                            live_unanswered_since = None;
                             live_misses = 0;
                         }
                     } else {
@@ -1452,6 +1602,7 @@ pub async fn run_doorbell(
             outcome.upgraded_to = Some(winner.addr);
             live_last_sent = Some(Instant::now());
             live_outstanding = None;
+            live_unanswered_since = None;
             live_misses = 0;
             let rtt_us = u32::try_from(winner.rtt.as_micros()).unwrap_or(u32::MAX);
             write_porch_frame(
@@ -1471,6 +1622,17 @@ pub async fn run_doorbell(
             _ = peer.closed() => return Ok(outcome),
         }
     }
+}
+
+/// Whether a live-path probe sent at `sent` counts as lost by `now`,
+/// section 4's `max(4 * srtt, 500 ms)` (Konrad's should 3).
+///
+/// A function rather than an expression inside the monitor loop so the
+/// rule is testable without a connection: the loop it lives in needs two
+/// houses, a gate and a real path before it can be exercised at all, and
+/// the thing that was wrong there was one comparison.
+fn live_probe_lost(sent: Instant, now: Instant, srtt: Option<Duration>) -> bool {
+    now.duration_since(sent) >= crate::live::probe_loss_deadline(srtt)
 }
 
 /// Holds an attempt's live state for as long as `run_doorbell` runs: the
@@ -2063,6 +2225,229 @@ mod tests {
         // globally routable addresses.
         let mut bare = Attempt::new(ID, KEY, None);
         assert!(!bare.add_candidate(reflected, CandidateSource::PeerReported));
+    }
+
+    /// Issue #37, the relaxation and its limit in one test. A private-range
+    /// LAN address is admissible from a peer's `Candidates` frame when, and
+    /// only when, this house itself heard that peer announce from it on
+    /// this network for this attempt (section 6) or the gate reflected it
+    /// for this attempt. The same address named by a peer this house has
+    /// discovered nothing about is still refused.
+    ///
+    /// Deliberate break to fail this test: in `Attempt::add_discovered`,
+    /// delete the `self.vouch(addr)` line, keeping the `add_candidate`
+    /// call. The discovered address is still a candidate,
+    /// so the first half passes, and the peer's own naming of it is refused
+    /// again, so the second assertion fails.
+    #[test]
+    fn a_discovered_lan_address_is_vouched_for_and_an_undiscovered_one_is_not() {
+        let announced: SocketAddr = "192.168.4.21:4433".parse().unwrap();
+        let unheard: SocketAddr = "192.168.4.99:4433".parse().unwrap();
+
+        let mut attempt = Attempt::new(ID, KEY, None);
+        assert!(attempt.add_discovered(announced));
+        assert_eq!(
+            attempt.source_of(announced),
+            Some(CandidateSource::Discovery),
+            "a discovered address is a discovery-sourced candidate, never a peer-reported one"
+        );
+
+        // The peer naming the same address adds nothing new (it is already
+        // a candidate) but is not refused for being private: discovery
+        // vouched for it.
+        assert!(
+            attempt.vouched_for(announced),
+            "hearing the announce is what vouches for the address"
+        );
+        assert_eq!(
+            attempt.add_peer_candidates(&[Addr::from_socket_addr(announced)]),
+            0,
+            "already a candidate, so the peer naming it adds nothing"
+        );
+        // A duplicate, not a rejection: on a fresh attempt with the same
+        // vouching, the peer's own naming of it is accepted outright.
+        let mut fresh = Attempt::new(ID, KEY, None);
+        fresh.vouch(announced);
+        assert_eq!(
+            fresh.add_peer_candidates(&[Addr::from_socket_addr(announced)]),
+            1,
+            "a vouched private address is admissible from the peer's list"
+        );
+        assert_eq!(
+            fresh.source_of(announced),
+            Some(CandidateSource::PeerReported)
+        );
+
+        // Nothing vouched for this one, so it is refused exactly as before.
+        assert_eq!(
+            fresh.add_peer_candidates(&[Addr::from_socket_addr(unheard)]),
+            0,
+            "an undiscovered private address is still refused from a peer"
+        );
+
+        // And link-local and IPv4-mapped LAN forms travel the same road:
+        // vouched, admissible; unvouched, refused.
+        let link_local: SocketAddr = "169.254.7.7:4433".parse().unwrap();
+        let mut mapped = Attempt::new(ID, KEY, None);
+        assert_eq!(
+            mapped.add_peer_candidates(&[Addr::from_socket_addr(link_local)]),
+            0
+        );
+        assert!(mapped.add_discovered("[::ffff:169.254.7.7]:4433".parse().unwrap()));
+        assert!(
+            mapped.vouched_for(link_local),
+            "the mapped spelling vouches for the IPv4 form and no other"
+        );
+        assert_eq!(
+            mapped.source_of(link_local),
+            Some(CandidateSource::Discovery),
+            "vouched and stored in its IPv4 form, so one address has one verdict"
+        );
+    }
+
+    /// Konrad's should 3: the live monitor's loss deadline is section 4's
+    /// `max(4 * srtt, 500 ms)` and not a flat probe interval. A 400 ms
+    /// path is what separates them: at 500 ms its probe is not lost, and
+    /// counting a miss there called such a path dead after 1.5 seconds of
+    /// packets section 4 does not consider lost at all.
+    ///
+    /// Deliberate break to fail this test: in `live_probe_lost`, replace
+    /// `crate::live::probe_loss_deadline(srtt)` with
+    /// `LIVE_PROBE_INTERVAL`. The 400 ms path's probe is then lost at 500
+    /// ms and the second assertion fails.
+    #[test]
+    fn a_live_probe_is_lost_on_section_fours_deadline_not_on_the_probe_interval() {
+        let sent = Instant::now();
+        let slow = Some(Duration::from_millis(400));
+        // A fast path takes the 500 ms floor.
+        assert!(!live_probe_lost(
+            sent,
+            sent + Duration::from_millis(499),
+            None
+        ));
+        assert!(live_probe_lost(sent, sent + LIVE_PROBE_INTERVAL, None));
+        // A 400 ms path waits 4 * srtt, which is 1.6 s.
+        assert!(!live_probe_lost(sent, sent + LIVE_PROBE_INTERVAL, slow));
+        assert!(!live_probe_lost(
+            sent,
+            sent + Duration::from_millis(1599),
+            slow
+        ));
+        assert!(live_probe_lost(
+            sent,
+            sent + Duration::from_millis(1600),
+            slow
+        ));
+    }
+
+    /// Yseult's High 2: discovery gets its own bounded slot count and
+    /// never takes a slot from a peer-listed or gate-reflected candidate.
+    /// With the replay window of section 6 in place a LAN stranger cannot
+    /// resend one announce at all, and even if it could, 16 discovered
+    /// addresses cannot crowd the attempt: 4 get in and the peer's real
+    /// candidates are all still there.
+    ///
+    /// Deliberate break to fail this test: in `Attempt::add_discovered`,
+    /// delete the `if self.discovery_candidates >= DISCOVERY_CANDIDATE_SLOTS`
+    /// early return. Discovery then takes every remaining slot and the
+    /// peer's candidates that follow are refused, so the count assertions
+    /// fail.
+    #[test]
+    fn discovery_cannot_crowd_out_the_peers_own_candidates() {
+        let reflected: SocketAddr = "192.168.7.7:4433".parse().unwrap();
+        let mut attempt = Attempt::new(ID, KEY, Some(reflected));
+
+        // The peer's list and the gate's reflection go in first, as
+        // `run_doorbell` orders them: 5 globally routable addresses plus
+        // the reflected one.
+        let peer_named: Vec<Addr> = (0..5)
+            .map(|index| {
+                Addr::from_socket_addr(SocketAddr::new(
+                    IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5)),
+                    4433 + index,
+                ))
+            })
+            .chain(std::iter::once(Addr::from_socket_addr(reflected)))
+            .collect();
+        assert_eq!(attempt.add_peer_candidates(&peer_named), 6);
+
+        // Then 16 discovered addresses, which is what a flood would look
+        // like if it got past section 6 at all.
+        let mut discovered_in = 0;
+        for index in 0..16u16 {
+            let addr = SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 4, 21)),
+                5000 + index,
+            );
+            if attempt.add_discovered(addr) {
+                discovered_in += 1;
+            }
+        }
+        assert_eq!(
+            discovered_in, DISCOVERY_CANDIDATE_SLOTS,
+            "discovery fills its own slots and stops"
+        );
+        assert_eq!(attempt.candidate_count(), 6 + DISCOVERY_CANDIDATE_SLOTS);
+
+        // Every real candidate is still in the table, which is the thing
+        // the cap protects: without it the pair stays on the relay.
+        for addr in &peer_named {
+            let addr = addr.to_socket_addr().unwrap();
+            assert!(
+                attempt.source_of(addr).is_some(),
+                "{addr} must still be a candidate"
+            );
+        }
+        assert_eq!(
+            attempt.source_of(reflected),
+            Some(CandidateSource::PeerReported)
+        );
+        // And a discovery past the cap still vouches, since hearing a peer
+        // at an address is a fact about this network either way.
+        let past_cap: SocketAddr = "192.168.4.21:5015".parse().unwrap();
+        assert!(attempt.vouched_for(past_cap));
+        assert_eq!(attempt.source_of(past_cap), None);
+    }
+
+    /// The other direction of issue #37, and the invariant the relaxation
+    /// rests on: nothing arriving in a peer's `Candidates` frame can enter
+    /// the table as anything but [`CandidateSource::PeerReported`], so a
+    /// peer cannot vouch for its own private-range address by claiming it
+    /// was discovered.
+    ///
+    /// Deliberate break to fail this test: in
+    /// `Attempt::add_peer_candidates`, change `CandidateSource::PeerReported`
+    /// to `CandidateSource::Discovery`. Every refused address is then
+    /// accepted and the count assertion fails on the first line.
+    #[test]
+    fn a_peer_candidate_list_can_only_produce_peer_reported_candidates() {
+        let mut attempt = Attempt::new(ID, KEY, None);
+        let named: Vec<Addr> = [
+            "127.0.0.1:631",
+            "192.168.1.1:53",
+            "[fd00::1]:4433",
+            "[::ffff:10.0.0.1]:53",
+        ]
+        .iter()
+        .map(|a| Addr::from_socket_addr(a.parse().unwrap()))
+        .collect();
+        assert_eq!(
+            attempt.add_peer_candidates(&named),
+            0,
+            "a peer's list vouches for nothing"
+        );
+        assert_eq!(attempt.candidate_count(), 0);
+
+        // A globally routable one from the same list is accepted, and as
+        // peer-reported.
+        assert_eq!(
+            attempt.add_peer_candidates(&[Addr::from_socket_addr(addr(4433))]),
+            1
+        );
+        assert_eq!(
+            attempt.source_of(addr(4433)),
+            Some(CandidateSource::PeerReported)
+        );
     }
 
     /// Yseult's remaining Medium: one address, two spellings, one verdict.
