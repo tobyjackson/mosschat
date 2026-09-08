@@ -23,7 +23,7 @@ mod gate {
     };
     use mosschat_net::gate::server::{GateServer, GateServerConfig};
     use mosschat_net::gate::wire::{self, Addr, Frame};
-    use mosschat_net::gate::{GateError, MemberList};
+    use mosschat_net::gate::{ErrorCode, GateError, MemberList};
     use rand::RngExt;
 
     const LOCALHOST_ANY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
@@ -831,7 +831,19 @@ mod gate {
             Arc::new(InMemoryInviteStore::new()),
         )
         .await;
-        assert!(third.is_err());
+        // Section 1: the gate "answers `Error{...}`" -- the house must
+        // actually receive frame 12 and learn the code, not just find its
+        // connection gone. `send_error_and_close` used to close the
+        // connection in the same breath as writing the frame, which quinn
+        // documents as abandoning data not yet transmitted, so the house
+        // saw an unexplained dead connection and its diagnostics record
+        // said `internal` for a refusal the gate had named.
+        let err = third.err().expect("the third connection is refused");
+        assert!(
+            err.to_string()
+                .contains(&format!("code={}", ErrorCode::AtCapacity as u8)),
+            "the refusal must reach the house as frame 12's code: {err}"
+        );
         assert_eq!(server.connections_for_key(&key), 2);
         assert_eq!(
             server
