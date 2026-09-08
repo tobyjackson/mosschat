@@ -1168,10 +1168,7 @@ pub async fn run_doorbell(
         // roughly its true round trip rather than rounded up to the next
         // schedule point.
         let mut decided = None;
-        loop {
-            let Some((from, bytes)) = porch.try_recv_probe() else {
-                break;
-            };
+        while let Some((from, bytes)) = porch.try_recv_probe() {
             let Some(probe) = Probe::decode(&bytes, &key) else {
                 continue;
             };
