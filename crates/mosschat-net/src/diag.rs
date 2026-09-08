@@ -20,6 +20,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::gate::wire::Addr;
+use crate::lockext::LockExt as _;
 
 /// One step of a connection attempt, in the order section 7's step enum
 /// lists them.
@@ -585,8 +586,28 @@ pub struct DiagRecord {
     /// Whether the relay session carried any traffic, recorded on every
     /// attempt, success or not (D3).
     pub gate_carried_traffic: bool,
-    /// Bytes the relay session carried, either direction.
+    /// Bytes this house handed to the relay leg for this peer: its own
+    /// egress, not both directions (Konrad's should 6 on PR #49). The
+    /// shaper counts what enters its queue, and only the sending side
+    /// queues; the other direction's bytes are in the peer's own record.
     pub gate_bytes: u64,
+    /// Section 1's shaper, first counter: datagrams that waited in a relay
+    /// queue. Added in WO-1.4b, which is the first order with a call site
+    /// that can read them ([`Recorder::relay_stats`]); WO-1.4a's record
+    /// carried section 7's `gate_carried_traffic` and `gate_bytes` but not
+    /// the three counters beside them in the same table row, so this is an
+    /// additive format change and `from_json_line` reads a record written
+    /// without them as zeroes rather than refusing it.
+    pub relay_queued: u64,
+    /// Section 1's shaper: the median time a relayed datagram waited, in
+    /// microseconds.
+    pub relay_shaped_delay_p50_us: u64,
+    /// Section 1's shaper: the longest a relayed datagram waited, in
+    /// microseconds.
+    pub relay_shaped_delay_max_us: u64,
+    /// Section 1's shaper: datagrams dropped on a full queue. 0 for a
+    /// shaping house.
+    pub relay_dropped_at_full: u64,
     /// The path chosen and the address it uses.
     pub path: PathChoice,
     /// The chosen path's round trip time in microseconds.
@@ -725,16 +746,40 @@ fn addr_to_json_string(addr: Addr) -> String {
     }
 }
 
-/// The inverse of [`addr_to_json_string`] for the `"host:port"` form.
+/// The inverse of [`addr_to_json_string`], for both forms it writes.
+///
+/// The second form matters: an [`Addr`] whose family is neither 4 nor 6 is
+/// how this design spells "not observed" (frame 16's probe carries one, and
+/// so does a record whose attempt never reached a reflection), and
+/// [`addr_to_json_string`] writes it as the raw-field dump. Reading only
+/// `"host:port"` made every such record a malformed line: written by the
+/// writer, refused by its own reader.
 ///
 /// # Errors
-/// Returns [`DiagError::Malformed`] if `s` does not parse as a socket
-/// address.
+/// Returns [`DiagError::Malformed`] if `s` is neither form.
 fn addr_from_json_string(s: &str) -> Result<Addr, DiagError> {
-    let socket_addr: std::net::SocketAddr = s
-        .parse()
-        .map_err(|_| DiagError::Malformed(format!("bad address: {s:?}")))?;
-    Ok(Addr::from_socket_addr(socket_addr))
+    if let Ok(socket_addr) = s.parse::<std::net::SocketAddr>() {
+        return Ok(Addr::from_socket_addr(socket_addr));
+    }
+    let malformed = || DiagError::Malformed(format!("bad address: {s:?}"));
+    let family = s
+        .strip_prefix("family=")
+        .and_then(|rest| rest.split(' ').next())
+        .ok_or_else(malformed)?;
+    let bytes_hex = s
+        .split(" bytes=")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .ok_or_else(malformed)?;
+    let port = s.split(" port=").nth(1).ok_or_else(malformed)?;
+    let bytes: [u8; 16] = hex_decode(bytes_hex)?
+        .try_into()
+        .map_err(|_| DiagError::Malformed(format!("address bytes must be 16 bytes: {s:?}")))?;
+    Ok(Addr {
+        family: family.parse().map_err(|_| malformed())?,
+        bytes,
+        port: port.parse().map_err(|_| malformed())?,
+    })
 }
 
 /// Looks up `key` in a `serde_json::Value` expected to be an object.
@@ -759,6 +804,21 @@ fn field_u64(value: &serde_json::Value, key: &str) -> Result<u64, DiagError> {
     field(value, key)?
         .as_u64()
         .ok_or_else(|| DiagError::Malformed(format!("field {key:?} is not an unsigned integer")))
+}
+
+/// An optional unsigned integer field: absent reads as `0`, present but of
+/// the wrong type is still an error.
+///
+/// # Errors
+/// Returns [`DiagError::Malformed`] if `key` is present and is not an
+/// unsigned integer.
+fn optional_field_u64(value: &serde_json::Value, key: &str) -> Result<u64, DiagError> {
+    match value.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(0),
+        Some(present) => present.as_u64().ok_or_else(|| {
+            DiagError::Malformed(format!("field {key:?} is not an unsigned integer"))
+        }),
+    }
 }
 
 /// [`field`] plus a bool type check.
@@ -822,6 +882,10 @@ impl DiagRecord {
             "mapping": self.mapping.as_str(),
             "gate_carried_traffic": self.gate_carried_traffic,
             "gate_bytes": self.gate_bytes,
+            "relay_queued": self.relay_queued,
+            "relay_shaped_delay_p50_us": self.relay_shaped_delay_p50_us,
+            "relay_shaped_delay_max_us": self.relay_shaped_delay_max_us,
+            "relay_dropped_at_full": self.relay_dropped_at_full,
             "path": self.path.kind_str(),
             "path_addr": addr_to_json_string(self.path.addr()),
             "path_rtt_us": self.path_rtt_us,
@@ -899,6 +963,13 @@ impl DiagRecord {
         let mapping = Mapping::parse_str(field_str(&value, "mapping")?)?;
         let gate_carried_traffic = field_bool(&value, "gate_carried_traffic")?;
         let gate_bytes = field_u64(&value, "gate_bytes")?;
+        // The four shaper counters arrived in WO-1.4b, after WO-1.4a's
+        // writer had a released format: absent means a record written
+        // before them, which is a zero rather than a malformed line.
+        let relay_queued = optional_field_u64(&value, "relay_queued")?;
+        let relay_shaped_delay_p50_us = optional_field_u64(&value, "relay_shaped_delay_p50_us")?;
+        let relay_shaped_delay_max_us = optional_field_u64(&value, "relay_shaped_delay_max_us")?;
+        let relay_dropped_at_full = optional_field_u64(&value, "relay_dropped_at_full")?;
 
         let path_kind = field_str(&value, "path")?;
         let path_addr = addr_from_json_string(field_str(&value, "path_addr")?)?;
@@ -932,6 +1003,10 @@ impl DiagRecord {
             mapping,
             gate_carried_traffic,
             gate_bytes,
+            relay_queued,
+            relay_shaped_delay_p50_us,
+            relay_shaped_delay_max_us,
+            relay_dropped_at_full,
             path,
             path_rtt_us,
             reason,
@@ -1150,7 +1225,12 @@ impl DiagWriter {
 #[derive(Debug)]
 pub enum ReadOutcome {
     /// The line parsed into a record.
-    Record(DiagRecord),
+    ///
+    /// Boxed because a [`DiagRecord`] is several hundred bytes and the
+    /// malformed variant is two words: unboxed, every entry of a whole
+    /// file's `Vec<ReadOutcome>` would be sized for the record even where
+    /// it holds a parse error (`clippy::large_enum_variant`).
+    Record(Box<DiagRecord>),
     /// The line (1-indexed) did not parse; the file's remaining lines are
     /// still read.
     Malformed {
@@ -1174,7 +1254,7 @@ pub fn read_records(path: &Path) -> Result<Vec<ReadOutcome>, DiagError> {
             continue;
         }
         match DiagRecord::from_json_line(line) {
-            Ok(record) => out.push(ReadOutcome::Record(record)),
+            Ok(record) => out.push(ReadOutcome::Record(Box::new(record))),
             Err(error) => out.push(ReadOutcome::Malformed {
                 line_number: i + 1,
                 error,
@@ -1237,6 +1317,621 @@ pub fn diagnostics_dir(platform: TargetPlatform, env: &LocationEnv<'_>) -> PathB
     }
 }
 
+// ---------------------------------------------------------------------
+// The recorder (WO-1.4b)
+// ---------------------------------------------------------------------
+
+/// The running platform, as section 7's `platform` field spells it.
+#[must_use]
+pub fn host_platform_name() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        std::env::consts::OS
+    }
+}
+
+/// The diagnostics directory for the machine this binary is running on,
+/// resolved from the environment through [`diagnostics_dir`].
+///
+/// # Errors
+/// Returns [`DiagError::Io`] if the home directory cannot be determined,
+/// which is the one input every platform's location needs.
+pub fn host_diagnostics_dir() -> Result<PathBuf, DiagError> {
+    let home_var = if cfg!(target_os = "windows") {
+        "USERPROFILE"
+    } else {
+        "HOME"
+    };
+    let home = std::env::var_os(home_var).ok_or_else(|| {
+        DiagError::Io(std::io::Error::other(format!(
+            "{home_var} is not set, so the diagnostics directory cannot be resolved"
+        )))
+    })?;
+    let home = PathBuf::from(home);
+    let xdg = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+    let local_appdata = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let platform = if cfg!(target_os = "macos") {
+        TargetPlatform::MacOs
+    } else if cfg!(target_os = "windows") {
+        TargetPlatform::Windows
+    } else {
+        TargetPlatform::Linux
+    };
+    Ok(diagnostics_dir(
+        platform,
+        &LocationEnv {
+            home: &home,
+            xdg_state_home: xdg.as_deref(),
+            local_appdata: local_appdata.as_deref(),
+        },
+    ))
+}
+
+/// A [`DiagWriter`] behind a lock, shared by every [`Recorder`] in a
+/// process, so the doorbell, the gate client and the liveness monitor all
+/// append to the one day's file without each opening it.
+///
+/// The lock is a `std::sync::Mutex` and is never held across an `.await`:
+/// [`DiagSink::write`] is a synchronous call that returns before the caller
+/// touches the network again.
+pub struct DiagSink {
+    writer: std::sync::Mutex<DiagWriter>,
+}
+
+impl DiagSink {
+    /// Opens a sink writing into `dir`.
+    ///
+    /// # Errors
+    /// Returns [`DiagError::Io`] if `dir` cannot be created.
+    pub fn new(dir: PathBuf) -> Result<std::sync::Arc<Self>, DiagError> {
+        Ok(std::sync::Arc::new(Self {
+            writer: std::sync::Mutex::new(DiagWriter::new(dir)?),
+        }))
+    }
+
+    /// Opens a sink at [`host_diagnostics_dir`].
+    ///
+    /// # Errors
+    /// Returns [`DiagError::Io`] if the directory cannot be resolved or
+    /// created.
+    pub fn for_host() -> Result<std::sync::Arc<Self>, DiagError> {
+        Self::new(host_diagnostics_dir()?)
+    }
+
+    /// Appends one record, timestamped `now_ms`.
+    ///
+    /// # Errors
+    /// Returns [`DiagError::Io`] if the write fails.
+    pub fn write(&self, record: &DiagRecord, now_ms: u64) -> Result<(), DiagError> {
+        self.writer.lock_or_recover().append(record, now_ms)?;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DiagSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DiagSink(..)")
+    }
+}
+
+/// Everything one attempt has recorded so far.
+#[derive(Debug)]
+struct RecorderState {
+    attempt: [u8; 16],
+    session: u32,
+    gate_ms: u64,
+    steps: Vec<StepRecord>,
+    failed_step: Option<Step>,
+    local_observed: [Option<Addr>; 2],
+    peer_observed: Option<Addr>,
+    mapping: Option<Mapping>,
+    /// The reason the protocol itself named, if one did.
+    reason_hint: Option<Reason>,
+    gate_carried_traffic: bool,
+    gate_bytes: u64,
+    relay_queued: u64,
+    relay_shaped_delay_p50_us: u64,
+    relay_shaped_delay_max_us: u64,
+    relay_dropped_at_full: u64,
+    path: PathChoice,
+    path_rtt_us: u32,
+    /// The record as it was written, once [`Recorder::finish`] has run.
+    /// Held rather than a bare flag so a second caller (`doctor`, after the
+    /// doorbell it started has already settled the attempt) is handed the
+    /// record that was actually written, not a second one built from a
+    /// different reason.
+    finished: Option<DiagRecord>,
+}
+
+#[derive(Debug)]
+struct RecorderInner {
+    peer: PeerFingerprint,
+    started: std::time::Instant,
+    started_at_ms: u64,
+    sink: Option<std::sync::Arc<DiagSink>>,
+    state: std::sync::Mutex<RecorderState>,
+}
+
+/// One connection attempt's diagnostics record while it is still being
+/// built: the steps as they happen, both sides' observed addresses as they
+/// are learned, and the shaper counters read at the end.
+///
+/// Every call site holds the same recorder through an [`std::sync::Arc`],
+/// because one attempt crosses the gate client, the doorbell and the
+/// liveness monitor and section 7 wants one record out of all three.
+/// Cloning shares the state rather than copying it.
+///
+/// **Redaction is the type's, not the caller's** (section 7). A recorder is
+/// built from a [`PeerFingerprint`], so a key cannot enter one, and every
+/// step's `detail` is free text capped by [`MAX_FREE_TEXT_LEN`] when
+/// written. A call site with a key, a ticket or a sealed body in hand
+/// records its fingerprint or its length instead of its bytes.
+#[derive(Debug, Clone)]
+pub struct Recorder {
+    inner: std::sync::Arc<RecorderInner>,
+}
+
+impl Recorder {
+    /// A recorder for an attempt against `peer`, writing to `sink` when it
+    /// finishes. `None` writes nothing, which is what a caller with no
+    /// diagnostics directory (a test, or a house whose state directory is
+    /// unwritable) gets rather than an error on every step.
+    #[must_use]
+    pub fn new(peer: PeerFingerprint, sink: Option<std::sync::Arc<DiagSink>>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(RecorderInner {
+                peer,
+                started: std::time::Instant::now(),
+                started_at_ms: crate::gate::now_ms(),
+                sink,
+                state: std::sync::Mutex::new(RecorderState {
+                    attempt: [0u8; 16],
+                    session: 0,
+                    gate_ms: 0,
+                    steps: Vec::new(),
+                    failed_step: None,
+                    local_observed: [None, None],
+                    peer_observed: None,
+                    mapping: None,
+                    reason_hint: None,
+                    gate_carried_traffic: false,
+                    gate_bytes: 0,
+                    relay_queued: 0,
+                    relay_shaped_delay_p50_us: 0,
+                    relay_shaped_delay_max_us: 0,
+                    relay_dropped_at_full: 0,
+                    // Section 2 step 2: every attempt starts relayed, so
+                    // the path is the relay until an upgrade says
+                    // otherwise, and an attempt that never got that far
+                    // records the truth rather than a default direct path.
+                    path: PathChoice::Relay(Addr::default()),
+                    path_rtt_us: 0,
+                    finished: None,
+                }),
+            }),
+        }
+    }
+
+    /// The peer this attempt is against, redacted.
+    #[must_use]
+    pub fn peer(&self) -> PeerFingerprint {
+        self.inner.peer
+    }
+
+    /// Milliseconds since this attempt started, which is what every
+    /// [`StepRecord::at_ms`] is measured in.
+    #[must_use]
+    pub fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.inner.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Records one step, and the first failing one as `failed_step`.
+    ///
+    /// The first rather than the last: section 7's `failed_step` is what
+    /// `doctor` exits naming, and a later failure is usually a consequence
+    /// of the first (a probe burst that never fired because the start
+    /// signal never came).
+    pub fn step(&self, step: Step, outcome: StepOutcome, detail: impl Into<String>) {
+        let at_ms = self.elapsed_ms();
+        let mut state = self.inner.state.lock_or_recover();
+        if outcome == StepOutcome::Fail && state.failed_step.is_none() {
+            state.failed_step = Some(step);
+        }
+        state.steps.push(StepRecord {
+            step,
+            at_ms,
+            outcome,
+            detail: detail.into(),
+        });
+    }
+
+    /// The attempt id of frame 16, once the porch stream has named it.
+    pub fn set_attempt(&self, attempt: [u8; 16]) {
+        self.inner.state.lock_or_recover().attempt = attempt;
+    }
+
+    /// The gate's session id (frame 6).
+    pub fn set_session(&self, session: u32) {
+        self.inner.state.lock_or_recover().session = session;
+    }
+
+    /// The gate's own clock from frame 7, the one shared timestamp two
+    /// logs are aligned on. Never a time to act on.
+    pub fn set_gate_ms(&self, gate_ms: u64) {
+        self.inner.state.lock_or_recover().gate_ms = gate_ms;
+    }
+
+    /// The primary gate reflection (`Registered.observed`, frame 2).
+    pub fn set_local_observed_primary(&self, addr: Addr) {
+        let mut state = self.inner.state.lock_or_recover();
+        state.local_observed[0] = Some(addr);
+    }
+
+    /// The secondary port's reflection (`Reflected.observed`, frame 4),
+    /// the second observation research D1 asks for.
+    pub fn set_local_observed_secondary(&self, addr: Addr) {
+        let mut state = self.inner.state.lock_or_recover();
+        state.local_observed[1] = Some(addr);
+    }
+
+    /// The peer's observed address from frame 6.
+    pub fn set_peer_observed(&self, addr: Addr) {
+        self.inner.state.lock_or_recover().peer_observed = Some(addr);
+    }
+
+    /// The path traffic settled on and its measured round trip.
+    pub fn set_path(&self, path: PathChoice, rtt_us: u32) {
+        let mut state = self.inner.state.lock_or_recover();
+        state.path = path;
+        state.path_rtt_us = rtt_us;
+    }
+
+    /// The shaper counters of section 1, read from the path table at
+    /// attempt end (section 7 records them "on every connection, success or
+    /// not").
+    ///
+    /// `gate_carried_traffic` follows from the same read: a relay queue
+    /// that took a datagram is a gate that carried traffic, which is the
+    /// only fact the house can state about the relay leg without asking the
+    /// gate.
+    pub fn set_relay_stats(&self, stats: &crate::path::ShaperStats) {
+        let mut state = self.inner.state.lock_or_recover();
+        state.gate_carried_traffic = stats.relay_queued > 0;
+        state.gate_bytes = stats.relay_bytes;
+        state.relay_queued = stats.relay_queued;
+        state.relay_shaped_delay_p50_us = stats.relay_shaped_delay_p50_us;
+        state.relay_shaped_delay_max_us = stats.relay_shaped_delay_max_us;
+        state.relay_dropped_at_full = stats.relay_dropped_at_full;
+    }
+
+    /// Records the reason the protocol itself named, for a caller that
+    /// decides the record's `reason` later (Konrad's should 3 on PR #49).
+    ///
+    /// The gate's `Error.code` is section 7's reason enum on the wire, so a
+    /// refusal is `gate_refused_not_member`, `gate_at_capacity` or
+    /// `gate_rate_limited` and not the `internal` a caller guessing from
+    /// the failed step alone would write.
+    pub fn set_reason_hint(&self, reason: Reason) {
+        self.inner.state.lock_or_recover().reason_hint = Some(reason);
+    }
+
+    /// The reason the protocol named, if anything named one.
+    #[must_use]
+    pub fn reason_hint(&self) -> Option<Reason> {
+        self.inner.state.lock_or_recover().reason_hint
+    }
+
+    /// Overrides the inferred mapping, for a caller that knows better than
+    /// the two reflections do (a `doctor --gate` run that reached neither
+    /// port has no reflections at all and its mapping stays `unknown`).
+    pub fn set_mapping(&self, mapping: Mapping) {
+        self.inner.state.lock_or_recover().mapping = Some(mapping);
+    }
+
+    /// The step that failed first, if any has.
+    #[must_use]
+    pub fn failed_step(&self) -> Option<Step> {
+        self.inner.state.lock_or_recover().failed_step
+    }
+
+    /// Section 7's inference for a probe burst that answered nothing,
+    /// applied to what this attempt has observed:
+    /// `endpoint_dependent_mapping` when the two reflections differed,
+    /// `hairpin_failure` when both sides' observed addresses share an IP
+    /// and the relay carried traffic, and `probe_timeout` otherwise.
+    #[must_use]
+    pub fn probe_failure_reason(&self) -> Reason {
+        let state = self.inner.state.lock_or_recover();
+        let mapping = state
+            .mapping
+            .unwrap_or_else(|| infer_mapping(state.local_observed[0], state.local_observed[1]));
+        probe_failure_reason(
+            state.local_observed[0],
+            state.peer_observed,
+            mapping,
+            state.gate_carried_traffic,
+        )
+    }
+
+    /// The record as it stands, without writing it.
+    #[must_use]
+    pub fn snapshot(&self, reason: Reason) -> DiagRecord {
+        let state = self.inner.state.lock_or_recover();
+        let mapping = state
+            .mapping
+            .unwrap_or_else(|| infer_mapping(state.local_observed[0], state.local_observed[1]));
+        DiagRecord {
+            attempt: state.attempt,
+            session: state.session,
+            gate_ms: state.gate_ms,
+            peer: self.inner.peer,
+            started_at_ms: self.inner.started_at_ms,
+            ended_at_ms: self.inner.started_at_ms.saturating_add(self.elapsed_ms()),
+            steps: state.steps.clone(),
+            failed_step: state.failed_step,
+            local_observed: [
+                state.local_observed[0].unwrap_or_default(),
+                state.local_observed[1].unwrap_or_default(),
+            ],
+            peer_observed: state.peer_observed.unwrap_or_default(),
+            mapping,
+            gate_carried_traffic: state.gate_carried_traffic,
+            gate_bytes: state.gate_bytes,
+            relay_queued: state.relay_queued,
+            relay_shaped_delay_p50_us: state.relay_shaped_delay_p50_us,
+            relay_shaped_delay_max_us: state.relay_shaped_delay_max_us,
+            relay_dropped_at_full: state.relay_dropped_at_full,
+            path: state.path,
+            path_rtt_us: state.path_rtt_us,
+            reason,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: host_platform_name().to_string(),
+        }
+    }
+
+    /// Closes the attempt: builds the record, writes it to the sink if
+    /// there is one, and returns it.
+    ///
+    /// Idempotent, because an attempt can end more than one way in the same
+    /// code path (a fall-back that then loses the connection): the second
+    /// and later calls return the record without appending a second line,
+    /// so one attempt is one record (section 7).
+    ///
+    /// A failed write is returned rather than swallowed, but the record
+    /// comes back either way: `doctor` prints what it observed even when
+    /// the log directory is unwritable.
+    ///
+    /// # Errors
+    /// Returns [`DiagError::Io`] if the sink's append failed.
+    pub fn finish(&self, reason: Reason) -> (DiagRecord, Result<(), DiagError>) {
+        let record = self.snapshot(reason);
+        {
+            let mut state = self.inner.state.lock_or_recover();
+            if let Some(already) = state.finished.as_ref() {
+                return (already.clone(), Ok(()));
+            }
+            state.finished = Some(record.clone());
+        }
+        let written = match self.inner.sink.as_ref() {
+            Some(sink) => sink.write(&record, record.ended_at_ms),
+            None => Ok(()),
+        };
+        (record, written)
+    }
+}
+
+/// Records one step of an attempt, section 7's `steps[]` entry.
+///
+/// A free function taking `Option<&Recorder>` because most call sites hold
+/// exactly that: a house running without a diagnostics directory, and every
+/// test that predates this work order, pass `None` and the call is a no-op.
+/// `diag::record(recorder, Step::GateDial, StepOutcome::Ok, detail)` is the
+/// one spelling used at every step in `punch.rs`, `live.rs` and
+/// `gate/client.rs`.
+pub fn record(
+    recorder: Option<&Recorder>,
+    step: Step,
+    outcome: StepOutcome,
+    detail: impl Into<String>,
+) {
+    if let Some(recorder) = recorder {
+        recorder.step(step, outcome, detail);
+    }
+}
+
+/// Section 7's mapping inference: `endpoint_dependent` when the two
+/// reflections differ in address or port, `endpoint_independent` when they
+/// agree, and `unknown` when fewer than two were observed.
+#[must_use]
+pub fn infer_mapping(primary: Option<Addr>, secondary: Option<Addr>) -> Mapping {
+    match (primary, secondary) {
+        (Some(first), Some(second)) => {
+            if first.bytes == second.bytes && first.port == second.port {
+                Mapping::EndpointIndependent
+            } else {
+                Mapping::EndpointDependent
+            }
+        }
+        _ => Mapping::Unknown,
+    }
+}
+
+/// Section 7's `hairpin_failure` rule: both sides' observed addresses share
+/// an IP and every direct candidate timed out while the relay worked.
+///
+/// Stated as a function so the doorbell's fall-back reason is a rule and
+/// not a guess, which is what the Phase 1 gate's "named reason" for case
+/// (d) needs.
+#[must_use]
+pub fn probe_failure_reason(
+    local_observed: Option<Addr>,
+    peer_observed: Option<Addr>,
+    mapping: Mapping,
+    relay_carried_traffic: bool,
+) -> Reason {
+    if mapping == Mapping::EndpointDependent {
+        return Reason::EndpointDependentMapping;
+    }
+    if let (Some(local), Some(peer)) = (local_observed, peer_observed)
+        && local.bytes == peer.bytes
+        && relay_carried_traffic
+    {
+        return Reason::HairpinFailure;
+    }
+    Reason::ProbeTimeout
+}
+
+// ---------------------------------------------------------------------
+// Reading back, for `doctor --last`
+// ---------------------------------------------------------------------
+
+/// Every diagnostics file in `dir`, newest day first and, within a day, its
+/// highest overflow part first, so a search for the most recent record
+/// reads the fewest files.
+fn files_newest_first(dir: &Path) -> Result<Vec<PathBuf>, DiagError> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".jsonl") && day_prefix(name).is_some())
+        .collect();
+    // Lexicographic order is chronological for `YYYY-MM-DD[.N]`, except
+    // that `.10` sorts before `.2`; parts are compared numerically for
+    // that reason.
+    names.sort_by(|a, b| {
+        let key = |name: &str| {
+            let day = day_prefix(name).unwrap_or("").to_string();
+            let part: u32 = name
+                .strip_suffix(".jsonl")
+                .and_then(|stem| stem.get(10..))
+                .and_then(|rest| rest.strip_prefix('.'))
+                .and_then(|digits| digits.parse().ok())
+                .unwrap_or(0);
+            (day, part)
+        };
+        key(b).cmp(&key(a))
+    });
+    Ok(names.into_iter().map(|name| dir.join(name)).collect())
+}
+
+/// The most recent record in `dir` for `peer`, or for any peer when `peer`
+/// is `None`, without running anything: `doctor --last`.
+///
+/// Malformed lines are skipped, as [`read_records`] reports them: one torn
+/// line must not hide the record before it.
+///
+/// # Errors
+/// Returns [`DiagError::Io`] if `dir` cannot be listed or a file in it
+/// cannot be read.
+pub fn last_record(
+    dir: &Path,
+    peer: Option<PeerFingerprint>,
+) -> Result<Option<DiagRecord>, DiagError> {
+    for path in files_newest_first(dir)? {
+        let mut best: Option<DiagRecord> = None;
+        for outcome in read_records(&path)? {
+            let ReadOutcome::Record(record) = outcome else {
+                continue;
+            };
+            if peer.is_some_and(|wanted| wanted != record.peer) {
+                continue;
+            }
+            best = Some(*record);
+        }
+        if best.is_some() {
+            return Ok(best);
+        }
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------
+// The human-readable report (`doctor` without `--json`)
+// ---------------------------------------------------------------------
+
+/// An address for a person to read: `host:port`, or the plain words for
+/// one that was never observed, rather than the raw-field dump the JSON
+/// form needs in order to round trip (Konrad's nit 10 on PR #49).
+fn addr_for_humans(addr: Addr) -> String {
+    match addr.to_socket_addr() {
+        Some(socket_addr) => socket_addr.to_string(),
+        None => "(not observed)".to_string(),
+    }
+}
+
+/// The first line of every `doctor` report, section 7: "IP addresses are
+/// kept, because they are the thing being diagnosed, and the doctor command
+/// says so on its first line so nobody sends a file blind."
+pub const PRIVACY_NOTICE: &str =
+    "This report contains IP addresses: yours, your friend's and your gate's.";
+
+impl DiagRecord {
+    /// This record in the human form section 7 gives: the privacy notice,
+    /// one line per step (`10 fail probe_burst 10000 ms 0 of 9 candidates
+    /// answered`), then mapping, path and RTT, gate bytes and reason.
+    ///
+    /// The number opening a step line is that step's position in section
+    /// 7's step enum, which is what makes `probe_burst` the tenth.
+    ///
+    /// The duration is derived rather than stored, and derived **backwards**
+    /// (Konrad's must 1 on PR #49): every call site stamps `at_ms` when the
+    /// step finishes, so a step's duration is the distance from the
+    /// previous step's `at_ms`, and the first step's is the distance from
+    /// the start of the attempt. Deriving it forwards, to the next step's
+    /// `at_ms`, printed each step's neighbour's duration and always 0 for
+    /// the last one, so a 10 s gate dial read `0 ms`.
+    #[must_use]
+    pub fn to_human_report(&self) -> String {
+        let mut out = String::new();
+        out.push_str(PRIVACY_NOTICE);
+        out.push('\n');
+        let mut previous_ms = 0u64;
+        for step in &self.steps {
+            let duration_ms = step.at_ms.saturating_sub(previous_ms);
+            previous_ms = step.at_ms;
+            let number = Step::ALL
+                .iter()
+                .position(|candidate| *candidate == step.step)
+                .map_or(0, |index| index + 1);
+            out.push_str(&format!(
+                "{number:>2} {outcome:<4} {name:<18} {duration_ms:>6} ms  {detail}\n",
+                outcome = step.outcome.as_str(),
+                name = step.step.as_str(),
+                detail = step.detail,
+            ));
+        }
+        out.push_str(&format!("mapping {}\n", self.mapping.as_str()));
+        out.push_str(&format!(
+            "path {} {} rtt {} us\n",
+            self.path.kind_str(),
+            addr_for_humans(self.path.addr()),
+            self.path_rtt_us,
+        ));
+        out.push_str(&format!(
+            "gate carried {} ({} bytes, {} queued, shaped p50 {} us max {} us, dropped {})\n",
+            if self.gate_carried_traffic {
+                "traffic"
+            } else {
+                "nothing"
+            },
+            self.gate_bytes,
+            self.relay_queued,
+            self.relay_shaped_delay_p50_us,
+            self.relay_shaped_delay_max_us,
+            self.relay_dropped_at_full,
+        ));
+        out.push_str(&format!("reason {}\n", self.reason.as_str()));
+        if let Some(failed) = self.failed_step {
+            out.push_str(&format!("failed step {}\n", failed.as_str()));
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1285,6 +1980,10 @@ mod tests {
             mapping: Mapping::EndpointIndependent,
             gate_carried_traffic: true,
             gate_bytes: 4096,
+            relay_queued: 12,
+            relay_shaped_delay_p50_us: 480,
+            relay_shaped_delay_max_us: 1200,
+            relay_dropped_at_full: 0,
             path: PathChoice::Direct(sample_addr(51_823)),
             path_rtt_us: 15_000,
             reason,
@@ -1337,6 +2036,278 @@ mod tests {
             let parsed = DiagRecord::from_json_line(&record.to_json_line()).unwrap();
             assert_eq!(parsed.reason, reason);
         }
+    }
+
+    // --- the recorder (WO-1.4b) ---------------------------------------------
+
+    /// A unique temporary directory for one test's diagnostics log.
+    fn test_dir(name: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("jerome14b-diag-{name}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn records_in(dir: &Path) -> Vec<DiagRecord> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            for outcome in read_records(&path).unwrap() {
+                if let ReadOutcome::Record(record) = outcome {
+                    out.push(*record);
+                }
+            }
+        }
+        out
+    }
+
+    /// Section 8's WO-1.4 verify line, first half: "a test forcing each
+    /// failure step asserts a record naming that step". Every step of
+    /// section 7's enum is forced to fail through the recorder that
+    /// `punch.rs`, `live.rs` and `gate/client.rs` all call, and the record
+    /// that reaches the log names it.
+    ///
+    /// Deliberate break to fail this test: in `Recorder::step`, drop the
+    /// `if outcome == StepOutcome::Fail && state.failed_step.is_none()`
+    /// assignment. Every step is still logged, but `failed_step` stays
+    /// null and `doctor` exits 0 on a failed attempt.
+    #[test]
+    fn forcing_each_step_to_fail_writes_a_record_naming_it() {
+        for step in Step::ALL {
+            let dir = test_dir(&format!("force-{}", step.as_str()));
+            let sink = DiagSink::new(dir.clone()).unwrap();
+            let recorder = Recorder::new(
+                PeerFingerprint::from_key(&test_salt(), &[3u8; 32]),
+                Some(sink),
+            );
+            record(
+                Some(&recorder),
+                step,
+                StepOutcome::Fail,
+                format!("forced failure at {}", step.as_str()),
+            );
+            let (returned, written) = recorder.finish(Reason::Internal);
+            written.unwrap();
+            assert_eq!(returned.failed_step, Some(step));
+
+            let written = records_in(&dir);
+            assert_eq!(written.len(), 1, "one attempt is one record");
+            let record = &written[0];
+            assert_eq!(record.failed_step, Some(step), "record must name {step:?}");
+            assert!(
+                record
+                    .steps
+                    .iter()
+                    .any(|entry| entry.step == step && entry.outcome == StepOutcome::Fail),
+                "record must carry the failing step entry for {step:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn one_attempt_writes_one_record_however_often_it_is_finished() {
+        let dir = test_dir("finish-once");
+        let sink = DiagSink::new(dir.clone()).unwrap();
+        let recorder = Recorder::new(PeerFingerprint::default(), Some(sink));
+        record(Some(&recorder), Step::GateDial, StepOutcome::Ok, "dialled");
+        let (first, _) = recorder.finish(Reason::Ok);
+        // A second and third close, which is what a doorbell that falls
+        // back and then loses its connection does.
+        let (second, _) = recorder.finish(Reason::Internal);
+        let (third, _) = recorder.finish(Reason::PathIdleTimeout);
+        assert_eq!(first, second);
+        assert_eq!(first, third, "later closes return the record written");
+        assert_eq!(records_in(&dir).len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An address that was never observed is written as its raw fields
+    /// (family 0), and must read back: a record whose attempt never
+    /// reached a reflection is exactly the record a person runs `doctor`
+    /// to look at.
+    #[test]
+    fn an_unobserved_address_round_trips_through_the_reader() {
+        let mut record = sample_record(Reason::GateUnreachable, Some(Step::GateDial));
+        record.local_observed = [Addr::default(), Addr::default()];
+        record.peer_observed = Addr::default();
+        record.path = PathChoice::Relay(Addr::default());
+        let parsed = DiagRecord::from_json_line(&record.to_json_line()).unwrap();
+        assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn the_mapping_is_inferred_from_the_two_reflections() {
+        assert_eq!(
+            infer_mapping(Some(sample_addr(1000)), Some(sample_addr(1000))),
+            Mapping::EndpointIndependent
+        );
+        assert_eq!(
+            infer_mapping(Some(sample_addr(1000)), Some(sample_addr(1001))),
+            Mapping::EndpointDependent
+        );
+        assert_eq!(
+            infer_mapping(Some(sample_addr(1000)), None),
+            Mapping::Unknown
+        );
+        assert_eq!(infer_mapping(None, None), Mapping::Unknown);
+    }
+
+    /// Section 7's inference, so case (d)'s named reason is a rule: two
+    /// reflections that differ are an endpoint-dependent mapping; a shared
+    /// IP with a working relay is a hairpin failure; anything else is a
+    /// plain probe timeout.
+    #[test]
+    fn the_probe_failure_reason_follows_section_sevens_rules() {
+        let local = sample_addr(4000);
+        assert_eq!(
+            probe_failure_reason(
+                Some(local),
+                Some(sample_addr(4001)),
+                Mapping::EndpointDependent,
+                true
+            ),
+            Reason::EndpointDependentMapping
+        );
+        // Same IP on both sides, relay carried traffic: hairpin.
+        assert_eq!(
+            probe_failure_reason(
+                Some(local),
+                Some(sample_addr(4002)),
+                Mapping::EndpointIndependent,
+                true
+            ),
+            Reason::HairpinFailure
+        );
+        // Same IP but the relay carried nothing: not the hairpin rule.
+        assert_eq!(
+            probe_failure_reason(
+                Some(local),
+                Some(sample_addr(4002)),
+                Mapping::EndpointIndependent,
+                false
+            ),
+            Reason::ProbeTimeout
+        );
+        let elsewhere = Addr::from_socket_addr(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9)),
+            4000,
+        ));
+        assert_eq!(
+            probe_failure_reason(
+                Some(local),
+                Some(elsewhere),
+                Mapping::EndpointIndependent,
+                true
+            ),
+            Reason::ProbeTimeout
+        );
+    }
+
+    /// `doctor --last` reads the most recent record for one peer without
+    /// running anything, and is not confused by another peer's later
+    /// record.
+    #[test]
+    fn last_record_finds_the_newest_for_that_peer() {
+        let dir = test_dir("last");
+        let salt = test_salt();
+        let wanted = PeerFingerprint::from_key(&salt, &[1u8; 32]);
+        let other = PeerFingerprint::from_key(&salt, &[2u8; 32]);
+        let mut writer = DiagWriter::new(dir.clone()).unwrap();
+
+        let mut first = sample_record(Reason::Ok, None);
+        first.peer = wanted;
+        first.session = 1;
+        let mut second = sample_record(Reason::ProbeTimeout, Some(Step::ProbeBurst));
+        second.peer = wanted;
+        second.session = 2;
+        let mut third = sample_record(Reason::Ok, None);
+        third.peer = other;
+        third.session = 3;
+        for record in [&first, &second, &third] {
+            writer.append(record, 1_700_000_000_000).unwrap();
+        }
+
+        let found = last_record(&dir, Some(wanted)).unwrap().unwrap();
+        assert_eq!(found.session, 2, "the newest record for that peer");
+        let any = last_record(&dir, None).unwrap().unwrap();
+        assert_eq!(any.session, 3);
+        let missing =
+            last_record(&dir, Some(PeerFingerprint::from_key(&salt, &[9u8; 32]))).unwrap();
+        assert!(missing.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The human form section 7 gives: a first line saying the report
+    /// carries IP addresses, one line per step opening with that step's
+    /// number in the enum, then mapping, path, gate bytes and reason.
+    #[test]
+    fn the_human_report_has_section_sevens_shape() {
+        let mut record = sample_record(Reason::ProbeTimeout, Some(Step::ProbeBurst));
+        record.steps = vec![
+            // Both stamped the way every call site stamps: at the moment
+            // the step finished. The dial took 12 ms, the burst the 10 s
+            // between its own stamp and the dial's.
+            StepRecord {
+                step: Step::GateDial,
+                at_ms: 12,
+                outcome: StepOutcome::Ok,
+                detail: "gate at 198.51.100.7:443".to_string(),
+            },
+            StepRecord {
+                step: Step::ProbeBurst,
+                at_ms: 10_012,
+                outcome: StepOutcome::Fail,
+                detail: "0 of 9 candidates answered".to_string(),
+            },
+        ];
+        record.ended_at_ms = record.started_at_ms + 10_012;
+        let report = record.to_human_report();
+        let mut lines = report.lines();
+        assert_eq!(lines.next(), Some(PRIVACY_NOTICE));
+        let gate_dial = lines.next().unwrap();
+        assert!(gate_dial.starts_with(" 1 ok   gate_dial"), "{gate_dial:?}");
+        assert!(gate_dial.contains("12 ms"), "{gate_dial:?}");
+        let probe = lines.next().unwrap();
+        // `probe_burst` is the tenth step of section 7's enum, and its
+        // duration runs from the step before it: 10012 - 12.
+        assert!(probe.starts_with("10 fail probe_burst"), "{probe:?}");
+        assert!(probe.contains("10000 ms"), "{probe:?}");
+        assert!(probe.ends_with("0 of 9 candidates answered"), "{probe:?}");
+        assert!(report.contains("mapping endpoint_independent"));
+        assert!(report.contains("reason probe_timeout"));
+        assert!(report.contains("failed step probe_burst"));
+    }
+
+    /// The four shaper counters section 7 puts beside `gate_carried_traffic`
+    /// travel into the record, and a record written before they existed
+    /// still reads back rather than being rejected as malformed.
+    #[test]
+    fn the_shaper_counters_round_trip_and_an_older_record_still_reads() {
+        let record = sample_record(Reason::Ok, None);
+        let parsed = DiagRecord::from_json_line(&record.to_json_line()).unwrap();
+        assert_eq!(parsed.relay_queued, 12);
+        assert_eq!(parsed.relay_shaped_delay_p50_us, 480);
+        assert_eq!(parsed.relay_shaped_delay_max_us, 1200);
+        assert_eq!(parsed.relay_dropped_at_full, 0);
+
+        let mut value: serde_json::Value = serde_json::from_str(&record.to_json_line()).unwrap();
+        for key in [
+            "relay_queued",
+            "relay_shaped_delay_p50_us",
+            "relay_shaped_delay_max_us",
+            "relay_dropped_at_full",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        let older = DiagRecord::from_json_line(&serde_json::to_string(&value).unwrap()).unwrap();
+        assert_eq!(older.relay_queued, 0);
+        assert_eq!(older.gate_bytes, record.gate_bytes);
     }
 
     // --- reader skips malformed lines ---------------------------------------

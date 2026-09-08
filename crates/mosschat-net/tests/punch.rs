@@ -222,6 +222,31 @@ mod punch {
         )
     }
 
+    /// A unique temporary diagnostics directory for one test.
+    fn diag_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("jerome14b-punch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Every record written into `dir`.
+    fn records_in(dir: &std::path::Path) -> Vec<mosschat_net::diag::DiagRecord> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            for outcome in mosschat_net::diag::read_records(&path).unwrap() {
+                if let mosschat_net::diag::ReadOutcome::Record(record) = outcome {
+                    out.push(*record);
+                }
+            }
+        }
+        out
+    }
+
     /// Section 8's WO-1.3b case, over the real stream: the doorbell opens
     /// relayed from the first packet, upgrades to a direct path once a
     /// candidate has proved itself by the stated count, and falls back to
@@ -260,14 +285,26 @@ mod punch {
         alice_friends.add(bob_key);
         bob_friends.add(alice_key);
 
+        // WO-1.4b: alice runs this whole attempt with a recorder, from the
+        // gate dial to the fall-back, so the one record it writes is the
+        // one section 8 asks this test to assert against.
+        let diagnostics = diag_dir("doorbell");
+        let alice_recorder = mosschat_net::diag::Recorder::new(
+            mosschat_net::diag::PeerFingerprint::from_key(
+                &mosschat_net::diag::InstallSalt::load_or_create(&diagnostics).unwrap(),
+                &bob_key,
+            ),
+            Some(mosschat_net::diag::DiagSink::new(diagnostics.clone()).unwrap()),
+        );
         let alice = Arc::new(
-            GateClient::connect(
+            GateClient::connect_with_recorder(
                 gate.primary_addr(),
                 alice_seed,
                 community,
                 None,
                 alice_friends,
                 Arc::new(InMemoryInviteStore::new()),
+                Some(alice_recorder.clone()),
             )
             .await
             .unwrap(),
@@ -380,6 +417,7 @@ mod punch {
                         candidates,
                         peer_observed: bob.peer_observed_for(outcome.session),
                         peer_discovered: Vec::new(),
+                        recorder: None,
                     },
                     &bob_control,
                 )
@@ -389,6 +427,7 @@ mod punch {
         let alice_doorbell = {
             let alice = Arc::clone(&alice);
             let alice_control = Arc::clone(&alice_control);
+            let alice_recorder_for_task = alice_recorder.clone();
             let alice_peer = alice_peer.clone();
             let candidates = vec![alice_candidate];
             tokio::spawn(async move {
@@ -403,6 +442,7 @@ mod punch {
                         candidates,
                         peer_observed: alice.peer_observed_for(outcome.session),
                         peer_discovered: Vec::new(),
+                        recorder: Some(alice_recorder_for_task),
                     },
                     &alice_control,
                 )
@@ -475,6 +515,66 @@ mod punch {
             2,
             "the fall-back restarts slow start again"
         );
+
+        // WO-1.4b, section 8's end to end record: the attempt that just
+        // ran wrote exactly one record, and it says what this test watched
+        // happen.
+        let observed = alice.porch().path_for(&bob_key).unwrap().egress().stats();
+        let records = records_in(&diagnostics);
+        assert_eq!(records.len(), 1, "one attempt is one record");
+        let record = &records[0];
+        assert!(
+            matches!(record.path, mosschat_net::diag::PathChoice::Relay(_)),
+            "the attempt ended back on the relay: {:?}",
+            record.path
+        );
+        assert_eq!(record.failed_step, Some(mosschat_net::diag::Step::PathLost));
+        assert_eq!(record.reason, mosschat_net::diag::Reason::PathIdleTimeout);
+        assert!(
+            record.gate_carried_traffic,
+            "the relay carried this connection before the upgrade and after the fall-back"
+        );
+        assert!(record.gate_bytes > 0, "gate_bytes: {}", record.gate_bytes);
+        // The record's counters were read when the attempt settled and
+        // this reads them again afterwards, so the two are compared as the
+        // monotonic counters they are rather than for equality: quinn can
+        // put another relayed packet on the wire between the two reads.
+        assert!(record.relay_queued > 0);
+        assert!(
+            record.relay_queued <= observed.relay_queued,
+            "record {} against a later read of {}",
+            record.relay_queued,
+            observed.relay_queued
+        );
+        assert!(record.gate_bytes <= observed.relay_bytes);
+        assert_eq!(
+            record.relay_dropped_at_full, 0,
+            "a shaping house drops nothing"
+        );
+        assert_eq!(observed.relay_socket_backpressure, 0);
+        // Section 2's steps, in the order it runs them.
+        let steps: Vec<&str> = record
+            .steps
+            .iter()
+            .map(|entry| entry.step.as_str())
+            .collect();
+        for expected in [
+            "gate_dial",
+            "gate_register",
+            "reflect_primary",
+            "introduce",
+            "relay_open",
+            "candidate_exchange",
+            "start_signal",
+            "probe_burst",
+            "upgrade",
+            "live",
+            "path_lost",
+            "relay_fallback",
+        ] {
+            assert!(steps.contains(&expected), "no {expected} step in {steps:?}");
+        }
+        std::fs::remove_dir_all(&diagnostics).unwrap();
 
         // The connection survived both moves.
         data_send.write_all(b"relayed2").await.unwrap();
@@ -654,6 +754,7 @@ mod punch {
                         candidates,
                         peer_observed: ninth.peer_observed_for(outcome.session),
                         peer_discovered: Vec::new(),
+                        recorder: None,
                     },
                     &ninth_control,
                 )
@@ -677,6 +778,7 @@ mod punch {
                         candidates,
                         peer_observed: alice.peer_observed_for(outcome.session),
                         peer_discovered: Vec::new(),
+                        recorder: None,
                     },
                     &alice_control,
                 )
