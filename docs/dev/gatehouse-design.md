@@ -104,17 +104,22 @@ a few devices each at 8x headroom and bounds registration state at a few hundred
 one person talks to at once; 2 GiB per hour bounds the bill on a rented box.
 
 **The relay is shaped, not policed** (issue #19). A policer's drops are invisible to a peer's congestion control, so a
-bulk sender bursts and stalls. Each session direction holds a queue drained at the rate instead. On the house, 100
-datagrams, 50 ms of the rate, deep enough for a congestion window because it never drops: on a full queue it returns
-`WouldBlock` and wakes its poller on the next drain (`quinn/src/runtime.rs:57-59`), so the sender observes latency, not
-loss. On the gate, 24 datagrams, 12 ms, its input already shaped by the sending house, absorbing jitter and not a
-window: 28 KiB a direction, and 56 MiB with all 1024 sessions its caps permit full at once, the gate-wide bound entire,
-nothing to arbitrate. Unable to push back on unreliable datagrams, it drops the newest and counts it, but only when
-full: 0 for a house that shapes, the abuse cap in the open otherwise. 62 ms across the two queues a datagram crosses, a
-sixteenth of section 4's 1 s budget. The rate binds the instant, 2 GiB an hour the volume and the only byte ceiling, 15
-minutes at the 2.29 MiB/s the rate implies: conversation, not bulk. 10 MiB is 9119 datagrams at about 1150 stream bytes
-per 1200 byte packet after QUIC overhead, 4.6 s at 2000 a second, inside that test's 120 s timeout. The fix path for
-#19; a wedge surviving WO-1.3c's assertions is the frozen sender, its own defect.
+bulk sender bursts and stalls. Each direction of each session holds a queue drained at the rate instead, per session
+and in the path table beside its path, so a full one refuses only its own session. On the house, 100 datagrams, 50 ms
+of the rate, deep enough for a congestion window because this queue never drops: quinn's one refusal is `try_send`
+returning `WouldBlock`, which clears readiness endpoint-wide (`quinn/src/runtime.rs:54-59`), so it is the last resort,
+`poll_writable` staying Pending until the next drain, 0.5 ms at the rate, so the retry loop
+(`quinn/src/connection.rs:1031-1052`) cannot spin; each refusal counts `relay_socket_backpressure`, which WO-1.3c
+asserts stays 0. On the gate, 24 datagrams, 12 ms, drained at 2200 a second, 10 percent over the house's 2000 because
+two independently timed buckets never converge: without headroom 0.26 percent of mismatch fills 24 across a 9119
+datagram run, while 10 percent absorbs a thousand times a quartz clock's 100 ppm, leaving occupancy at one 10 ms
+scheduling tick's arrivals, 20 against the depth of 24. So 28 KiB a direction, and 56 MiB with all 1024 sessions its
+caps permit full at once, the gate-wide bound entire. Unable to push back on unreliable datagrams, the gate drops the
+newest and counts it, but only when full: 0 for a shaping house, the abuse cap in the open otherwise. 62 ms across the
+two queues a datagram crosses, a sixteenth of section 4's 1 s budget. The rate binds the instant, 2 GiB an hour the
+volume and the only byte ceiling: 15 minutes at 2.29 MiB/s, conversation not bulk. 10 MiB is 9119 datagrams at about
+1150 stream bytes per 1200 byte packet, 4.6 s at the rate, the 4 to 7 s a healthy run measures. This does not close
+#19, a receive-side `poll_recv` wake that stays WO-1.3b's must; it closes the relay's invisible loss.
 
 **Pair tag** = `BLAKE3("mosschat-gate-pair-v1" || community || min(kA,kB) || max(kA,kB))`, keys compared as byte
 strings. Only someone holding both public keys can compute it, so a stranger who knows a house's key cannot
@@ -234,13 +239,12 @@ connection, and on a **client** connection a non probing packet from an address 
 passive migration being server only (`:3011-3031`). Real addresses would give an upgrade that works one way and panics
 the other. Direct packets from an address in no peer's candidate table are dropped, which is a feature: nobody
 publishes where a house is (D3), so every real path came from a ticket, discovery or a candidate exchange. One
-exception, scoped to a connection and never to the process: the primary and secondary gate addresses this house dialled
-itself, each admitted by the dial that learned it and withdrawn when that connection closes, since the rule read
-literally drops the gate's own reflection replies. So it cannot outlive a registration, a restart or an address change
-re-learns, and one connection's address is not admitted for another. It is armed by that attach, not by a non-empty
-allow-list, so an emptied list fails closed; and with no unknown source admitted anywhere, the `panic!` above is out of
-reach of all but a gate crossing its own two addresses. The cost is one seam WO-4.1 needs, a flag accepting unknown
-sources while an invite stands.
+exception, a check on the packet and not a lifetime: a datagram is admitted when its source is in the live gate-address
+set, an address entering it at its connection's registration and leaving when that connection closes, since the rule
+read literally drops the gate's own reflection replies. `poll_recv` holds no connection, so a packet is matched against
+the union of the live sets, stated plainly rather than claimed per connection. The set is armed by that attach and not
+by being non-empty, so an emptied one fails closed, and the `panic!` above is out of reach of all but a gate crossing
+its own two addresses. The cost is one seam WO-4.1 needs, a flag accepting unknown sources while an invite stands.
 
 **What quinn therefore does not see.** Hiding the path change hides it from the three subsystems quinn rebuilds per
 path: `PathData::new` builds a fresh congestion controller, RTT estimator, pacer and `MtuDiscovery` out of the
@@ -470,16 +474,15 @@ kind, relay, and no probes, with the MTU cap and the epoch-resetting congestion 
 identity binding of section 5. Not touched: `punch.rs`, `live.rs`, `discovery.rs`, `diag.rs`. Files:
 `crates/mosschat-net/src/gate/{mod,server,client,wire}.rs`, `src/sock.rs`, `src/path.rs`, `src/authed.rs`, and the
 subcommand in `crates/mosschat/src/main.rs`, every `EndpointConfig` among them setting section 3's
-`grease_quic_bit(false)`, normative and not an optimisation. Verify, from WO-1.3's verify line: `cargo test -p
-mosschat-net gate::` passes, including a relay path carrying 10 MiB unchanged; a key absent from the member list
-refused in the handshake; an `Introduce` whose tag matches nobody, one the other house declines and one it never
-answers all yielding the asker the same silence and the same `introduce_timeout`; a first contact accepted on an
-unredeemed invite proof, and that proof refused at a second gate and against a second invite; a `Relay` datagram whose
-sender is neither key of its session dropped and counted rather than answered; and the registration cap rejecting the
-connection past it while still serving those below; and the gate connection reporting a `max_datagram_size()` of 1205
-or better, which fails if the porch socket leaves `may_fragment` at its default. Plus a chain of two certificates
-rejected in the handshake, a signature verified against the TLS key, and section 3's reversing-condition benchmark run
-and its median recorded.
+`grease_quic_bit(false)`, normative. Verify, from WO-1.3's verify line: `cargo test -p mosschat-net gate::` passes,
+including a relay path carrying 10 MiB unchanged; a key absent from the member list refused in the handshake; an
+`Introduce` whose tag matches nobody, one the other house declines and one it never answers all yielding the asker the
+same silence and the same `introduce_timeout`; a first contact accepted on an unredeemed invite proof, and that proof
+refused at a second gate and against a second invite; a `Relay` datagram whose sender is neither key of its session
+dropped and counted rather than answered; and the registration cap rejecting the connection past it while still serving
+those below; and the gate connection reporting a `max_datagram_size()` of 1205 or better, which fails if the porch
+socket leaves `may_fragment` at its default. Plus a chain of two certificates rejected in the handshake, a signature
+verified against the TLS key, and section 3's reversing-condition benchmark run and its median recorded.
 
 **WO-1.3b, the doorbell, liveness and discovery** (Jerome, agent-executable). Scope: sections 2, 4 and 6 on WO-1.3a's
 path table and porch socket. Files: `crates/mosschat-net/src/{punch.rs,live.rs,discovery.rs}`, edits to `src/sock.rs`
@@ -492,12 +495,14 @@ consumer, and one GSO `Transmit` of three segments relayed as three `Relay` data
 
 **WO-1.3c, the relay shaper** (Jerome), alone after WO-1.3b, sharing `path.rs` with it. Scope: section 1's shaper on
 both ends of the relay leg and section 7's three counters. Files: `crates/mosschat-net/src/gate/{server,client}.rs`,
-`src/sock.rs` for section 3's exception, and `src/path.rs` if the queue sits beside it. Verify by mechanism, 20 clean
-runs being 12 percent likely anyway: across `relay_path_carries_10_mib_unchanged`, `relay_dropped_at_full` is 0 and the
-gate forwards as many relay datagrams as it takes; then that test 20 of 20 under `nice -n 10`, green on macOS CI, which
-wedged twice at 124 s, none past 30 s; a unit test that a full queue drains at 2000 a second within a tick of section
-1's arithmetic, a datagram arriving on a full one dropped and counted with the rest in order; and one from a closed
-gate connection's address dropped and counted.
+`src/sock.rs` for section 3's check, and `src/path.rs`, which holds the per session queues. Verify by mechanism, 20
+clean runs being 12 percent likely anyway: across every run of `relay_path_carries_10_mib_unchanged`,
+`relay_rate_limited`, `relay_dropped_at_full` and `relay_socket_backpressure` all end at 0 and the gate forwards as
+many relay datagrams as it takes; 20 of 20 one at a time under `nice -n 10`, each under 15 s of wall clock, healthy
+runs measuring 4 to 7 s against a wedge's 123 s; green on macOS CI, which wedged twice at 124 s; the shaper timing unit
+test, a full queue draining at 2000 a second within a tick of section 1's arithmetic and a datagram arriving on a full
+one dropped and counted with the rest in order; and one from a closed gate connection's address dropped and counted.
+All of that together would close #19; the shaper alone closes the relay's invisible loss, not the receive-side wake.
 
 **WO-1.4, the diagnostics log and the doctor command** (Jerome), as PLAN writes it, against section 7. Files:
 `crates/mosschat-net/src/diag.rs` and the `doctor` subcommand. Verify: a test forcing each failure step asserts a
