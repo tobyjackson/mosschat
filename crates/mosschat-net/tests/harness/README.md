@@ -366,7 +366,85 @@ input (both were real bugs in an earlier version, PR 48 review).
 
 Each row's raw stdout (and stderr, merged) lands in
 `docs/measurements/<today's date>-faults/<row-id>.txt`. When it finishes
-it prints a summary table naming every file it wrote.
+it prints a report card, one line per row: condition, verdict, the exit
+code, and a plain-English note.
+
+### The report card
+
+Toby is not a network engineer, so the end-of-run table reads as a
+report card rather than a bare exit-code list. Each row's own
+`<row-id>.txt` (its header plus the doctor's `--json` record, if the row
+command was the doctor) is read back into one of four verdicts. Where
+more than one could apply to the same row, the precedence is FAIL beats
+SUSPECT beats NOT TESTED: an incomplete or wrong-reason record means the
+doctor itself misbehaved, and that must never be hidden behind "the
+fault did not land".
+
+- **PASS** -- the command exited 0 and the record shows a complete run
+  (`failed_step` null, `reason` `ok`, all four gate steps present), and,
+  for a row whose fault only lands after a start delay, the doctor was
+  still running when it did (see NOT TESTED below). The note is the
+  step timing: `dial N ms, register N ms, reflect N ms`.
+- **FAIL** -- the command exited non-zero, or the record names a
+  `failed_step`. The note names the failed step and the reason in
+  words, for example "failed at registering with the gate: the gate
+  rate limited this house".
+- **SUSPECT** -- exit 0, no `failed_step`, but the record's `reason` is
+  not `ok` or it has fewer than four steps (an unrecorded post-dial
+  failure, see the 2026-09-08 hewn-mini run below). The note says so.
+  Decided before NOT TESTED: a row can only be NOT TESTED once its
+  record already looks complete and ok.
+- **NOT TESTED** -- only possible for a row whose fault applies after a
+  start delay (today: `blackout-60s`, at `--blackout-start-delay`, and
+  `gatehouse-killed`, at its fixed 5 s kill delay), and only once the
+  record has already cleared the SUSPECT check above. If the record's
+  last step finished before that delay elapsed, the fault never landed
+  on a live connection, so a PASS there would be exactly the misread
+  this card exists to prevent -- caught in PR 78 review, both rows had
+  looked like clean passes despite the doctor finishing in a few
+  milliseconds, seconds before either fault applied. The note says how
+  many ms it took and when the fault would have landed, for example
+  "command finished in 4 ms, before the fault was applied at 5 s; needs
+  a long-lived command". Both rows need a long-lived row command (a
+  visit, not yet built) to mean anything; see each row's own note in
+  `docs/measurements/2026-09-08-hewn-mini*/NOTES.md`.
+
+A row whose command was not the doctor, or whose output has no JSON
+record at all, gets PASS or FAIL from its exit code alone, noted "no
+doctor record in output" -- the card does not assume the row command is
+`mosschat doctor --json`.
+
+Every card ends with a totals line, `totals: N PASS, N FAIL, N SUSPECT,
+N NOT TESTED`, counting the rows above it. The same card, with the same
+totals line, is written to `<output dir>/REPORT.md` as a markdown table
+(date, host, the command run, a one-line legend for all four verdicts,
+then the rows) every time `fault-matrix.sh` finishes a real run. Every
+row's `<row-id>.txt` also gets a trailing `# fault-matrix.sh: exit N`
+line so the real exit code survives being read back later.
+
+**`--report-only <dir>`** regenerates and prints this same card from an
+existing output directory's `<row-id>.txt` files, without running
+anything and without root. It never writes into `<dir>` (no
+`REPORT.md`, no edits to the row files), so it is safe to point at
+`docs/measurements/2026-09-08-hewn-mini/faults` or
+`docs/measurements/2026-09-08-hewn-mini-run2/faults` to see, without a
+Linux box, what the report card says about those two runs:
+
+- Run 1: 2 PASS, 9 SUSPECT, 1 NOT TESTED. `blackout-60s` stays SUSPECT
+  (the doctor defect described in that run's own NOTES.md, only
+  `gate_dial` recorded, fixed by PR 69, still SUSPECT under the FAIL
+  beats SUSPECT beats NOT TESTED precedence above, since it never
+  cleared the SUSPECT check to begin with); `gatehouse-killed` had a
+  complete, ok record and moves out of PASS into NOT TESTED, the doctor
+  having finished in a handful of milliseconds, well before its fault
+  landed at 5 s.
+- Run 2: 10 PASS, 2 NOT TESTED. `blackout-60s` and `gatehouse-killed`
+  both had complete, ok records and move out of what was previously 12
+  PASS.
+
+Row files written before the `# fault-matrix.sh: exit N` line existed
+(both of those) fall back to inferring 0 when the row printed anything
+after its header and 1 when it printed nothing at all.
 
 ## What to paste back into the repo
 
