@@ -93,17 +93,18 @@ record says `relay_stream_fallback`; DERP relays over TCP, so a reliable floor i
 `Error{gate_rate_limited}` and keeps the registration; over a hard cap it closes. Any control frame: 64 KiB length
 prefix checked before allocating, 32 frames per second per connection with burst 64. `Register`: one per connection, a
 second is a protocol error, and 4 connection attempts per key per minute. `Reflect`: 2 per connection; reconnecting
-resets it, and `Register`'s 4 connection attempts per key per minute is the per-key brake (amendment 3). The secondary
-(reflection) port carries its own 4 connection attempts per key per minute, a separate bucket from `Register`'s rather
-than a share of it (amendment 3). `Introduce`: `ttl_s` 60 and `sealed` 512 bytes, 6 per minute with burst 6 and 60 per
-hour per registrant. `StartRequest`: 4 per session, then ignored. `Keepalive`: one per `keepalive_s`, 3 per second
-tolerated. `Error`: `detail` 64 bytes. `Relay`: payload 1200 bytes, longer dropped and counted, 2000 datagrams a second
-per session each way and no byte rate beside it (below), 2 GiB per session per hour then `cap_exceeded`. `Knock`: one
-per matched `Introduce`, `sealed` forwarded verbatim and never opened. `KnockAnswer`: one per outstanding knock, later
-ones ignored, bounded by the `Introduce` limit that caused it. `Candidates`: 16 addresses, once per attempt. Whole gate:
-256 registrations, 2 live connections per key with a third refused, 8 live sessions per registration. 256 is 30 people
-with a few devices each at 8x headroom and bounds registration state at a few hundred KiB; 8 sessions is more friends
-than one person talks to at once; 2 GiB per hour bounds the bill on a rented box.
+resets it, and the per-key brake is the secondary port's own connection limit below, not `Register`'s, whose bucket is
+on the primary port and gates nothing on the reflection one (amendment 3). The secondary (reflection) port carries its
+own 4 connection attempts per key per minute, a separate bucket from `Register`'s rather than a share of it, so one key
+gets 8 reflections a minute (amendment 3). `Introduce`: `ttl_s` 60 and `sealed` 512 bytes, 6 per minute with burst 6 and
+60 per hour per registrant. `StartRequest`: 4 per session, then ignored. `Keepalive`: one per `keepalive_s`, 3 per
+second tolerated. `Error`: `detail` 64 bytes. `Relay`: payload 1200 bytes, longer dropped and counted, 2000 datagrams a
+second per session each way and no byte rate beside it (below), 2 GiB per session per hour then `cap_exceeded`. `Knock`:
+one per matched `Introduce`, `sealed` forwarded verbatim and never opened. `KnockAnswer`: one per outstanding knock,
+later ones ignored, bounded by the `Introduce` limit that caused it. `Candidates`: 16 addresses, once per attempt. Whole
+gate: 256 registrations, 2 live connections per key with a third refused, 8 live sessions per registration. 256 is 30
+people with a few devices each at 8x headroom and bounds registration state at a few hundred KiB; 8 sessions is more
+friends than one person talks to at once; 2 GiB per hour bounds the bill on a rented box.
 
 **The relay is shaped, not policed** (issue #19). A policer's drops are invisible to a peer's congestion control, so a
 bulk sender bursts and stalls. Each direction of each session holds a queue drained at the rate instead, per session
@@ -521,10 +522,11 @@ Amendments 1 and 2 predate this list and are not restated here; they are cited f
 (`crates/mosschat-net/src/gate/mod.rs` and `server.rs`, "design amendment 1" and "amended section 1").
 
 **Amendment 3, 2026-09-08: `Reflect` is limited per connection, not per key** (Toby). Section 1's caps paragraph now
-reads "2 per connection; reconnecting resets it, and `Register`'s 4 connection attempts per key per minute is the
-per-key brake". A house that reconnects is a new connection and may reflect again, so a person running `mosschat
-doctor` twice inside a minute is not rate limited on the second run, and the per-key bound stays where the design
-already put it, at 4 connection attempts a minute allowing 8 reflections. That brake is now real on both ports: the
-secondary port gets its own 4 connection attempts per key per minute, a separate bucket from `Register`'s, so one
-`doctor` run costs one connection on each port and four runs a minute fit on both, where a shared bucket would halve it
-to two; before this the secondary port had no per-key connection limit at all.
+reads "2 per connection; reconnecting resets it, and the per-key brake is the secondary port's own connection limit
+below". A house that reconnects is a new connection and may reflect again, so a person running `mosschat
+doctor` twice inside a minute is not rate limited on the second run. The per-key bound comes with it, on the port that
+needs it: the secondary port gets its own 4 connection attempts per key per minute, a separate bucket from `Register`'s
+rather than a share of it, so one `doctor` run costs one connection on each port, four runs a minute fit on both, and
+one key gets 8 reflections a minute. `Register`'s own bucket is not that bound and never was, its bucket being on the
+primary port while a key that never registers can reach the reflection port regardless; before this amendment the
+secondary port had no per-key connection limit at all.

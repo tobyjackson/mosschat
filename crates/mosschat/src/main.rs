@@ -474,21 +474,25 @@ async fn run_doctor_steps(
                     // Unreachable today: `connect` records `gate_register`
                     // and `reflect_primary` together and has nothing
                     // fallible after them. If a fallible step is ever added
-                    // there, this records the last step the attempt is
-                    // known to have reached rather than asserting a failure
-                    // in a step the same record already shows succeeding,
-                    // which would be a record contradicting itself
-                    // (Yseult's I1 on PR 69). The step that owns the new
-                    // failure should record it in `connect`, as every other
-                    // one there does.
-                    Some(step) => step,
+                    // there, the attempt ended somewhere this code cannot
+                    // name, so it is recorded as the attempt closing rather
+                    // than as a second, failing entry for a step the same
+                    // record already shows succeeding, which would be a
+                    // record contradicting itself (Yseult's I1 on PR 69).
+                    // The step that owns the new failure should record it
+                    // in `connect`, as every other one there does.
+                    Some(_) => Step::Closed,
                 };
-                mosschat_net::diag::record(
-                    Some(&recorder),
-                    in_flight,
-                    StepOutcome::Fail,
-                    err.to_string(),
-                );
+                let detail = match recorder.last_step() {
+                    Some(last) if in_flight == Step::Closed => {
+                        format!(
+                            "ended after {} with no step of its own: {err}",
+                            last.as_str()
+                        )
+                    }
+                    _ => err.to_string(),
+                };
+                mosschat_net::diag::record(Some(&recorder), in_flight, StepOutcome::Fail, detail);
                 Reason::Internal
             };
             let (record, written) = recorder.finish(reason);

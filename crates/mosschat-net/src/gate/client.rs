@@ -1308,9 +1308,15 @@ fn gate_close_reason(connection: &quinn::Connection) -> Option<Reason> {
 /// the house can read it. Without it the record's detail was "stream read
 /// error: connection lost" for a refusal the gate had named.
 fn closed_detail(e: &GateError, connection: &quinn::Connection) -> String {
+    // Both halves go through `gate_text`, not only the close reason: a
+    // `GateError` carries gate-authored text too, `Protocol` most of all
+    // ("expected Registered or Error, got {other:?}" prints a decoded
+    // frame, `Error.detail` inside it). Whichever half a hostile gate
+    // reaches the report through, it reaches it stripped and capped.
+    let error = gate_text(&e.to_string());
     match connection.close_reason() {
-        Some(reason) => format!("{e} ({})", gate_text(&reason.to_string())),
-        None => e.to_string(),
+        Some(reason) => format!("{error} ({})", gate_text(&reason.to_string())),
+        None => error,
     }
 }
 
