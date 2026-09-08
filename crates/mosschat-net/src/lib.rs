@@ -11,6 +11,7 @@ pub mod diag;
 pub mod gate;
 pub(crate) mod lockext;
 pub mod path;
+pub mod punch;
 pub mod sock;
 
 #[cfg(test)]

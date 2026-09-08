@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use rand::RngExt;
@@ -64,6 +64,15 @@ pub struct ServerCounters {
     /// was already full (Yseult finding 5 remainder: `frame_tx` was
     /// previously unbounded).
     pub frame_tx_dropped: AtomicU64,
+    /// A `StartRequest` naming a session this gate does not hold, dropped
+    /// in silence.
+    pub start_request_unknown_session: AtomicU64,
+    /// A `StartRequest` from a connection that is neither key of the named
+    /// session, dropped in silence: answering would be an oracle for live
+    /// sessions, exactly as it would be for a `Relay` datagram.
+    pub start_request_wrong_sender: AtomicU64,
+    /// A `StartRequest` past section 1's 4 per session, ignored.
+    pub start_requests_ignored: AtomicU64,
 }
 
 struct RegistrationInner {
@@ -120,6 +129,17 @@ impl RelayLimiter {
 struct SessionState {
     key_a: [u8; 32],
     key_b: [u8; 32],
+    /// Section 1: "`StartRequest`: 4 per session, then ignored". Counted
+    /// per session rather than per connection, because both houses of one
+    /// session share the budget: `Start` goes to both of them, so a fifth
+    /// request costs the peer a frame as much as the asker.
+    start_requests: AtomicU32,
+    /// The instant this session was introduced, which is what `Start`'s
+    /// `gate_ms` is measured from: a monotonic gate clock both houses write
+    /// into their diagnostics records so two logs can be aligned. It is
+    /// never a time to act on, so it needs no relation to anyone's wall
+    /// clock and must not be one.
+    opened_at: Instant,
     /// Charged against a datagram sent by `key_a`, forwarded to `key_b`.
     a_to_b: StdMutex<RelayLimiter>,
     /// Charged against a datagram sent by `key_b`, forwarded to `key_a`.
@@ -279,8 +299,27 @@ impl GateServer {
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
         server_config.transport_config(Arc::new(transport));
 
-        let primary = quinn::Endpoint::server(server_config.clone(), config.primary_bind)?;
-        let secondary = quinn::Endpoint::server(server_config, config.secondary_bind)?;
+        // `grease_quic_bit(false)` for the same reason the house sets it
+        // (see `client.rs`): the gate's own packets travel over the house's
+        // porch socket, past a probe filter that reads the first byte, so
+        // the gate must not clear the fixed bit either. `Endpoint::new`
+        // rather than `Endpoint::server` only because the latter takes no
+        // `EndpointConfig`.
+        let mut endpoint_config = quinn::EndpointConfig::default();
+        endpoint_config.grease_quic_bit(false);
+        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+        let primary = quinn::Endpoint::new(
+            endpoint_config.clone(),
+            Some(server_config.clone()),
+            std::net::UdpSocket::bind(config.primary_bind)?,
+            Arc::clone(&runtime),
+        )?;
+        let secondary = quinn::Endpoint::new(
+            endpoint_config,
+            Some(server_config),
+            std::net::UdpSocket::bind(config.secondary_bind)?,
+            runtime,
+        )?;
         let primary_addr = primary.local_addr()?;
         let secondary_addr = secondary.local_addr()?;
 
@@ -828,6 +867,9 @@ async fn control_loop(
             Frame::KnockAnswer { tag, accept, .. } => {
                 handle_knock_answer(state, registration, tag, accept);
             }
+            Frame::StartRequest { session, .. } => {
+                handle_start_request(state, registration, session);
+            }
             Frame::Goodbye { .. } => {
                 return Ok(());
             }
@@ -913,6 +955,65 @@ fn handle_introduce(
     );
 }
 
+/// Section 2 step 4: either side may ask, and the gate answers by sending
+/// `Start` **to both houses back to back**, so the two first probes cross
+/// inside a firewall's state window without any clock being synchronised.
+///
+/// The asker is checked against the session the way `forward_relay` checks
+/// a datagram's sender, and for the same reason: the session id is the
+/// authorisation, so a member who guessed one must not be able to make the
+/// gate fire two other houses' bursts. A request naming a session this
+/// connection is not a party to is dropped and counted, never answered,
+/// since an error frame would be an oracle for live sessions.
+fn handle_start_request(state: &Arc<ServerState>, registration: &Registration, session: u32) {
+    let (key_a, key_b, gate_ms, over_limit) = {
+        let sessions = state.sessions.lock_or_recover();
+        let Some(session_state) = sessions.get(&session) else {
+            state
+                .counters
+                .start_request_unknown_session
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if session_state.key_a != registration.key && session_state.key_b != registration.key {
+            state
+                .counters
+                .start_request_wrong_sender
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let taken = session_state.start_requests.fetch_add(1, Ordering::Relaxed);
+        (
+            session_state.key_a,
+            session_state.key_b,
+            u64::try_from(session_state.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            taken >= limits::START_REQUESTS_PER_SESSION,
+        )
+    };
+    if over_limit {
+        // Section 1: "4 per session, then ignored". Ignored, not refused:
+        // an error frame here is one more frame for a peer to make the gate
+        // send, and the two houses have already been told to start.
+        state
+            .counters
+            .start_requests_ignored
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let start = Frame::Start {
+        v: 1,
+        session,
+        fire_in_ms: limits::START_FIRE_IN_MS,
+        gate_ms,
+    };
+    let registrations = state.registrations.lock_or_recover();
+    for key in [key_a, key_b] {
+        if let Some(target) = registrations.get(&key).and_then(|list| list.last()) {
+            send_frame(state, target, start.clone());
+        }
+    }
+}
+
 fn handle_knock_answer(
     state: &Arc<ServerState>,
     registration: &Registration,
@@ -981,6 +1082,8 @@ fn handle_knock_answer(
         SessionState {
             key_a: knock.requester,
             key_b: knock.target,
+            start_requests: AtomicU32::new(0),
+            opened_at: Instant::now(),
             a_to_b: StdMutex::new(RelayLimiter::new()),
             b_to_a: StdMutex::new(RelayLimiter::new()),
         },

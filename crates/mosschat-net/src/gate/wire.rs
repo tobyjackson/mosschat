@@ -157,6 +157,20 @@ pub enum Frame {
         peer_observed: Addr,
         role: u8,
     },
+    /// Frame 7, gate to house, sent back to back to both houses of a
+    /// session on `StartRequest`.
+    Start {
+        v: u8,
+        session: u32,
+        /// How long after receiving this each side waits before firing its
+        /// first probe (section 2 step 4, 200 ms).
+        fire_in_ms: u16,
+        /// The gate's monotonic clock, written into both diagnostics
+        /// records so two logs can be aligned. **Never a time to act on.**
+        gate_ms: u64,
+    },
+    /// Frame 8, house to gate, once both sides have exchanged candidates.
+    StartRequest { v: u8, session: u32 },
     /// Frame 9, house to gate.
     Keepalive { v: u8 },
     /// Frame 10, gate to house.
@@ -182,6 +196,8 @@ const T_REFLECT: u8 = 3;
 const T_REFLECTED: u8 = 4;
 const T_INTRODUCE: u8 = 5;
 const T_INTRODUCTION: u8 = 6;
+const T_START: u8 = 7;
+const T_START_REQUEST: u8 = 8;
 const T_KEEPALIVE: u8 = 9;
 const T_KEEPALIVE_ACK: u8 = 10;
 const T_GOODBYE: u8 = 11;
@@ -264,6 +280,25 @@ impl Frame {
                 enc.u32(*session).unwrap();
                 peer_observed.encode(&mut enc).unwrap();
                 enc.u8(*role).unwrap();
+            }
+            Frame::Start {
+                v,
+                session,
+                fire_in_ms,
+                gate_ms,
+            } => {
+                enc.array(5).unwrap();
+                enc.u8(T_START).unwrap();
+                enc.u8(*v).unwrap();
+                enc.u32(*session).unwrap();
+                enc.u16(*fire_in_ms).unwrap();
+                enc.u64(*gate_ms).unwrap();
+            }
+            Frame::StartRequest { v, session } => {
+                enc.array(3).unwrap();
+                enc.u8(T_START_REQUEST).unwrap();
+                enc.u8(*v).unwrap();
+                enc.u32(*session).unwrap();
             }
             Frame::Keepalive { v } => {
                 enc.array(2).unwrap();
@@ -358,6 +393,16 @@ impl Frame {
                 session: dec.u32()?,
                 peer_observed: Addr::decode(&mut dec)?,
                 role: dec.u8()?,
+            },
+            (T_START, 5) => Frame::Start {
+                v: dec.u8()?,
+                session: dec.u32()?,
+                fire_in_ms: dec.u16()?,
+                gate_ms: dec.u64()?,
+            },
+            (T_START_REQUEST, 3) => Frame::StartRequest {
+                v: dec.u8()?,
+                session: dec.u32()?,
             },
             (T_KEEPALIVE, 2) => Frame::Keepalive { v: dec.u8()? },
             (T_KEEPALIVE_ACK, 3) => Frame::KeepaliveAck {
