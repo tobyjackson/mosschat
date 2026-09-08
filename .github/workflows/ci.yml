@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   check:
@@ -142,12 +143,17 @@ jobs:
       # still needs a dynamic linker hewn-pc doesn't have. `--version` is a
       # real execution, not just a link check, and only succeeds at all
       # because the runner's kernel can exec a static musl binary that
-      # carries no interpreter.
+      # carries no interpreter. Accepts either "statically linked" or
+      # "static-pie linked": x86_64-unknown-linux-musl has defaulted to
+      # static-pie since Rust 1.59, and both forms carry no dynamic
+      # interpreter -- only the traditional non-PIE form segfaults less
+      # predictably to force (rust-lang/rust#73661), which is why this
+      # doesn't add -C relocation-model=static to chase the older wording.
       - name: Verify static linking and binary execution
         run: |
           set -euo pipefail
           file dist-musl/mosschat
-          if ! file dist-musl/mosschat | grep -q 'statically linked'; then
+          if ! file dist-musl/mosschat | grep -qE 'statically linked|static-pie linked'; then
             echo "verify: FAIL: dist-musl/mosschat is not statically linked" >&2
             exit 1
           fi
