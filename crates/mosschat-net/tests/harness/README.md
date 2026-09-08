@@ -33,15 +33,66 @@ On the Linux box (hewn-mini or hewn-pc), with a one-line check for each:
 - `socat`, for the fixed-source-port NAT-mode probe below: `command -v socat >/dev/null && echo ok`
 - GNU coreutils' `timeout`, which every fault-matrix.sh row is bounded by: `command -v timeout >/dev/null && echo ok`
 - `openssl`, only for generating the community id and identity seeds below: `command -v openssl >/dev/null && echo ok`
-- a mosschat build: `nice -n 10 env CARGO_BUILD_JOBS=3 cargo build -p mosschat -p mosschat-net --examples`
+- `gh`, the GitHub CLI, to fetch the prebuilt binaries below: `command -v gh >/dev/null && echo ok`
+- `mosschat` and `spike` binaries, built for Linux (`x86_64-unknown-linux-gnu`) -- see
+  "Getting the binaries" immediately below
 - `iperf3` is not required by anything here; skip it unless you want it
   for your own bandwidth sanity checks outside this harness
 
-Debian/Ubuntu: `sudo apt install iproute2 nftables conntrack socat coreutils openssl`
-Arch: `sudo pacman -S iproute2 nftables conntrack-tools socat coreutils openssl`
-NixOS or any Nix install: `nix-shell -p iproute2 nftables conntrack-tools socat coreutils openssl`
+Debian/Ubuntu: `sudo apt install iproute2 nftables conntrack socat coreutils openssl gh`
+Arch: `sudo pacman -S iproute2 nftables conntrack-tools socat coreutils openssl github-cli`
+NixOS or any Nix install: `nix-shell -p iproute2 nftables conntrack-tools socat coreutils openssl gh`
 (coreutils and openssl are normally already on the system; the package
 names above only matter if either is missing).
+
+### Getting the binaries
+
+CI (`.github/workflows/ci.yml`, job `artifacts-linux`) builds `mosschat`
+and `spike` in release mode on every push to `main` and uploads them as
+one artifact, `mosschat-linux-x86_64-<short sha>`, retained 14 days. That
+job's own comments explain the scope: it only proves the example builds
+in release mode and runs on a `glibc` no older than an `ubuntu-latest`
+runner's, which is older than Ubuntu 26.04's -- it is the seed of WO-5.4
+(pinned baseline, checksummed, multi-target release builds), not a
+substitute for it. Download the latest one on any machine with `gh`
+authenticated against this repo (does not need to be the Linux test box
+itself), then copy the two binaries to the box:
+
+```
+gh run download --repo tobyjackson/mosschat -n mosschat-linux-x86_64-$(git rev-parse --short origin/main) -D /tmp/mosschat-artifact
+scp /tmp/mosschat-artifact/mosschat /tmp/mosschat-artifact/spike user@linux-box:/path/to/bin/
+```
+
+`gh run download` matches the artifact by exact name, so if you do not
+have the short SHA handy, list recent runs first
+(`gh run list --repo tobyjackson/mosschat --workflow=ci.yml --branch main`)
+and copy the name it printed, or omit `-n` to be prompted interactively.
+`SHA256SUMS` is in the same artifact; check it after the `scp` if you
+want to confirm nothing was altered in transit:
+
+```
+cd /path/to/bin && sha256sum -c /tmp/mosschat-artifact/SHA256SUMS
+```
+
+On the Linux box:
+
+```
+chmod +x /path/to/bin/mosschat /path/to/bin/spike
+export MOSSCHAT_BIN=/path/to/bin/mosschat
+export SPIKE_BIN=/path/to/bin/spike
+```
+
+Every command below uses `$MOSSCHAT_BIN` and `$SPIKE_BIN`; set them once
+per shell before running any of the sequence. `fault-matrix.sh` and
+`netns-nat.sh` read the same two variables, defaulting to
+`./target/release/mosschat` and `./target/release/examples/spike` if
+unset, so a developer who would rather build locally can skip all of the
+above with one line instead of the Prerequisites' old cargo-toolchain
+requirement:
+
+```
+nice -n 10 env CARGO_BUILD_JOBS=3 cargo build --release -p mosschat -p mosschat-net --examples
+```
 
 ## The exact sequence
 
@@ -51,11 +102,14 @@ root; `--dry-run` works without root and runs nothing (see each script's
 `--help` for the full flag list).
 
 ```
-nice -n 10 env CARGO_BUILD_JOBS=3 cargo build -p mosschat -p mosschat-net --examples
 sudo bash crates/mosschat-net/tests/harness/netns-nat.sh --mode eim
 sudo ip netns exec house-a ip addr show veth-ha
 sudo ip netns exec nat-a nft list ruleset
 ```
+
+(`$MOSSCHAT_BIN` and `$SPIKE_BIN` should already be set per "Getting the
+binaries" above before this point; neither script here needs them yet,
+but every step from "Building a real community" onward does.)
 
 The first `ip addr show` and `nft list ruleset` are a sanity check, not
 part of the harness: confirm `veth-ha` has `10.1.0.2/24` and that
@@ -133,14 +187,14 @@ on both `listen` and `dial` (`crates/mosschat-net/examples/spike.rs`),
 before it does anything network-facing, so a short-lived `listen` is
 enough to read a fixed identity's public key off.
 
-Every in-namespace step below runs the prebuilt
-`./target/debug/examples/spike` binary, never `cargo run` (issue #51):
-`cargo run` inside `ip netns exec` has to resolve, lock and possibly
-recompile through cargo's own machinery, which reaches outside
-`203.0.113.0/24` and has no route from inside these namespaces, so it
-hangs or fails; the plain prebuilt binary is what actually has the
-namespace's network access. Build it once with the `cargo build`
-command in Prerequisites above before running any of these.
+Every in-namespace step below runs the prebuilt `$SPIKE_BIN` binary,
+never `cargo run` (issue #51): `cargo run` inside `ip netns exec` has to
+resolve, lock and possibly recompile through cargo's own machinery,
+which reaches outside `203.0.113.0/24` and has no route from inside
+these namespaces, so it hangs or fails; the plain prebuilt binary is
+what actually has the namespace's network access. Set `$SPIKE_BIN` (and
+`$MOSSCHAT_BIN`) per "Getting the binaries" above before running any of
+these.
 
 ```
 mkdir -p crates/mosschat-net/tests/harness/.run
@@ -148,7 +202,7 @@ HOUSE_A_SEED=$(openssl rand -hex 32)
 HOUSE_B_SEED=$(openssl rand -hex 32)
 COMMUNITY=$(openssl rand -hex 32)
 
-sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/spike-a.pid; exec ip netns exec house-a ./target/debug/examples/spike listen --identity $HOUSE_A_SEED --bind 10.1.0.2:7777" >/tmp/spike-a-id.log 2>&1 &
+sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/spike-a.pid; exec ip netns exec house-a $SPIKE_BIN listen --identity $HOUSE_A_SEED --bind 10.1.0.2:7777" >/tmp/spike-a-id.log 2>&1 &
 sleep 2
 HOUSE_A_PUB=$(grep -m1 'spike: identity' /tmp/spike-a-id.log | awk '{print $3}')
 SPIKE_A_PID=$(cat crates/mosschat-net/tests/harness/.run/spike-a.pid)
@@ -157,7 +211,7 @@ if tr '\0' ' ' </proc/$SPIKE_A_PID/cmdline 2>/dev/null | grep -q spike; then
 fi
 wait
 
-sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/spike-b.pid; exec ip netns exec house-b ./target/debug/examples/spike listen --identity $HOUSE_B_SEED --bind 10.2.0.2:7777" >/tmp/spike-b-id.log 2>&1 &
+sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/spike-b.pid; exec ip netns exec house-b $SPIKE_BIN listen --identity $HOUSE_B_SEED --bind 10.2.0.2:7777" >/tmp/spike-b-id.log 2>&1 &
 sleep 2
 HOUSE_B_PUB=$(grep -m1 'spike: identity' /tmp/spike-b-id.log | awk '{print $3}')
 SPIKE_B_PID=$(cat crates/mosschat-net/tests/harness/.run/spike-b.pid)
@@ -198,7 +252,7 @@ never anyone's monitor or wrapper, it is the pid the gatehouse actually
 runs under, start to finish:
 
 ```
-sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/gatehouse.pid; exec ip netns exec internet ./target/debug/mosschat gatehouse --bind 203.0.113.1:443 --secondary-bind 203.0.113.1:444 --community $COMMUNITY --members crates/mosschat-net/tests/harness/.run/members.txt"
+sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/gatehouse.pid; exec ip netns exec internet $MOSSCHAT_BIN gatehouse --bind 203.0.113.1:443 --secondary-bind 203.0.113.1:444 --community $COMMUNITY --members crates/mosschat-net/tests/harness/.run/members.txt"
 ```
 
 Leave that terminal running. If you get either flag wrong, the
@@ -209,14 +263,14 @@ In a second terminal, listen inside house-b for the connection
 fault-matrix.sh (or a manual dial) will drive:
 
 ```
-sudo ip netns exec house-b ./target/debug/examples/spike listen --bind 10.2.0.2:7777 --advertise 10.2.0.2:7777
+sudo ip netns exec house-b $SPIKE_BIN listen --bind 10.2.0.2:7777 --advertise 10.2.0.2:7777
 ```
 
 It prints a ticket starting `moss1...`. Copy it. In a third terminal,
 dial from house-a:
 
 ```
-sudo ip netns exec house-a ./target/debug/examples/spike dial <the ticket from house-b>
+sudo ip netns exec house-a $SPIKE_BIN dial <the ticket from house-b>
 ```
 
 This is a direct connection between the two houses' namespaces, not
@@ -235,7 +289,7 @@ each row measures how that connection behaves under the row's condition:
 
 ```
 sudo bash crates/mosschat-net/tests/harness/fault-matrix.sh -- \
-  ip netns exec house-a ./target/debug/examples/spike dial <ticket>
+  ip netns exec house-a $SPIKE_BIN dial <ticket>
 ```
 
 A ticket is single-use per spike's own design (the listener answers one

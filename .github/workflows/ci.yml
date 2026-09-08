@@ -34,3 +34,72 @@ jobs:
 
       - name: Run the checks
         run: ./ci/check.sh
+
+  # Builds and publishes Linux release binaries so the NAT/fault-matrix
+  # harness (crates/mosschat-net/tests/harness/) and anyone else who just
+  # wants to run mosschat can `gh run download` a binary instead of
+  # installing a Rust toolchain on every test box (Toby, 2026-09: "why
+  # would build tools be needed on a machine that only runs the binary").
+  #
+  # Deliberately NOT on `pull_request` or every `push`: a PR branch's
+  # binary is not what anyone downloads for real work, only main's is,
+  # so this only rebuilds when main actually moves. `workflow_dispatch`
+  # covers re-running it on demand (e.g. to regenerate an artifact whose
+  # 14-day retention expired) without needing a throwaway commit.
+  #
+  # ubuntu-latest only: no macOS/Windows artifact yet, and no cross
+  # build. ubuntu-latest's glibc is OLDER than what a fresh Ubuntu 26.04
+  # box ships, which is what lets the resulting binary run there (a
+  # newer glibc is backwards-compatible with binaries linked against an
+  # older one, not the reverse) -- but that is a property this job gets
+  # for free from the runner image, not a deliberately chosen baseline,
+  # and nothing here pins a specific glibc version or checks it against
+  # a floor. This job is the seed of WO-5.4 (real release engineering:
+  # a pinned baseline glibc or a musl/static build, checksums published
+  # as release assets, multiple targets), not a replacement for it --
+  # no reproducibility is claimed for what this job produces.
+  artifacts-linux:
+    needs: check
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Same toolchain-pin comment as the check job above: dtolnay/rust-toolchain
+      # does not read rust-toolchain.toml itself; keep the @stable rev and
+      # components list in sync with that file by hand.
+      - name: Install Rust toolchain (kept in sync with rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build mosschat (release)
+        run: nice -n 10 env CARGO_BUILD_JOBS=3 cargo build --release -p mosschat --bin mosschat
+
+      - name: Build spike example (release)
+        run: nice -n 10 env CARGO_BUILD_JOBS=3 cargo build --release -p mosschat-net --example spike
+
+      - name: Stage artifact and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/mosschat dist/mosschat
+          cp target/release/examples/spike dist/spike
+          ( cd dist && sha256sum mosschat spike > SHA256SUMS )
+          cat dist/SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosschat-linux-x86_64-${{ steps.vars.outputs.sha_short }}
+          path: |
+            dist/mosschat
+            dist/spike
+            dist/SHA256SUMS
+          retention-days: 14
