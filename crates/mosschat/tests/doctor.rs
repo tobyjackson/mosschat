@@ -322,12 +322,11 @@ async fn a_gate_that_refuses_the_registration_exits_non_zero_naming_the_step() {
 /// `gate_register` ok and the gate holds no connection for that key
 /// afterwards.
 ///
-/// The third run does not exit 0: section 1's `Reflect` limit is 2 per
-/// minute and this implementation tracks it per key, so the third run's
-/// secondary-port reflection is refused `gate_rate_limited`. That is a
-/// separate finding (see the PR), and what this test pins is that the
-/// refusal is now the *reflection*, not the registration, and that it is
-/// reported rather than swallowed.
+/// All three exit 0. `Reflect` is capped per connection and each run
+/// dials its own (amendment 3, 2026-09-08), and three runs are inside
+/// `Register`'s 4 connection attempts per key per minute, so nothing here
+/// is rate limited: a person running `doctor` twice in a minute, or three
+/// times, gets an answer every time.
 ///
 /// Deliberate break to fail this test, run for real: remove the
 /// `deregister(&client).await` call from the gate-only path of
@@ -353,6 +352,11 @@ async fn a_doctor_run_deregisters_so_the_next_one_still_registers() {
             "run {run} exited {:?} with failed_step {:?}: the exit code and the record must agree",
             out.status.code(),
             record.failed_step
+        );
+        assert!(
+            out.status.success(),
+            "run {run} must succeed: nothing in three back to back runs is over a limit: {:?}",
+            record.steps
         );
         // The gate lets go as soon as it has read the `Goodbye`, and the
         // house waits for that close before returning, so this is already

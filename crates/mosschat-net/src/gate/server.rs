@@ -197,10 +197,6 @@ struct ServerState {
     /// separately from [`limits::MAX_CONNECTIONS_PER_KEY`], which bounds
     /// concurrent connections rather than the rate of new ones.
     register_attempts: StdMutex<HashMap<[u8; 32], RateLimiter>>,
-    /// Section 1: "`Reflect`: ... 2 per minute", tracked per key since each
-    /// `Reflect` rides its own short-lived secondary-port connection rather
-    /// than a long-lived registration.
-    reflect_attempts: StdMutex<HashMap<[u8; 32], RateLimiter>>,
     counters: ServerCounters,
 }
 
@@ -372,7 +368,6 @@ impl GateServer {
             sessions: StdMutex::new(HashMap::new()),
             pending_handshakes: AtomicUsize::new(0),
             register_attempts: StdMutex::new(HashMap::new()),
-            reflect_attempts: StdMutex::new(HashMap::new()),
             counters: ServerCounters::default(),
         });
 
@@ -478,10 +473,6 @@ fn sweep_once(state: &Arc<ServerState>) {
         let mut attempts = state.register_attempts.lock_or_recover();
         attempts.retain(|_, limiter| !limiter.is_full());
     }
-    {
-        let mut attempts = state.reflect_attempts.lock_or_recover();
-        attempts.retain(|_, limiter| !limiter.is_full());
-    }
     let expired: Vec<([u8; 32], Registration)> = {
         let registrations = state.registrations.lock_or_recover();
         registrations
@@ -538,53 +529,67 @@ async fn handle_secondary_connection(
         return Ok(());
     }
 
-    // Section 1: "`Reflect`: ... 2 per minute", tracked per key.
-    let reflect_allowed = {
-        let mut attempts = state.reflect_attempts.lock_or_recover();
-        let limiter = attempts.entry(authed.peer_key()).or_insert_with(|| {
-            RateLimiter::per_minute(limits::REFLECT_PER_MINUTE, limits::REFLECT_PER_MINUTE)
-        });
-        limiter.try_take()
-    };
-    if !reflect_allowed {
-        state
-            .counters
-            .reflect_rate_limited
-            .fetch_add(1, Ordering::Relaxed);
-        close_refused(&authed, ErrorCode::RateLimited, b"gate_rate_limited");
-        return Ok(());
-    }
-
     let observed = authed.connection().remote_address();
-    let (mut send, mut recv) = tokio::time::timeout(
-        authed::control_read_deadline(),
-        authed.connection().accept_bi(),
-    )
-    .await
-    .map_err(|_| GateError::Timeout)??;
-    let frame = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
-    if !matches!(frame, Frame::Reflect { .. }) {
-        return Err(GateError::Protocol(
-            "expected Reflect as the first frame".into(),
-        ));
+    // Amendment 3 (2026-09-08): the `Reflect` cap is per connection, so its
+    // whole state is this counter, which lives exactly as long as the
+    // connection it bounds and needs no map, no key and no sweep. It was a
+    // per-key token bucket, which made it stricter than the connection rate
+    // it sits under: a member allowed 4 connection attempts a minute could
+    // reflect on only 2 of them, so `mosschat doctor` run twice in a minute
+    // failed the second time. The per-key brake is `Register`'s 4 attempts
+    // a minute, which bounds this at 8 reflections a minute for one key.
+    let mut reflections_served = 0u32;
+    // One `Reflect` per connection is the intended use, and the house
+    // closes as soon as it has its answer; the loop is what makes the cap
+    // of 2 real rather than a number nothing could reach, and what keeps
+    // this connection alive between answers. Dropping the last `Connection`
+    // handle closes it at once (quinn's `ConnectionRef::drop`), which would
+    // race the reply reaching the house, so the wait for the next stream is
+    // also the wait for the house to close.
+    loop {
+        let accepted = tokio::time::timeout(
+            authed::control_read_deadline(),
+            authed.connection().accept_bi(),
+        )
+        .await;
+        // A house that has closed, or one that opens nothing at all inside
+        // the deadline, is simply let go: it has had every answer it asked
+        // for, and neither case is an error to report.
+        let Ok(Ok((mut send, mut recv))) = accepted else {
+            return Ok(());
+        };
+        let frame = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
+        if !matches!(frame, Frame::Reflect { .. }) {
+            return Err(GateError::Protocol(
+                "expected Reflect as the first frame".into(),
+            ));
+        }
+        if reflections_served >= limits::REFLECT_PER_CONNECTION {
+            state
+                .counters
+                .reflect_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
+            // A hard cap, so the gate closes rather than keeping the
+            // connection (section 1: "over a rate limit the gate answers
+            // `Error{gate_rate_limited}` and keeps the registration; over a
+            // hard cap it closes"). The house is told which, either way.
+            send_error_and_close(
+                &mut send,
+                &authed,
+                ErrorCode::RateLimited,
+                "gate_rate_limited",
+            )
+            .await;
+            return Ok(());
+        }
+        reflections_served += 1;
+        let reply = Frame::Reflected {
+            v: 1,
+            observed: Addr::from_socket_addr(observed),
+        };
+        wire::write_frame(&mut send, &reply).await?;
+        send.finish().ok();
     }
-    let reply = Frame::Reflected {
-        v: 1,
-        observed: Addr::from_socket_addr(observed),
-    };
-    wire::write_frame(&mut send, &reply).await?;
-    send.finish().ok();
-    // Dropping the last `Connection` handle closes it at once (quinn's
-    // `ConnectionRef::drop`), which can race the reply actually reaching
-    // the house if this task returns immediately. Wait for the house to
-    // close its side first (it does, right after reading the reply),
-    // bounded so a house that never closes cannot hang this task forever.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        authed.connection().closed(),
-    )
-    .await;
-    Ok(())
 }
 
 async fn accept_loop_primary(endpoint: quinn::Endpoint, state: Arc<ServerState>) {
