@@ -95,13 +95,27 @@ prefix checked before allocating, 32 frames per second per connection with burst
 second is a protocol error, and 4 connection attempts per key per minute. `Reflect`: one per connection is the intended
 use, 2 per minute. `Introduce`: `ttl_s` 60 and `sealed` 512 bytes, 6 per minute with burst 6 and 60 per hour per
 registrant. `StartRequest`: 4 per session, then ignored. `Keepalive`: one per `keepalive_s`, 3 per second tolerated.
-`Error`: `detail` 64 bytes. `Relay`: payload 1200 bytes, longer dropped and counted, 2000 datagrams and 3 MiB/s per
-session each way, 2 GiB per session per hour then `cap_exceeded`. `Knock`: one per matched `Introduce`, `sealed`
-forwarded verbatim and never opened. `KnockAnswer`: one per outstanding knock, later ones ignored, bounded by the
-`Introduce` limit that caused it. `Candidates`: 16 addresses, once per attempt. Whole gate: 256 registrations, 2 live
-connections per key with a third refused, 8 live sessions per registration. 256 is 30 people with a few devices each at
-8x headroom and bounds memory at a few hundred KiB; 8 sessions is more friends than one person talks to at once; 2 GiB
-per hour bounds the bill on a rented box.
+`Error`: `detail` 64 bytes. `Relay`: payload 1200 bytes, longer dropped and counted, 2000 datagrams a second per
+session each way and no byte rate beside it, 2000 x 1200 being 2.29 MiB/s so the 3 MiB/s once here could never bind, 2
+GiB per session per hour then `cap_exceeded`. `Knock`: one per matched `Introduce`, `sealed` forwarded verbatim and
+never opened. `KnockAnswer`: one per outstanding knock, later ones ignored, bounded by the `Introduce` limit that
+caused it. `Candidates`: 16 addresses, once per attempt. Whole gate: 256 registrations, 2 live connections per key with
+a third refused, 8 live sessions per registration. 256 is 30 people with a few devices each at 8x headroom and bounds
+registration state at a few hundred KiB; 8 sessions is more friends than one person talks to at once; 2 GiB per hour
+bounds the bill on a rented box.
+
+**The relay is shaped, not policed** (issue #19). A policer's drops are invisible to a peer's congestion control, so a
+bulk sender bursts, is decimated in silence and stalls. Each session direction holds a queue drained at the rate
+instead: 200 datagrams, 100 ms of that rate and a tenth of section 4's 1 s fall-back budget, so a full queue adds delay
+no liveness timer reads as a dead path, and deeper is bufferbloat; 234 KiB a direction, and 64 MiB gate-wide, its 1024
+sessions otherwise committing 469 MiB. Over the rate a datagram waits rather than dies, so the sender observes latency
+and not loss: the house returns `WouldBlock` to quinn on a full egress queue and wakes its poller on the next drain
+(`quinn/src/runtime.rs:57-59`, `:98-102`), never dropping; the gate, unable to push back on unreliable datagrams, drops
+the newest and counts it, but only on a full queue. At about 1150 bytes of stream data per 1200 byte packet (header,
+packet number, STREAM header, AEAD tag), 10 MiB is 9119 datagrams: 4.6 s at 2000 a second, 5.2 s even at a pessimistic
+1000 bytes, inside the 120 s idle timeout the 10 MiB relay test sets. The fix path for #19, proved by that test passing
+20 of 20 under `nice` with no wedge, plus a unit test of the shaper's timing (WO-1.3c); a wedge surviving that is the
+frozen sender behind it, its own defect.
 
 **Pair tag** = `BLAKE3("mosschat-gate-pair-v1" || community || min(kA,kB) || max(kA,kB))`, keys compared as byte
 strings. Only someone holding both public keys can compute it, so a stranger who knows a house's key cannot
@@ -220,8 +234,11 @@ connection, and on a **client** connection a non probing packet from an address 
 `panic!("packets from unknown remote should be dropped by clients")` (`quinn-proto/src/connection/mod.rs:3016-3018`),
 passive migration being server only (`:3011-3031`). Real addresses would give an upgrade that works one way and panics
 the other. Direct packets from an address in no peer's candidate table are dropped, which is a feature: nobody
-publishes where a house is (D3), so every real path came from a ticket, discovery or a candidate exchange. The cost is
-one seam WO-4.1 needs, a flag accepting unknown sources while an invite stands.
+publishes where a house is (D3), so every real path came from a ticket, discovery or a candidate exchange. One
+exception: the primary and secondary gate addresses this house dialled itself, learned at registration, since the rule
+read literally drops the gate's own reflection replies; and the rule is armed by that attach, not by a non-empty
+allow-list, so an emptied list fails closed. The cost is one seam WO-4.1 needs, a flag accepting unknown sources while
+an invite stands.
 
 **What quinn therefore does not see.** Hiding the path change hides it from the three subsystems quinn rebuilds per
 path: `PathData::new` builds a fresh congestion controller, RTT estimator, pacer and `MtuDiscovery` out of the
@@ -256,7 +273,7 @@ appears nowhere under `quinn-0.11.11/src`.
   built one. Pacing follows for free, quinn passing the pacer `congestion.window()` on every call rather than caching
   it (`quinn-proto/src/connection/mod.rs:617-622`). Cost: every switch restarts slow start from the initial window,
   12000 bytes (`quinn-proto/src/congestion/cubic.rs:266` against `quinn-proto/src/congestion.rs:105`), which is
-  correct; a LAN window landing on the gate's 3 MiB/s cap is what is being bought out of.
+  correct; a LAN window landing on the gate's shaped rate is what is being bought out of.
 - **RTT, out of quinn's hands.** `RttEstimator` has no hook at all, so section 4's `8 * srtt` and `4 * srtt` read the
   path table's own per path smoothed RTT, an EWMA over probe pong round trips (step 5) reset to the first sample on a
   switch, and never `Connection::rtt()` (`quinn/src/connection.rs:531-534`), which stays stale for several samples
@@ -293,16 +310,16 @@ GRO one.
 **Reversing condition**, either one flips the decision: (a) one probe delivered into quinn or one QUIC packet eaten by
 the filter on any of the three platforms; (b) the porch socket adds more than 20 microseconds at the median per
 received datagram against a plain tokio socket, roughly a tenth of a LAN RTT. Half (b) is measured **in WO-1.3a, not
-WO-1.5**: it is the riskiest bet here, 1.3b and 1.4 build on it, and the porch socket exists at the end of 1.3a with a
-benchmark needing nothing else. Half (a) cannot move, needing probes that WO-1.3b builds; it runs there and again on
-all three platforms in WO-1.5/1.6. On either, keep the porch socket for path selection, move probes to a second
-socket, and drive the upgrade from QUIC's own PATH_CHALLENGE, giving up pre-validated candidate scoring.
+WO-1.5**, the riskiest bet here and the one 1.3b and 1.4 build on. Half (a) cannot move, needing probes that WO-1.3b
+builds; it runs there and again on all three platforms in WO-1.5/1.6. On either, keep the porch socket for path
+selection, move probes to a second socket, and drive the upgrade from QUIC's own PATH_CHALLENGE, giving up
+pre-validated candidate scoring.
 
 ## 4. Liveness
 
 quinn does not know a router's UDP timer, so this policy is ours (research lesson 8, Reticulum lesson 4). The firewall
-assumption is research B's 30 seconds, and every `srtt` below is the path table's own per path estimate from probe
-pongs, never `Connection::rtt()`, for the reason section 3 gives.
+assumption is research B's 30 seconds, and every `srtt` below is the path table's own, never `Connection::rtt()`, for
+the reason section 3 gives.
 
 - **Keepalive on an idle direct path.** `K = clamp(8 * srtt, 5 s, 15 s)`. Ceiling 15 s because it is half the assumed
   30 s timer, so two consecutive losses still cannot let the mapping expire; floor 5 s because below that we spend
@@ -401,7 +418,7 @@ One record per connection attempt, written whether it succeeded, degraded or fai
 | `local_observed` | two `Addr`s | Primary and secondary gate reflections |
 | `peer_observed` | `Addr` | From frame 6 |
 | `mapping` | `endpoint_independent` / `endpoint_dependent` / `unknown` | Inferred, see below |
-| `gate_carried_traffic` | bool, plus `gate_bytes` | Recorded on every connection, success or not (D3) |
+| `gate_carried_traffic` | bool, plus `gate_bytes`, `relay_queued`, `relay_shaped_delay_us` (p50 and max), `relay_dropped_at_full` | Recorded on every connection, success or not (D3); the last three are section 1's shaper: datagrams that waited, how long, and drops on a full queue |
 | `path`, `path_rtt_us` | `relay` or `direct` with its `Addr`; u32 | The chosen path |
 | `reason`, `version`, `platform` | fixed enum; strings | |
 
@@ -442,23 +459,24 @@ ms 0 of 9 candidates answered`), then mapping, path and RTT, gate bytes and reas
 
 ## 8. Work orders
 
-**WO-1.3a, the gatehouse and the relay path** (Jerome, agent-executable). Scope: the `gatehouse` subcommand and the gate
-protocol of section 1 (the member list and slot table, registration, address reflection on two ports, introduction by
-knock with the sealed request carried verbatim, relay by session with the sender-membership check, keepalive, goodbye,
-and every cap section 1 lists); the house side gate client, including sealing a request and answering a knock from the
-local friend list and outstanding invites; the porch socket and the path table of section 3 with one path kind, relay,
-and no probes, with the MTU cap and the epoch-resetting congestion factory in place from the start; the identity binding
-of section 5. Not touched: `punch.rs`, `live.rs`, `discovery.rs`, `diag.rs`. Files:
+**WO-1.3a, the gatehouse and the relay path** (Jerome, agent-executable). Scope: the `gatehouse` subcommand and the
+gate protocol of section 1 (the member list and slot table, registration, address reflection on two ports, introduction
+by knock with the sealed request carried verbatim, relay by session with the sender-membership check, keepalive,
+goodbye, and every cap section 1 lists); the house side gate client, including sealing a request and answering a knock
+from the local friend list and outstanding invites; the porch socket and the path table of section 3 with one path
+kind, relay, and no probes, with the MTU cap and the epoch-resetting congestion factory in place from the start; the
+identity binding of section 5. Not touched: `punch.rs`, `live.rs`, `discovery.rs`, `diag.rs`. Files:
 `crates/mosschat-net/src/gate/{mod,server,client,wire}.rs`, `src/sock.rs`, `src/path.rs`, `src/authed.rs`, and the
-subcommand in `crates/mosschat/src/main.rs`. Verify, from WO-1.3's verify line: `cargo test -p mosschat-net gate::`
-passes, including a relay path carrying 10 MiB unchanged; a key absent from the member list refused in the handshake; an
-`Introduce` whose tag matches nobody, one the other house declines and one it never answers all yielding the asker the
-same silence and the same `introduce_timeout`; a first contact accepted on an unredeemed invite proof, and that proof
-refused at a second gate and against a second invite; a `Relay` datagram whose sender is neither key of its session
-dropped and counted rather than answered; and the registration cap rejecting the connection past it while still serving
-those below; and the gate connection reporting a `max_datagram_size()` of 1205 or better, which fails if the porch
-socket leaves `may_fragment` at its default. Plus a chain of two certificates rejected in the handshake, a signature
-verified against the TLS key, and section 3's reversing-condition benchmark run and its median recorded.
+subcommand in `crates/mosschat/src/main.rs`, every `EndpointConfig` among them setting `grease_quic_bit(false)`, which
+section 3's first-byte rule makes normative. Verify, from WO-1.3's verify line: `cargo test -p mosschat-net gate::`
+passes, including a relay path carrying 10 MiB unchanged; a key absent from the member list refused in the handshake;
+an `Introduce` whose tag matches nobody, one the other house declines and one it never answers all yielding the asker
+the same silence and the same `introduce_timeout`; a first contact accepted on an unredeemed invite proof, and that
+proof refused at a second gate and against a second invite; a `Relay` datagram whose sender is neither key of its
+session dropped and counted rather than answered; and the registration cap rejecting the connection past it while still
+serving those below; and the gate connection reporting a `max_datagram_size()` of 1205 or better, which fails if the
+porch socket leaves `may_fragment` at its default. Plus a chain of two certificates rejected in the handshake, a
+signature verified against the TLS key, and section 3's reversing-condition benchmark run and its median recorded.
 
 **WO-1.3b, the doorbell, liveness and discovery** (Jerome, agent-executable). Scope: sections 2, 4 and 6 on WO-1.3a's
 path table and porch socket. Files: `crates/mosschat-net/src/{punch.rs,live.rs,discovery.rs}`, edits to `src/sock.rs`
@@ -468,6 +486,14 @@ relay and a killed path putting it back with the connection surviving, a peer ki
 before dead while a goodbye reaches dead at once, and a failed dial to a cached address triggering rediscovery rather
 than a retry. Plus, from section 3, a probe and a QUIC packet delivered in one GRO batch each reaching its own
 consumer, and one GSO `Transmit` of three segments relayed as three `Relay` datagrams.
+
+**WO-1.3c, the relay shaper** (Jerome, agent-executable), alone after WO-1.3b, sharing `path.rs` with it. Scope:
+section 1's shaper on both ends of the relay leg, and section 7's three counters. Not touched: sections 2, 4 and 6.
+Files: `crates/mosschat-net/src/gate/{server,client}.rs`, and `src/path.rs` if the queue belongs beside the path table.
+Verify: `cargo test -p mosschat-net gate::` passes; `relay_path_carries_10_mib_unchanged` 20 of 20 one at a time under
+`nice -n 10`, none wedged and none past 30 s; and a unit test that a full queue drains at 2000 a second within a tick
+of section 1's arithmetic while a datagram arriving on a full queue is dropped and counted, those queued still leaving
+in order.
 
 **WO-1.4, the diagnostics log and the doctor command** (Jerome), as PLAN writes it, against section 7. Files:
 `crates/mosschat-net/src/diag.rs` and the `doctor` subcommand. Verify: a test forcing each failure step asserts a
