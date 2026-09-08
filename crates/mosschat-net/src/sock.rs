@@ -32,7 +32,9 @@ use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::io::Interest;
 
+use crate::gate::limits::INBOUND_RELAY_QUEUE_CAP;
 use crate::gate::wire::{decode_relay, encode_relay};
+use crate::lockext::LockExt;
 
 /// Builds the stable synthetic address for `peer_key` (section 3): `fd`, 5
 /// bytes randomised per process (`process_salt`), 10 bytes of
@@ -111,8 +113,7 @@ impl PorchSocket {
     /// addresses.
     pub fn attach_gate(self: &Arc<Self>, gate: quinn::Connection) {
         {
-            #[allow(clippy::unwrap_used)]
-            let mut routes = self.relay.lock().unwrap();
+            let mut routes = self.relay.lock_or_recover();
             routes.gate = Some(gate.clone());
         }
         let this = Arc::clone(self);
@@ -135,26 +136,36 @@ impl PorchSocket {
     /// `Relay{session, ..}` datagrams received from the gate are delivered
     /// to quinn tagged as arriving from `synthetic_peer`.
     pub fn register_relay_session(&self, session: u32, synthetic_peer: SocketAddr) {
-        #[allow(clippy::unwrap_used)]
-        let mut routes = self.relay.lock().unwrap();
+        let mut routes = self.relay.lock_or_recover();
         routes.by_synthetic.insert(synthetic_peer, session);
         routes.by_session.insert(session, synthetic_peer);
     }
 
+    /// Queues one inbound relayed datagram for delivery to quinn as if it
+    /// arrived from `session`'s registered synthetic peer address.
+    ///
+    /// **Drop policy** (Yseult finding 3: the queue was previously
+    /// unbounded, letting a session peer that sends faster than this
+    /// endpoint drains exhaust memory and starve the gate connection
+    /// sharing this socket). Bounded at
+    /// [`crate::gate::limits::INBOUND_RELAY_QUEUE_CAP`]; a full queue drops
+    /// its oldest entry to make room for the new one, since QUIC's own loss
+    /// recovery already treats an unacknowledged packet as retransmittable
+    /// and a stale queued packet is worth less than a fresh one.
     fn deliver_synthetic(&self, session: u32, payload: &[u8]) {
         let addr = {
-            #[allow(clippy::unwrap_used)]
-            let routes = self.relay.lock().unwrap();
+            let routes = self.relay.lock_or_recover();
             routes.by_session.get(&session).copied()
         };
         let Some(addr) = addr else { return };
         {
-            #[allow(clippy::unwrap_used)]
-            let mut queue = self.inbound_synthetic.lock().unwrap();
+            let mut queue = self.inbound_synthetic.lock_or_recover();
+            if queue.len() >= INBOUND_RELAY_QUEUE_CAP {
+                queue.pop_front();
+            }
             queue.push_back((addr, payload.to_vec()));
         }
-        #[allow(clippy::unwrap_used)]
-        if let Some(waker) = self.waker.lock().unwrap().take() {
+        if let Some(waker) = self.waker.lock_or_recover().take() {
             waker.wake();
         }
     }
@@ -186,14 +197,12 @@ impl AsyncUdpSocket for PorchSocket {
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
         let session = {
-            #[allow(clippy::unwrap_used)]
-            let routes = self.relay.lock().unwrap();
+            let routes = self.relay.lock_or_recover();
             routes.by_synthetic.get(&transmit.destination).copied()
         };
         if let Some(session) = session {
             let gate = {
-                #[allow(clippy::unwrap_used)]
-                let routes = self.relay.lock().unwrap();
+                let routes = self.relay.lock_or_recover();
                 routes.gate.clone()
             };
             let Some(gate) = gate else {
@@ -201,18 +210,33 @@ impl AsyncUdpSocket for PorchSocket {
                     "no gate connection attached to relay through",
                 ));
             };
-            let payload = encode_relay(session, transmit.contents)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            // `quinn::Connection::send_datagram` (unlike quinn-proto's
-            // lower-level API) has no `Blocked` case: it queues up to the
-            // connection's own datagram buffer and only ever reports
-            // `TooLarge`, `Disabled`, `UnsupportedByPeer` or the connection
-            // being lost, none of which are a transient "try again"
-            // condition this socket can usefully retry on.
-            return match gate.send_datagram(payload.into()) {
-                Ok(()) => Ok(()),
-                Err(e) => Err(io::Error::other(e.to_string())),
-            };
+            // Section 3: quinn sets `Transmit::segment_size` whenever it
+            // wrote more than one datagram into `contents` (GSO), and each
+            // segment is its own inner QUIC packet needing its own `Relay`
+            // header. Splitting on anything but `segment_size` (or ignoring
+            // it, as this used to) wraps the whole batch as one over-cap
+            // `Relay` payload: `encode_relay` errors past
+            // `RELAY_PAYLOAD_CAP` for anything beyond a single segment, and
+            // even where it does not, the far side would receive one
+            // unparseable blob instead of N QUIC packets.
+            let segment_size = transmit.segment_size.unwrap_or(transmit.contents.len());
+            if segment_size == 0 {
+                return Ok(());
+            }
+            for segment in transmit.contents.chunks(segment_size) {
+                let payload =
+                    encode_relay(session, segment).map_err(|e| io::Error::other(e.to_string()))?;
+                // `quinn::Connection::send_datagram` (unlike quinn-proto's
+                // lower-level API) has no `Blocked` case: it queues up to
+                // the connection's own datagram buffer and only ever
+                // reports `TooLarge`, `Disabled`, `UnsupportedByPeer` or the
+                // connection being lost, none of which are a transient "try
+                // again" condition this socket can usefully retry on.
+                if let Err(e) = gate.send_datagram(payload.into()) {
+                    return Err(io::Error::other(e.to_string()));
+                }
+            }
+            return Ok(());
         }
         self.udp.try_io(Interest::WRITABLE, || {
             self.state.send((&self.udp).into(), transmit)
@@ -226,8 +250,7 @@ impl AsyncUdpSocket for PorchSocket {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         {
-            #[allow(clippy::unwrap_used)]
-            let mut queue = self.inbound_synthetic.lock().unwrap();
+            let mut queue = self.inbound_synthetic.lock_or_recover();
             if let Some((addr, payload)) = queue.pop_front() {
                 if let (Some(buf), Some(m)) = (bufs.first_mut(), meta.first_mut()) {
                     let n = payload.len().min(buf.len());
@@ -245,9 +268,8 @@ impl AsyncUdpSocket for PorchSocket {
                 return Poll::Ready(Err(io::Error::other("no receive buffer provided")));
             }
         }
-        #[allow(clippy::unwrap_used)]
         {
-            *self.waker.lock().unwrap() = Some(cx.waker().clone());
+            *self.waker.lock_or_recover() = Some(cx.waker().clone());
         }
         // `poll_recv_ready` can report ready and then have the non-blocking
         // read turn up `WouldBlock` anyway (a spurious or already-consumed

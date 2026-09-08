@@ -10,8 +10,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use rand::RngExt;
 use tokio::sync::mpsc;
@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use crate::authed::{self, AuthedConnection};
 use crate::gate::wire::{self, Addr, Frame, decode_relay, encode_relay};
 use crate::gate::{ErrorCode, GateError, MemberList, RateLimiter, limits};
+use crate::lockext::LockExt;
 
 /// Counters a test (or an operator) can read back from a running gate.
 #[derive(Debug, Default)]
@@ -26,9 +27,22 @@ pub struct ServerCounters {
     /// `Relay` datagrams dropped because the sender was neither key of the
     /// named session (section 1: "dropped and counted, never answered").
     pub relay_sender_mismatch: AtomicU64,
+    /// `Relay` datagrams dropped because the sending half of the session
+    /// exceeded its per-direction datagram or byte rate (section 1: 2000
+    /// datagrams/s and the 2 GiB/hour cap, each way).
+    pub relay_rate_limited: AtomicU64,
     /// Registration attempts refused because the slot table was already at
     /// capacity.
     pub registrations_refused_at_capacity: AtomicU64,
+    /// `KnockAnswer` frames dropped because the answering registration was
+    /// not the knock's own target (Yseult finding 2: previously any
+    /// registrant holding the tag could accept or cancel a knock addressed
+    /// to someone else).
+    pub knock_answered_by_wrong_target: AtomicU64,
+    /// Connections refused before a slot was touched because
+    /// [`limits::MAX_PENDING_CONNECTIONS`] handshaked-but-not-yet-registered
+    /// connections were already outstanding.
+    pub pending_connections_refused: AtomicU64,
 }
 
 struct RegistrationInner {
@@ -50,18 +64,49 @@ struct KnockState {
     deadline: Instant,
 }
 
+/// A per-direction budget on one live relay session: section 1's 2000
+/// datagrams/s and 2 GiB/hour caps, each way, tracked independently so one
+/// direction filling up never throttles the other.
+struct RelayLimiter {
+    datagrams: RateLimiter,
+    bytes: RateLimiter,
+}
+
+impl RelayLimiter {
+    fn new() -> Self {
+        Self {
+            datagrams: RateLimiter::per_second(
+                limits::RELAY_DATAGRAMS_PER_SECOND,
+                limits::RELAY_DATAGRAMS_PER_SECOND,
+            ),
+            #[allow(clippy::cast_precision_loss)]
+            bytes: RateLimiter::capacity_per_hour(limits::RELAY_BYTES_PER_HOUR as f64),
+        }
+    }
+}
+
 struct SessionState {
     key_a: [u8; 32],
     key_b: [u8; 32],
+    /// Charged against a datagram sent by `key_a`, forwarded to `key_b`.
+    a_to_b: StdMutex<RelayLimiter>,
+    /// Charged against a datagram sent by `key_b`, forwarded to `key_a`.
+    b_to_a: StdMutex<RelayLimiter>,
 }
 
 struct ServerState {
     community: [u8; 32],
     members: StdMutex<MemberList>,
     capacity: usize,
-    registrations: StdMutex<HashMap<[u8; 32], Registration>>,
+    secondary_port: u16,
+    registrations: StdMutex<HashMap<[u8; 32], Vec<Registration>>>,
     knocks: StdMutex<HashMap<[u8; 32], KnockState>>,
     sessions: StdMutex<HashMap<u32, SessionState>>,
+    pending_handshakes: AtomicUsize,
+    /// Section 1: "4 connection attempts per key per minute", tracked
+    /// separately from [`limits::MAX_CONNECTIONS_PER_KEY`], which bounds
+    /// concurrent connections rather than the rate of new ones.
+    register_attempts: StdMutex<HashMap<[u8; 32], RateLimiter>>,
     counters: ServerCounters,
 }
 
@@ -74,6 +119,62 @@ impl ServerState {
         input.extend_from_slice(lo);
         input.extend_from_slice(hi);
         *blake3::hash(&input).as_bytes()
+    }
+}
+
+/// Removes `registration` from its key's slot and from every live session it
+/// still holds, notifying the other half of each such session so a session
+/// never outlives the registration that owns one of its two keys (Konrad
+/// finding 4: previously nothing ever removed a session, so a gone
+/// registrant's old sessions stayed forwardable, and counted against the
+/// other party's `MAX_SESSIONS_PER_REGISTRATION`, forever).
+fn teardown_registration(
+    state: &Arc<ServerState>,
+    peer_key: [u8; 32],
+    registration: &Registration,
+) {
+    {
+        let mut registrations = state.registrations.lock_or_recover();
+        if let Some(list) = registrations.get_mut(&peer_key) {
+            list.retain(|r| !Arc::ptr_eq(r, registration));
+            if list.is_empty() {
+                registrations.remove(&peer_key);
+            }
+        }
+    }
+    let session_ids: Vec<u32> = registration
+        .sessions
+        .lock_or_recover()
+        .iter()
+        .copied()
+        .collect();
+    if session_ids.is_empty() {
+        return;
+    }
+    let mut orphaned = Vec::new();
+    {
+        let mut sessions = state.sessions.lock_or_recover();
+        for id in session_ids {
+            if let Some(session_state) = sessions.remove(&id) {
+                let other_key = if session_state.key_a == peer_key {
+                    session_state.key_b
+                } else {
+                    session_state.key_a
+                };
+                orphaned.push((other_key, id));
+            }
+        }
+    }
+    if orphaned.is_empty() {
+        return;
+    }
+    let registrations = state.registrations.lock_or_recover();
+    for (other_key, id) in orphaned {
+        if let Some(list) = registrations.get(&other_key) {
+            for reg in list {
+                reg.sessions.lock_or_recover().remove(&id);
+            }
+        }
     }
 }
 
@@ -104,6 +205,11 @@ pub struct GateServerConfig {
 }
 
 const ALPN: &[u8] = b"moss-gate";
+/// How often the background sweep (expired knocks, silent-past-TTL
+/// registrations) runs. Chosen, not measured: well under
+/// [`limits::REGISTRATION_TTL`] and any reasonable `Introduce.ttl_s`, so
+/// nothing waits more than one tick past its own deadline.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 impl GateServer {
     /// Binds both endpoints and returns immediately; call [`Self::serve`] to
@@ -133,14 +239,18 @@ impl GateServer {
             community: config.community,
             members: StdMutex::new(config.members),
             capacity: config.max_registrations,
+            secondary_port: secondary_addr.port(),
             registrations: StdMutex::new(HashMap::new()),
             knocks: StdMutex::new(HashMap::new()),
             sessions: StdMutex::new(HashMap::new()),
+            pending_handshakes: AtomicUsize::new(0),
+            register_attempts: StdMutex::new(HashMap::new()),
             counters: ServerCounters::default(),
         });
 
         tokio::spawn(accept_loop_primary(primary, Arc::clone(&state)));
         tokio::spawn(accept_loop_secondary(secondary, Arc::clone(&state)));
+        tokio::spawn(sweep_loop(Arc::clone(&state)));
 
         Ok(Self {
             primary_addr,
@@ -167,11 +277,28 @@ impl GateServer {
         &self.state.counters
     }
 
-    /// The number of currently live registrations, for tests.
+    /// The number of currently live registrations (distinct keys), for
+    /// tests.
     #[must_use]
     pub fn registration_count(&self) -> usize {
-        #[allow(clippy::unwrap_used)]
-        self.state.registrations.lock().unwrap().len()
+        self.state.registrations.lock_or_recover().len()
+    }
+
+    /// The number of connections held for one key, for tests exercising the
+    /// per-key sub-cap.
+    #[must_use]
+    pub fn connections_for_key(&self, key: &[u8; 32]) -> usize {
+        self.state
+            .registrations
+            .lock_or_recover()
+            .get(key)
+            .map_or(0, Vec::len)
+    }
+
+    /// The number of currently live relay sessions, for tests.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.state.sessions.lock_or_recover().len()
     }
 
     /// Reloads the member list from `path`, without dropping any live
@@ -182,11 +309,54 @@ impl GateServer {
     /// Returns a [`GateError`] if `path` cannot be read or parsed.
     pub fn reload_members(&self, path: &std::path::Path) -> Result<(), GateError> {
         let members = MemberList::load(path)?;
-        #[allow(clippy::unwrap_used)]
-        {
-            *self.state.members.lock().unwrap() = members;
-        }
+        *self.state.members.lock_or_recover() = members;
         Ok(())
+    }
+}
+
+async fn sweep_loop(state: Arc<ServerState>) {
+    let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+    loop {
+        interval.tick().await;
+        sweep_once(&state);
+    }
+}
+
+/// One sweep pass (Konrad finding 4): drops knocks past their own `ttl_s`
+/// deadline, and closes and tears down any registration silent past
+/// [`limits::REGISTRATION_TTL`] since its last keepalive, both previously
+/// unimplemented.
+fn sweep_once(state: &Arc<ServerState>) {
+    let now = Instant::now();
+    {
+        let mut knocks = state.knocks.lock_or_recover();
+        knocks.retain(|_, k| k.deadline > now);
+    }
+    {
+        let mut attempts = state.register_attempts.lock_or_recover();
+        attempts.retain(|_, limiter| !limiter.is_full());
+    }
+    let expired: Vec<([u8; 32], Registration)> = {
+        let registrations = state.registrations.lock_or_recover();
+        registrations
+            .iter()
+            .flat_map(|(key, list)| {
+                list.iter().filter_map(move |r| {
+                    let last = *r.last_keepalive.lock_or_recover();
+                    if now.duration_since(last) > limits::REGISTRATION_TTL {
+                        Some((*key, Arc::clone(r)))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect()
+    };
+    for (key, registration) in expired {
+        registration
+            .connection
+            .close(0u32.into(), b"registration expired");
+        teardown_registration(state, key, &registration);
     }
 }
 
@@ -204,11 +374,30 @@ async fn accept_loop_secondary(endpoint: quinn::Endpoint, state: Arc<ServerState
 
 async fn handle_secondary_connection(
     incoming: quinn::Incoming,
-    _state: Arc<ServerState>,
+    state: Arc<ServerState>,
 ) -> Result<(), GateError> {
     let connection = incoming.accept()?.await?;
-    let observed = connection.remote_address();
-    let (mut send, mut recv) = connection.accept_bi().await?;
+    let authed = AuthedConnection::new(connection)?;
+    // Yseult finding 4: the secondary (reflection) endpoint never checked
+    // membership at all, so any key on the internet got a free address
+    // reflection and a five second hold. It now runs the same TLS-proven
+    // membership check the primary endpoint does before doing anything
+    // else.
+    let is_member = {
+        let members = state.members.lock_or_recover();
+        members.contains(&authed.peer_key())
+    };
+    if !is_member {
+        authed.connection().close(0u32.into(), b"not a member");
+        return Ok(());
+    }
+    let observed = authed.connection().remote_address();
+    let (mut send, mut recv) = tokio::time::timeout(
+        authed::control_read_deadline(),
+        authed.connection().accept_bi(),
+    )
+    .await
+    .map_err(|_| GateError::Timeout)??;
     let frame = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
     if !matches!(frame, Frame::Reflect { .. }) {
         return Err(GateError::Protocol(
@@ -226,7 +415,11 @@ async fn handle_secondary_connection(
     // the house if this task returns immediately. Wait for the house to
     // close its side first (it does, right after reading the reply),
     // bounded so a house that never closes cannot hang this task forever.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), connection.closed()).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        authed.connection().closed(),
+    )
+    .await;
     Ok(())
 }
 
@@ -242,6 +435,41 @@ async fn accept_loop_primary(endpoint: quinn::Endpoint, state: Arc<ServerState>)
     }
 }
 
+/// Holds one slot of [`limits::MAX_PENDING_CONNECTIONS`] for a connection
+/// that has completed the TLS handshake but not yet completed `Register`
+/// (Yseult finding 4: previously nothing bounded this population, and
+/// `accept_bi` carried no deadline, so a peer that connected and then sent
+/// nothing held a slot forever).
+struct PendingGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> PendingGuard<'a> {
+    fn acquire(counter: &'a AtomicUsize, cap: usize) -> Option<Self> {
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current >= cap {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { counter }),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn handle_primary_connection(
     incoming: quinn::Incoming,
     state: Arc<ServerState>,
@@ -251,7 +479,42 @@ async fn handle_primary_connection(
     let observed = authed.connection().remote_address();
     let peer_key = authed.peer_key();
 
-    let (mut send, mut recv) = authed.connection().accept_bi().await?;
+    let Some(pending) =
+        PendingGuard::acquire(&state.pending_handshakes, limits::MAX_PENDING_CONNECTIONS)
+    else {
+        state
+            .counters
+            .pending_connections_refused
+            .fetch_add(1, Ordering::Relaxed);
+        authed.connection().close(0u32.into(), b"gate at capacity");
+        return Ok(());
+    };
+
+    // Section 1: "4 connection attempts per key per minute".
+    let attempt_allowed = {
+        let mut attempts = state.register_attempts.lock_or_recover();
+        let limiter = attempts.entry(peer_key).or_insert_with(|| {
+            RateLimiter::per_minute(
+                limits::REGISTER_ATTEMPTS_PER_MINUTE,
+                limits::REGISTER_ATTEMPTS_PER_MINUTE,
+            )
+        });
+        limiter.try_take()
+    };
+    if !attempt_allowed {
+        authed.connection().close(0u32.into(), b"gate_rate_limited");
+        return Ok(());
+    }
+
+    // Deadline the first stream too, not just the `Register` frame that
+    // follows it: a connected peer that never opens a bi stream at all
+    // previously held its slot (and quinn's `keep_alive_interval`) forever.
+    let (mut send, mut recv) = tokio::time::timeout(
+        authed::control_read_deadline(),
+        authed.connection().accept_bi(),
+    )
+    .await
+    .map_err(|_| GateError::Timeout)??;
     let frame = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
     let Frame::Register { v: _, community } = frame else {
         return Err(GateError::Protocol(
@@ -269,8 +532,7 @@ async fn handle_primary_connection(
         return Ok(());
     }
     let is_member = {
-        #[allow(clippy::unwrap_used)]
-        let members = state.members.lock().unwrap();
+        let members = state.members.lock_or_recover();
         members.contains(&peer_key)
     };
     if !is_member {
@@ -295,21 +557,38 @@ async fn handle_primary_connection(
             limits::INTRODUCE_PER_MINUTE,
             limits::INTRODUCE_PER_MINUTE,
         )),
-        introduce_hour: StdMutex::new(RateLimiter::per_minute(
+        introduce_hour: StdMutex::new(RateLimiter::per_hour(
             limits::INTRODUCE_PER_HOUR,
             limits::INTRODUCE_PER_HOUR,
         )),
         sessions: StdMutex::new(HashSet::new()),
     });
 
-    let at_capacity = {
-        #[allow(clippy::unwrap_used)]
-        let mut registrations = state.registrations.lock().unwrap();
-        let full = !registrations.contains_key(&peer_key) && registrations.len() >= state.capacity;
-        if !full {
-            registrations.insert(peer_key, Arc::clone(&registration));
+    // Within one key, section 1 allows 2 live connections, a third evicting
+    // that key's oldest by last keepalive (Konrad finding 3 on the earlier
+    // draft: a second connection for the same key silently replaced the
+    // first in the map without closing it, leaving it orphaned rather than
+    // torn down).
+    let (evicted, at_capacity) = {
+        let mut registrations = state.registrations.lock_or_recover();
+        let is_new_key = !registrations.contains_key(&peer_key);
+        if is_new_key && registrations.len() >= state.capacity {
+            (None, true)
+        } else {
+            let list = registrations.entry(peer_key).or_default();
+            let evicted = if list.len() >= limits::MAX_CONNECTIONS_PER_KEY {
+                let oldest = list
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, r)| *r.last_keepalive.lock_or_recover())
+                    .map(|(i, _)| i);
+                oldest.map(|i| list.remove(i))
+            } else {
+                None
+            };
+            list.push(Arc::clone(&registration));
+            (evicted, false)
         }
-        full
     };
     if at_capacity {
         state
@@ -325,14 +604,25 @@ async fn handle_primary_connection(
         .await;
         return Ok(());
     }
+    if let Some(evicted) = evicted {
+        evicted
+            .connection
+            .close(0u32.into(), b"displaced: connection cap per key reached");
+        teardown_registration(&state, peer_key, &evicted);
+    }
 
     let registered = Frame::Registered {
         v: 1,
         observed: Addr::from_socket_addr(observed),
         keepalive_s: 15,
-        secondary_port: 0,
+        secondary_port: state.secondary_port,
     };
     wire::write_frame(&mut send, &registered).await?;
+
+    // This connection is registered now, not merely handshaked: free its
+    // pending-handshake slot for the next connection rather than holding it
+    // for this connection's whole lifetime.
+    drop(pending);
 
     // Writer task: serialises every frame the gate sends this house onto
     // the one control stream.
@@ -366,15 +656,7 @@ async fn handle_primary_connection(
 
     writer.abort();
     relay_task.abort();
-    {
-        #[allow(clippy::unwrap_used)]
-        let mut registrations = state.registrations.lock().unwrap();
-        if let Some(current) = registrations.get(&peer_key)
-            && Arc::ptr_eq(current, &registration)
-        {
-            registrations.remove(&peer_key);
-        }
-    }
+    teardown_registration(&state, peer_key, &registration);
     result
 }
 
@@ -391,10 +673,7 @@ async fn control_loop(
         };
         match frame {
             Frame::Keepalive { .. } => {
-                #[allow(clippy::unwrap_used)]
-                {
-                    *registration.last_keepalive.lock().unwrap() = Instant::now();
-                }
+                *registration.last_keepalive.lock_or_recover() = Instant::now();
                 let _ = registration.frame_tx.send(Frame::KeepaliveAck {
                     v: 1,
                     observed: Addr::from_socket_addr(registration.observed),
@@ -406,7 +685,7 @@ async fn control_loop(
                 handle_introduce(state, registration, tag, ttl_s, sealed);
             }
             Frame::KnockAnswer { tag, accept, .. } => {
-                handle_knock_answer(state, tag, accept);
+                handle_knock_answer(state, registration, tag, accept);
             }
             Frame::Goodbye { .. } => {
                 return Ok(());
@@ -429,10 +708,8 @@ fn handle_introduce(
 ) {
     let ttl_s = ttl_s.min(limits::INTRODUCE_TTL_CAP_S);
     {
-        #[allow(clippy::unwrap_used)]
-        let mut minute = registration.introduce_min.lock().unwrap();
-        #[allow(clippy::unwrap_used)]
-        let mut hour = registration.introduce_hour.lock().unwrap();
+        let mut minute = registration.introduce_min.lock_or_recover();
+        let mut hour = registration.introduce_hour.lock_or_recover();
         if !minute.try_take() || !hour.try_take() {
             let _ = registration.frame_tx.send(Frame::Error {
                 v: 1,
@@ -444,8 +721,7 @@ fn handle_introduce(
     }
 
     let target_key = {
-        #[allow(clippy::unwrap_used)]
-        let registrations = state.registrations.lock().unwrap();
+        let registrations = state.registrations.lock_or_recover();
         registrations
             .keys()
             .find(|candidate| {
@@ -459,17 +735,17 @@ fn handle_introduce(
         return;
     };
     let target = {
-        #[allow(clippy::unwrap_used)]
-        let registrations = state.registrations.lock().unwrap();
-        registrations.get(&target_key).cloned()
+        let registrations = state.registrations.lock_or_recover();
+        registrations
+            .get(&target_key)
+            .and_then(|list| list.last().cloned())
     };
     let Some(target) = target else {
         return;
     };
 
     {
-        #[allow(clippy::unwrap_used)]
-        let mut knocks = state.knocks.lock().unwrap();
+        let mut knocks = state.knocks.lock_or_recover();
         knocks.insert(
             tag,
             KnockState {
@@ -488,10 +764,32 @@ fn handle_introduce(
     });
 }
 
-fn handle_knock_answer(state: &Arc<ServerState>, tag: [u8; 32], accept: bool) {
+fn handle_knock_answer(
+    state: &Arc<ServerState>,
+    registration: &Registration,
+    tag: [u8; 32],
+    accept: bool,
+) {
+    // Yseult finding 2 / Konrad finding 3: a `KnockAnswer` is accepted only
+    // from the registration whose key is the knock's own target. Anything
+    // else -- including a member who can compute `tag(A, B)` for a pair
+    // it is not part of -- is dropped and counted, and critically the knock
+    // itself is left outstanding rather than consumed, so the real target
+    // can still answer it before its `ttl_s` elapses.
     let knock = {
-        #[allow(clippy::unwrap_used)]
-        let mut knocks = state.knocks.lock().unwrap();
+        let mut knocks = state.knocks.lock_or_recover();
+        let is_target = knocks
+            .get(&tag)
+            .is_some_and(|k| k.target == registration.key);
+        if !is_target {
+            if knocks.contains_key(&tag) {
+                state
+                    .counters
+                    .knock_answered_by_wrong_target
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
         knocks.remove(&tag)
     };
     let Some(knock) = knock else {
@@ -505,33 +803,27 @@ fn handle_knock_answer(state: &Arc<ServerState>, tag: [u8; 32], accept: bool) {
         return;
     }
 
-    #[allow(clippy::unwrap_used)]
-    let registrations = state.registrations.lock().unwrap();
-    let Some(requester) = registrations.get(&knock.requester) else {
+    let registrations = state.registrations.lock_or_recover();
+    let Some(requester) = registrations
+        .get(&knock.requester)
+        .and_then(|list| list.last())
+    else {
         return;
     };
-    let Some(target) = registrations.get(&knock.target) else {
+    let Some(target) = registrations
+        .get(&knock.target)
+        .and_then(|list| list.last())
+    else {
         return;
     };
-    if requester
-        .sessions
-        .lock()
-        .map(|s| s.len())
-        .unwrap_or(usize::MAX)
-        >= limits::MAX_SESSIONS_PER_REGISTRATION
-        || target
-            .sessions
-            .lock()
-            .map(|s| s.len())
-            .unwrap_or(usize::MAX)
-            >= limits::MAX_SESSIONS_PER_REGISTRATION
+    if requester.sessions.lock_or_recover().len() >= limits::MAX_SESSIONS_PER_REGISTRATION
+        || target.sessions.lock_or_recover().len() >= limits::MAX_SESSIONS_PER_REGISTRATION
     {
         return;
     }
 
     let mut session_id: u32 = rand::rng().random();
-    #[allow(clippy::unwrap_used)]
-    let mut sessions = state.sessions.lock().unwrap();
+    let mut sessions = state.sessions.lock_or_recover();
     while sessions.contains_key(&session_id) {
         session_id = rand::rng().random();
     }
@@ -540,15 +832,14 @@ fn handle_knock_answer(state: &Arc<ServerState>, tag: [u8; 32], accept: bool) {
         SessionState {
             key_a: knock.requester,
             key_b: knock.target,
+            a_to_b: StdMutex::new(RelayLimiter::new()),
+            b_to_a: StdMutex::new(RelayLimiter::new()),
         },
     );
     drop(sessions);
 
-    #[allow(clippy::unwrap_used)]
-    {
-        requester.sessions.lock().unwrap().insert(session_id);
-        target.sessions.lock().unwrap().insert(session_id);
-    }
+    requester.sessions.lock_or_recover().insert(session_id);
+    target.sessions.lock_or_recover().insert(session_id);
 
     let _ = requester.frame_tx.send(Frame::Introduction {
         v: 1,
@@ -567,9 +858,10 @@ fn handle_knock_answer(state: &Arc<ServerState>, tag: [u8; 32], accept: bool) {
 }
 
 fn forward_relay(state: &Arc<ServerState>, session: u32, sender_key: [u8; 32], payload: &[u8]) {
+    #[allow(clippy::cast_precision_loss)]
+    let payload_len = payload.len() as f64;
     let other_key = {
-        #[allow(clippy::unwrap_used)]
-        let sessions = state.sessions.lock().unwrap();
+        let sessions = state.sessions.lock_or_recover();
         let Some(session_state) = sessions.get(&session) else {
             state
                 .counters
@@ -577,25 +869,33 @@ fn forward_relay(state: &Arc<ServerState>, session: u32, sender_key: [u8; 32], p
                 .fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if session_state.key_a == sender_key {
-            Some(session_state.key_b)
+        let (other_key, limiter) = if session_state.key_a == sender_key {
+            (session_state.key_b, &session_state.a_to_b)
         } else if session_state.key_b == sender_key {
-            Some(session_state.key_a)
+            (session_state.key_a, &session_state.b_to_a)
         } else {
-            None
-        }
+            state
+                .counters
+                .relay_sender_mismatch
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let mut limiter = limiter.lock_or_recover();
+        let allowed = limiter.datagrams.try_take() && limiter.bytes.try_take_n(payload_len);
+        if allowed { Some(other_key) } else { None }
     };
     let Some(other_key) = other_key else {
         state
             .counters
-            .relay_sender_mismatch
+            .relay_rate_limited
             .fetch_add(1, Ordering::Relaxed);
         return;
     };
     let other = {
-        #[allow(clippy::unwrap_used)]
-        let registrations = state.registrations.lock().unwrap();
-        registrations.get(&other_key).cloned()
+        let registrations = state.registrations.lock_or_recover();
+        registrations
+            .get(&other_key)
+            .and_then(|list| list.last().cloned())
     };
     let Some(other) = other else {
         return;

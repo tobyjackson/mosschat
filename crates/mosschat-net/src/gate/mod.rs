@@ -9,10 +9,21 @@
 //!
 //! Design gap (recorded per the work order, not redesigned): the design
 //! does not say whether the seen-set eviction sweep and the 4096-entry cap
-//! apply per registration or gate-wide; issue #16 already flags that the
-//! set must be sized off *accepted* seals, not merely opened ones, so this
-//! implementation takes the smaller, safer reading: one seen set per
-//! registration, capped at 4096 entries each, insert only on acceptance.
+//! apply per registration or gate-wide; this implementation takes the
+//! smaller, safer reading: one seen set per registration, capped at 4096
+//! entries each.
+//!
+//! **Corrected reading (issue #16, amending the WO-1.3a review's earlier
+//! "insert only on acceptance" note).** Section 1 says the seen set holds
+//! "`BLAKE3(sealed)` ... for every seal it opens", not only for those it
+//! goes on to accept as a friend or invite. The set is inserted into once a
+//! sealed body has decrypted and passed its freshness and pair-tag checks
+//! (that is what "opens" means here), and never before: a body that fails
+//! to decrypt, or fails freshness or the tag check, never occupied a slot
+//! in the first place, so recording it would let an attacker fill the set
+//! with garbage nobody ever opened. Whether the opened body then turns out
+//! to name a friend, an invite or neither is irrelevant to the seen set:
+//! that later accept/decline decision must not gate the insert.
 
 pub mod client;
 pub mod server;
@@ -130,6 +141,24 @@ pub mod limits {
     pub const SEEN_SET_CAP: usize = 4096;
     /// A frame that should follow immediately.
     pub const CONTROL_READ_DEADLINE: Duration = Duration::from_secs(10);
+    /// A cap on connections that have completed the TLS handshake but not
+    /// yet completed `Register`, guarding the `accept_bi` plus `Register`
+    /// read window (each individually deadlined) against an attacker who
+    /// opens many connections and then sends nothing at all. Chosen, not
+    /// measured: twice the registration cap, generous headroom for a
+    /// legitimate community's reconnect storms without leaving the window
+    /// unbounded.
+    pub const MAX_PENDING_CONNECTIONS: usize = 2 * MAX_REGISTRATIONS;
+    /// The gate-wide bound on the porch socket's inbound relay queue
+    /// (`sock.rs`), guarding against a session peer that sends faster than
+    /// this house's endpoint drains it. Chosen, not measured: large enough
+    /// to absorb a burst well past `RELAY_DATAGRAMS_PER_SECOND` for one
+    /// tick of scheduling, small enough that the worst case (every entry at
+    /// the 1200 byte relay cap) is a bounded ~1.2 MiB. The drop policy is
+    /// stated where it is enforced: oldest first, since a stale queued
+    /// packet is worth less than a fresh one under QUIC's own loss
+    /// recovery.
+    pub const INBOUND_RELAY_QUEUE_CAP: usize = 1024;
 }
 
 /// The gate's member list: ed25519 public keys read from a file, one 64
@@ -235,15 +264,63 @@ impl RateLimiter {
         }
     }
 
+    /// Builds a limiter with the given burst capacity and steady refill
+    /// rate over one hour (section 1's `INTRODUCE_PER_HOUR`, previously
+    /// wired through [`Self::per_minute`] by mistake, which refilled 60x too
+    /// fast and never let the hourly cap bind).
+    #[must_use]
+    pub fn per_hour(burst: u32, per_hour: u32) -> Self {
+        Self {
+            capacity: f64::from(burst),
+            tokens: f64::from(burst),
+            refill_per_s: f64::from(per_hour) / 3600.0,
+            last: Instant::now(),
+        }
+    }
+
+    /// Builds a limiter with the given burst capacity and steady refill
+    /// rate over one second (section 1's per-session `Relay` datagram
+    /// rate).
+    #[must_use]
+    pub fn per_second(burst: u32, per_second: u32) -> Self {
+        Self {
+            capacity: f64::from(burst),
+            tokens: f64::from(burst),
+            refill_per_s: f64::from(per_second),
+            last: Instant::now(),
+        }
+    }
+
+    /// Builds a limiter directly from a float capacity and a full-hour
+    /// refill rate, for a budget too large to express safely as `u32`
+    /// (section 1's per-session `RELAY_BYTES_PER_HOUR`, a `u64`).
+    #[must_use]
+    pub fn capacity_per_hour(capacity: f64) -> Self {
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_per_s: capacity / 3600.0,
+            last: Instant::now(),
+        }
+    }
+
     /// Attempts to consume one token, refilling first for elapsed time.
     /// Returns whether a token was available.
     pub fn try_take(&mut self) -> bool {
+        self.try_take_n(1.0)
+    }
+
+    /// Attempts to consume `amount` tokens (fractional units are how a byte
+    /// budget, such as section 1's `RELAY_BYTES_PER_HOUR`, is expressed as a
+    /// token bucket), refilling first for elapsed time. Returns whether
+    /// `amount` was available.
+    pub fn try_take_n(&mut self, amount: f64) -> bool {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last).as_secs_f64();
         self.last = now;
         self.tokens = (self.tokens + elapsed * self.refill_per_s).min(self.capacity);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= amount {
+            self.tokens -= amount;
             true
         } else {
             false
@@ -305,6 +382,17 @@ impl SeenSet {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+impl RateLimiter {
+    /// Whether this limiter is currently at full capacity (as of its last
+    /// `try_take*` call): a cheap, approximate signal a periodic sweep can
+    /// use to prune per-key limiter maps back down, since a limiter sitting
+    /// at capacity carries no state worth keeping.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.tokens >= self.capacity
     }
 }
 

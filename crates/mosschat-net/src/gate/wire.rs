@@ -547,6 +547,67 @@ mod tests {
         assert!(encode_relay(1, &payload).is_err());
     }
 
+    // ------------------------------------------------------------------
+    // Malformed input (Yseult finding 10: no malformed-frame test existed
+    // for `read_frame`'s length cap, `decode_relay`, `Addr::from_raw` or
+    // `seal::decode_body`; this file covers the ones it owns).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn decode_relay_rejects_a_datagram_shorter_than_the_header() {
+        for len in 0..5 {
+            let short = vec![RELAY_DISCRIMINATOR; len];
+            assert!(decode_relay(&short).is_err());
+        }
+    }
+
+    #[test]
+    fn decode_relay_rejects_the_wrong_discriminator() {
+        let mut datagram = vec![0xFFu8, 0, 0, 0, 1];
+        datagram.extend_from_slice(b"payload");
+        assert!(decode_relay(&datagram).is_err());
+    }
+
+    #[test]
+    fn decode_relay_rejects_a_payload_over_the_cap() {
+        let mut datagram = vec![RELAY_DISCRIMINATOR, 0, 0, 0, 1];
+        datagram.extend(std::iter::repeat_n(0u8, RELAY_PAYLOAD_CAP + 1));
+        assert!(decode_relay(&datagram).is_err());
+    }
+
+    #[test]
+    fn addr_decode_rejects_a_byte_string_of_the_wrong_length() {
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        // A hand-built `Reflected` frame whose `Addr` byte string is 18
+        // bytes, not the fixed 19 `Addr::from_raw` requires.
+        enc.array(3).unwrap();
+        enc.u8(T_REFLECTED).unwrap();
+        enc.u8(1).unwrap();
+        enc.bytes(&[0u8; 18]).unwrap();
+        assert!(Frame::from_cbor(&buf).is_err());
+    }
+
+    #[test]
+    fn frame_from_cbor_never_panics_on_arbitrary_bytes() {
+        // A cheap fuzz smoke test, not a claim of coverage: arbitrary,
+        // attacker-shaped byte strings (empty, truncated CBOR headers,
+        // random lengths) must always return `Err`, never panic -- every
+        // decode here is length-checked before indexing (invariant 4).
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_byte = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        };
+        for len in 0..64 {
+            let bytes: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+            let _ = Frame::from_cbor(&bytes);
+            let _ = decode_relay(&bytes);
+        }
+    }
+
     #[test]
     fn oversized_sealed_body_is_rejected_at_decode() {
         let frame = Frame::Introduce {

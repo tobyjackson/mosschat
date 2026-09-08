@@ -8,6 +8,7 @@
 
 pub mod authed;
 pub mod gate;
+pub(crate) mod lockext;
 pub mod path;
 pub mod sock;
 

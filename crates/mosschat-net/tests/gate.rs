@@ -66,6 +66,7 @@ mod gate {
             gate.primary_addr(),
             identity_seed,
             community,
+            None,
             friends,
             invites,
         )
@@ -180,19 +181,23 @@ mod gate {
         // endpoint-wide config either side's `GateClient` already set up
         // for its own gate registration.
         fn peer_transport_config() -> Arc<quinn::TransportConfig> {
-            let mut transport = quinn::TransportConfig::default();
-            transport.mtu_discovery_config(None);
-            transport.initial_mtu(1200);
-            transport.min_mtu(1200);
+            // The MTU cap and the epoch-resetting congestion factory are
+            // library code now (`mosschat_net::path::peer_transport_config`,
+            // Konrad finding 9), not reconstructed here; this wrapper only
+            // adds the test harness's own idle-timeout headroom on top of
+            // the freshly built (so uniquely owned) `Arc`.
+            let mut transport = mosschat_net::path::peer_transport_config(Arc::new(
+                std::sync::atomic::AtomicU64::new(0),
+            ));
+            let mutable = Arc::get_mut(&mut transport).unwrap();
             // The default 30s idle timeout is section 4's real policy value
             // for a live path; this test relays 10 MiB through a userspace
             // socket shim under `cargo test`'s own CPU contention with
             // every other test in this file, which is legitimately slower
             // than that policy assumes. 120s here is headroom for the test
             // harness, not a claim about production timing.
-            #[allow(clippy::unwrap_used)]
-            transport.max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
-            Arc::new(transport)
+            mutable.max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
+            transport
         }
 
         let (cert, key) = authed::self_signed_cert(&alice_seed).unwrap();
@@ -815,5 +820,270 @@ mod gate {
         .unwrap();
         let observed: Addr = client.reflect(server.secondary_addr()).await.unwrap();
         assert!(observed.to_socket_addr().is_some());
+    }
+
+    /// The secondary port is a real, reachable port the gate itself chose
+    /// (`GateServer::secondary_addr`, never 0), and `Registered.secondary_port`
+    /// names that exact port rather than the previously hardcoded 0.
+    #[tokio::test]
+    async fn registered_names_the_real_reachable_secondary_port() {
+        let community = random_seed();
+        let seed = random_seed();
+        let server = start_gate(&[public_key_of(&seed)], community, 256);
+
+        // The gate chose a real port for the secondary endpoint (config
+        // binds port 0, meaning "any"; `GateServer::bind` resolves that to
+        // whatever the OS actually assigned).
+        assert_ne!(server.secondary_addr().port(), 0);
+
+        // The port `Registered.secondary_port` names (checked indirectly:
+        // `GateClient::reflect` dials `server.secondary_addr()`, the same
+        // value the gate put in that field) is reachable end to end.
+        let member = connect_client(
+            &server,
+            seed,
+            community,
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await
+        .unwrap();
+        let observed = member.reflect(server.secondary_addr()).await.unwrap();
+        assert!(observed.to_socket_addr().is_some());
+    }
+
+    /// The secondary (reflection) port checks membership too: a non-member
+    /// gets nothing back rather than a free address reflection.
+    ///
+    /// Deliberate break to fail this test: in
+    /// `server.rs::handle_secondary_connection`, remove the membership
+    /// check block. The stranger's `reflect` call below then succeeds
+    /// instead of failing.
+    #[tokio::test]
+    async fn secondary_port_refuses_a_non_member() {
+        let community = random_seed();
+        let member_seed = random_seed();
+        let stranger_seed = random_seed();
+        let server = start_gate(&[public_key_of(&member_seed)], community, 256);
+
+        authed::install_crypto_provider();
+        let (cert, key) = authed::self_signed_cert(&stranger_seed).unwrap();
+        let tls = authed::client_tls_config(cert, key, b"moss-gate").unwrap();
+        let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        let client_config = quinn::ClientConfig::new(Arc::new(quic_client));
+        let mut endpoint = quinn::Endpoint::client(LOCALHOST_ANY).unwrap();
+        endpoint.set_default_client_config(client_config);
+        let connection = endpoint
+            .connect(server.secondary_addr(), "gate")
+            .unwrap()
+            .await
+            .unwrap();
+
+        // A non-member's connection to the secondary port is closed rather
+        // than served: either `open_bi` never completes, or a subsequent
+        // `Reflect`/read fails. Bound the whole exchange so a hang is a
+        // clear failure rather than a stuck test.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut send, mut recv) = connection.open_bi().await?;
+            wire::write_frame(&mut send, &Frame::Reflect { v: 1 }).await?;
+            wire::read_frame(&mut recv, Duration::from_secs(4)).await
+        })
+        .await;
+        assert!(
+            matches!(outcome, Ok(Err(_)) | Err(_)),
+            "a non-member should never receive a Reflected reply"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Gate key pinning (Yseult finding 8)
+    // ------------------------------------------------------------------
+
+    /// `GateClient::connect` refuses to complete against a gate whose
+    /// TLS-proven key does not match a pinned expectation, and succeeds
+    /// when it does.
+    #[tokio::test]
+    async fn connect_pins_the_gates_tls_proven_key() {
+        let community = random_seed();
+        let member_seed = random_seed();
+        let server = start_gate(&[public_key_of(&member_seed)], community, 256);
+
+        // Learn the gate's real key the same way a first connection would
+        // (trust on first use), then reconnect pinned against a wrong key.
+        let first = GateClient::connect(
+            server.primary_addr(),
+            member_seed,
+            community,
+            None,
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await
+        .unwrap();
+        let real_gate_key = first.gate_key();
+        drop(first);
+
+        let wrong_key = public_key_of(&random_seed());
+        let refused = GateClient::connect(
+            server.primary_addr(),
+            member_seed,
+            community,
+            Some(wrong_key),
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await;
+        assert!(refused.is_err());
+
+        let pinned = GateClient::connect(
+            server.primary_addr(),
+            member_seed,
+            community,
+            Some(real_gate_key),
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await;
+        assert!(pinned.is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // KnockAnswer accepted only from the knock's own target
+    // ------------------------------------------------------------------
+
+    /// A third member answering another house's knock changes nothing: the
+    /// forged `KnockAnswer` is dropped and counted, the knock is left
+    /// outstanding, and the real target can still answer it normally.
+    ///
+    /// Deliberate break to fail this test: in
+    /// `server.rs::handle_knock_answer`, remove the `k.target ==
+    /// registration.key` check (accept from any registration). Eve's forged
+    /// answer then creates a session by itself, `session_count()` becomes 1
+    /// before Bob ever answers, and the wrong-target counter stays at 0.
+    #[tokio::test]
+    async fn a_third_member_answering_another_houses_knock_changes_nothing() {
+        let community = random_seed();
+        let alice_seed = random_seed();
+        let bob_seed = random_seed();
+        let eve_seed = random_seed();
+        let alice_key = public_key_of(&alice_seed);
+        let bob_key = public_key_of(&bob_seed);
+        let members = [alice_key, bob_key, public_key_of(&eve_seed)];
+        let server = start_gate(&members, community, 256);
+
+        let alice = connect_client(
+            &server,
+            alice_seed,
+            community,
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await
+        .unwrap();
+
+        let mut bob = raw_register(server.primary_addr(), bob_seed, community)
+            .await
+            .unwrap();
+        let mut eve = raw_register(server.primary_addr(), eve_seed, community)
+            .await
+            .unwrap();
+
+        let ttl_s = 5;
+        let asker = tokio::spawn(async move { alice.introduce(bob_key, ttl_s, None).await });
+
+        let knock = wire::read_frame(&mut bob.recv, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let Frame::Knock { tag, .. } = knock else {
+            panic!("expected a Knock, got {knock:?}");
+        };
+
+        // Eve computes the same tag (public knowledge to anyone who knows
+        // both keys, per section 1) and forges an acceptance of a knock
+        // addressed to Bob, not to her.
+        let forged_tag = mosschat_net::gate::client::pair_tag(&community, &alice_key, &bob_key);
+        assert_eq!(forged_tag, tag);
+        wire::write_frame(
+            &mut eve.send,
+            &Frame::KnockAnswer {
+                v: 1,
+                tag,
+                accept: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(server.session_count(), 0);
+        assert_eq!(
+            server
+                .counters()
+                .knock_answered_by_wrong_target
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // The knock was left outstanding, not consumed by Eve's forgery:
+        // Bob, the real target, can still answer it and the asker still
+        // gets introduced.
+        wire::write_frame(
+            &mut bob.send,
+            &Frame::KnockAnswer {
+                v: 1,
+                tag,
+                accept: true,
+            },
+        )
+        .await
+        .unwrap();
+        let outcome = asker.await.unwrap().unwrap();
+        assert_eq!(outcome.role, 1);
+        assert_eq!(server.session_count(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Signature verification against the TLS-proven key
+    // ------------------------------------------------------------------
+
+    /// The section 5 case Konrad's finding 7 flagged as unverified: a
+    /// signature is checked against the key TLS actually proved for the
+    /// peer (here, the gate's own `AuthedConnection::peer_key`, exposed as
+    /// `GateClient::gate_key`), not a value taken from any frame, and a
+    /// signature made by a different key over the exact same bytes fails
+    /// against it.
+    #[tokio::test]
+    async fn signature_verifies_against_the_tls_proven_key_not_a_different_one() {
+        let community = random_seed();
+        let member_seed = random_seed();
+        let server = start_gate(&[public_key_of(&member_seed)], community, 256);
+        let client = connect_client(
+            &server,
+            member_seed,
+            community,
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await
+        .unwrap();
+
+        // `gate_key()` is `AuthedConnection::peer_key()`, derived from the
+        // certificate the gate actually presented in the TLS handshake,
+        // never a value read out of a frame.
+        let tls_proven_gate_key = client.gate_key();
+
+        let msg = b"bound to whichever key actually signed the TLS handshake";
+        let different_key = mosschat_core::identity::AuthorKey::from_bytes(&random_seed());
+        let signature_by_a_different_key =
+            mosschat_core::identity::Signer::sign(&different_key, msg);
+
+        assert!(
+            mosschat_net::gate::client::verify_signature(
+                &tls_proven_gate_key,
+                msg,
+                &signature_by_a_different_key,
+            )
+            .is_err()
+        );
     }
 }

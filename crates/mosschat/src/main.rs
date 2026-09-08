@@ -40,6 +40,8 @@ impl GatehouseArgs {
         let mut primary_bind = None;
         let mut secondary_bind = None;
         let mut identity_seed = None;
+        let mut identity_arg_given = false;
+        let mut identity_file_given = false;
         let mut it = args;
         while let Some(flag) = it.next() {
             let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -60,9 +62,28 @@ impl GatehouseArgs {
                             .map_err(|_| "bad --secondary-bind address".to_string())?,
                     );
                 }
-                "--identity" => identity_seed = Some(decode_hex32(&value()?)?),
+                // Yseult finding 9: a `--identity <hex>` value is visible to
+                // any local user via `ps`. `--identity-file` is the
+                // preferred form: the seed never touches argv, only a file
+                // this process reads once. `--identity` stays for scripts
+                // and tests that already depend on it; a real deployment
+                // should prefer the file form.
+                "--identity" => {
+                    identity_arg_given = true;
+                    identity_seed = Some(decode_hex32(&value()?)?);
+                }
+                "--identity-file" => {
+                    identity_file_given = true;
+                    let path = value()?;
+                    let contents = std::fs::read_to_string(&path)
+                        .map_err(|e| format!("reading --identity-file {path:?}: {e}"))?;
+                    identity_seed = Some(decode_hex32(contents.trim())?);
+                }
                 other => return Err(format!("unknown flag {other}")),
             }
+        }
+        if identity_arg_given && identity_file_given {
+            return Err("--identity and --identity-file are mutually exclusive".into());
         }
         Ok(Self {
             community: community.ok_or("--community <64 hex chars> is required")?,
@@ -122,11 +143,11 @@ async fn serve_gatehouse(args: GatehouseArgs) -> Result<(), Box<dyn std::error::
     };
     let server = mosschat_net::gate::server::GateServer::bind(config)?;
 
-    println!(
-        "mosschat gatehouse: community={} identity={}",
-        hex(&args.community),
-        hex(&mosschat_core::identity::AuthorKey::from_bytes(&identity_seed).public_bytes())
-    );
+    // Section 1: "Its stdout carries counts and error codes, never a key,
+    // an address or a payload byte." The community id is a shared,
+    // non-secret configuration value (every member already holds it), but
+    // the gate's own identity key is not printed here.
+    println!("mosschat gatehouse: community={}", hex(&args.community));
     println!(
         "mosschat gatehouse: primary={} secondary={}",
         server.primary_addr(),

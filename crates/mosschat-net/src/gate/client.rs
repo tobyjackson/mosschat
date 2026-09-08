@@ -23,6 +23,7 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use crate::authed::{self, AuthedConnection};
 use crate::gate::wire::{self, Addr, Frame};
 use crate::gate::{GateError, SeenSet, now_ms, within_freshness_window};
+use crate::lockext::LockExt;
 use crate::sock::{self, PorchSocket};
 
 const ALPN: &[u8] = b"moss-gate";
@@ -48,15 +49,13 @@ impl InMemoryFriendStore {
 
     /// Adds `key` as a friend.
     pub fn add(&self, key: [u8; 32]) {
-        #[allow(clippy::unwrap_used)]
-        self.0.lock().unwrap().insert(key);
+        self.0.lock_or_recover().insert(key);
     }
 }
 
 impl FriendStore for InMemoryFriendStore {
     fn is_friend(&self, key: &[u8; 32]) -> bool {
-        #[allow(clippy::unwrap_used)]
-        self.0.lock().unwrap().contains(key)
+        self.0.lock_or_recover().contains(key)
     }
 }
 
@@ -98,8 +97,7 @@ impl InMemoryInviteStore {
     /// Issues an invite for `secret`, expiring at `expires_ms`.
     pub fn issue(&self, secret: &[u8; 32], expires_ms: u64) {
         let hash = *blake3::hash(secret).as_bytes();
-        #[allow(clippy::unwrap_used)]
-        self.0.lock().unwrap().insert(
+        self.0.lock_or_recover().insert(
             hash,
             InviteRecord {
                 expires_ms,
@@ -134,8 +132,7 @@ impl InviteStore for InMemoryInviteStore {
             return false;
         }
         let hash = *blake3::hash(secret).as_bytes();
-        #[allow(clippy::unwrap_used)]
-        let mut invites = self.0.lock().unwrap();
+        let mut invites = self.0.lock_or_recover();
         let Some(record) = invites.get_mut(&hash) else {
             return false;
         };
@@ -368,14 +365,24 @@ impl GateClient {
     /// Connects to the gate at `primary_addr`, registers for `community`,
     /// and starts the background reader that answers incoming `Knock`s.
     ///
+    /// `expected_gate_key`, if given, pins the gate: the TLS-proven key the
+    /// handshake actually produces must equal it, or the connection is
+    /// refused before `Register` is ever sent (Yseult finding 8: previously
+    /// `connect` took no expected key at all and never checked
+    /// `peer_key()`, though `authed.rs`'s own doc says the caller does).
+    /// `None` is trust-on-first-connect, for a caller (a fresh gate join)
+    /// that has no key to pin against yet.
+    ///
     /// # Errors
     ///
     /// Returns a [`GateError`] if the socket cannot be bound, the TLS
-    /// handshake fails, or the gate refuses the registration.
+    /// handshake fails, the connected gate's key does not match
+    /// `expected_gate_key`, or the gate refuses the registration.
     pub async fn connect(
         primary_addr: std::net::SocketAddr,
         identity_seed: [u8; 32],
         community: [u8; 32],
+        expected_gate_key: Option<[u8; 32]>,
         friends: Arc<dyn FriendStore>,
         invites: Arc<dyn InviteStore>,
     ) -> Result<Self, GateError> {
@@ -418,6 +425,16 @@ impl GateClient {
         let connecting = endpoint.connect(primary_addr, "gate")?;
         let connection = connecting.await?;
         let authed_conn = AuthedConnection::new(connection)?;
+        if let Some(expected) = expected_gate_key
+            && authed_conn.peer_key() != expected
+        {
+            authed_conn
+                .connection()
+                .close(0u32.into(), b"gate key does not match the pinned key");
+            return Err(GateError::InvalidIdentity(
+                "connected gate's TLS-proven key does not match the pinned expected key".into(),
+            ));
+        }
         porch.attach_gate(authed_conn.connection().clone());
 
         let (mut send, mut recv) = authed_conn.connection().open_bi().await?;
@@ -586,8 +603,7 @@ impl GateClient {
 
         let (tx, rx) = oneshot::channel();
         {
-            #[allow(clippy::unwrap_used)]
-            self.inner.introductions.lock().unwrap().insert(tag, tx);
+            self.inner.introductions.lock_or_recover().insert(tag, tx);
         }
 
         {
@@ -612,8 +628,7 @@ impl GateClient {
                 Ok(outcome)
             }
             _ => {
-                #[allow(clippy::unwrap_used)]
-                self.inner.introductions.lock().unwrap().remove(&tag);
+                self.inner.introductions.lock_or_recover().remove(&tag);
                 Err(GateError::Protocol("introduce_timeout".into()))
             }
         }
@@ -647,10 +662,7 @@ async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
                 role,
                 ..
             } => {
-                let sender = {
-                    #[allow(clippy::unwrap_used)]
-                    inner.introductions.lock().unwrap().remove(&tag)
-                };
+                let sender = { inner.introductions.lock_or_recover().remove(&tag) };
                 if let Some(sender) = sender {
                     // The asker: `introduce` itself registers the relay
                     // route once the outcome reaches it, since it already
@@ -664,10 +676,7 @@ async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
                     // The responder: recover the peer key this `tag`'s
                     // accepted `Knock` came from, and register the relay
                     // route ourselves, since `Introduction` carries no key.
-                    let peer_key = {
-                        #[allow(clippy::unwrap_used)]
-                        inner.pending_accepts.lock().unwrap().remove(&tag)
-                    };
+                    let peer_key = { inner.pending_accepts.lock_or_recover().remove(&tag) };
                     if let Some(peer_key) = peer_key {
                         inner.porch.register_relay_session(
                             session,
@@ -691,14 +700,15 @@ async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
 }
 
 async fn answer_knock(inner: &Arc<Inner>, tag: [u8; 32], sealed: Vec<u8>) {
-    let fresh = {
-        #[allow(clippy::unwrap_used)]
-        let mut seen = inner.seen.lock().unwrap();
-        seen.accept(&sealed)
-    };
-    if !fresh {
-        return;
-    }
+    // Corrected reading of issue #16 (`gate/mod.rs`'s module doc): the seen
+    // set is charged only once a sealed body has opened *and* verified --
+    // decrypted, within its freshness window, and its pair tag matches --
+    // never before. Charging it on every `Knock` delivered (the previous
+    // order here) let anyone able to deliver a knock, opening or not, fill
+    // a target's seen set on its behalf; charging it only once the friend
+    // or invite decision is also made would instead let a captured, still
+    // fresh seal replay against the exact same acceptance decision inside
+    // the window, which section 1 says the set must prevent.
     let Ok(body) = seal::open(&sealed, &inner.signing_key) else {
         return;
     };
@@ -711,6 +721,14 @@ async fn answer_knock(inner: &Arc<Inner>, tag: [u8; 32], sealed: Vec<u8>) {
         &inner.identity_key.public_bytes(),
     ) != tag
     {
+        return;
+    }
+
+    let fresh = {
+        let mut seen = inner.seen.lock_or_recover();
+        seen.accept(&sealed)
+    };
+    if !fresh {
         return;
     }
 
@@ -734,8 +752,10 @@ async fn answer_knock(inner: &Arc<Inner>, tag: [u8; 32], sealed: Vec<u8>) {
     }
 
     {
-        #[allow(clippy::unwrap_used)]
-        inner.pending_accepts.lock().unwrap().insert(tag, body.from);
+        inner
+            .pending_accepts
+            .lock_or_recover()
+            .insert(tag, body.from);
     }
 
     let mut send = inner.control_send.lock().await;
@@ -815,6 +835,18 @@ mod tests {
         let opened_invite = opened.invite.unwrap();
         assert_eq!(opened_invite.secret, invite.secret);
         assert_eq!(opened_invite.bind, invite.bind);
+    }
+
+    /// Yseult finding 10: `seal::decode_body` (reached only after a
+    /// successful decrypt) had no malformed-input test either. A sealed
+    /// body shorter than the fixed ephemeral-key-plus-tag minimum must be
+    /// rejected before any decryption is attempted.
+    #[test]
+    fn seal_open_rejects_a_body_shorter_than_the_minimum() {
+        let recipient_signing = RawSigningKey::from_bytes(&[15u8; 32]);
+        for len in 0..(32 + 16) {
+            assert!(seal::open(&vec![0u8; len], &recipient_signing).is_err());
+        }
     }
 
     #[test]

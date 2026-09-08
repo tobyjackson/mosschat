@@ -25,7 +25,6 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -55,6 +54,18 @@ fn extract_ed25519_public_key(cert_der: &[u8]) -> Option<[u8; 32]> {
     <[u8; 32]>::try_from(spki.subject_public_key.data.as_ref()).ok()
 }
 
+/// Verifies `sig` over `msg` under `public`, delegating to
+/// `mosschat_core::identity::verify`: the one ed25519 verification path in
+/// this crate, `verify_strict` under the hood, so the two checks the TLS
+/// binding makes (a certificate's self-signature, and a handshake
+/// signature) reject the same low-order keys and signatures WO-1.2 already
+/// closed on the identity path, rather than a second, weaker copy that used
+/// `ed25519-dalek`'s plain `verify` (Yseult finding 1).
+fn verify_ed25519(public: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> Result<(), TlsError> {
+    mosschat_core::identity::verify(public, msg, sig)
+        .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadSignature))
+}
+
 /// Checks that `cert_der` is exactly one self-signed certificate: issuer
 /// equals subject, and the certificate's own signature verifies under its
 /// own SPKI key (issue #14: today intermediates were ignored rather than
@@ -72,18 +83,13 @@ fn verify_self_signed(cert_der: &[u8]) -> Result<[u8; 32], TlsError> {
     let public_bytes = extract_ed25519_public_key(cert_der).ok_or(TlsError::InvalidCertificate(
         rustls::CertificateError::BadEncoding,
     ))?;
-    let verifying_key = VerifyingKey::from_bytes(&public_bytes)
-        .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
     let sig_bytes: [u8; 64] = cert
         .signature_value
         .data
         .as_ref()
         .try_into()
         .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadSignature))?;
-    let signature = Signature::from_bytes(&sig_bytes);
-    verifying_key
-        .verify(cert.tbs_certificate.as_ref(), &signature)
-        .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadSignature))?;
+    verify_ed25519(&public_bytes, cert.tbs_certificate.as_ref(), &sig_bytes)?;
     Ok(public_bytes)
 }
 
@@ -100,16 +106,11 @@ fn verify_signature(
     let public_bytes = extract_ed25519_public_key(cert).ok_or(TlsError::InvalidCertificate(
         rustls::CertificateError::BadEncoding,
     ))?;
-    let verifying_key = VerifyingKey::from_bytes(&public_bytes)
-        .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
     let sig_bytes: [u8; 64] = dss
         .signature()
         .try_into()
         .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
-    let signature = Signature::from_bytes(&sig_bytes);
-    verifying_key
-        .verify(message, &signature)
-        .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadSignature))?;
+    verify_ed25519(&public_bytes, message, &sig_bytes)?;
     Ok(HandshakeSignatureValid::assertion())
 }
 
@@ -374,5 +375,23 @@ mod tests {
         let key = mosschat_core::identity::AuthorKey::from_bytes(&seed);
         assert_eq!(extracted, key.public_bytes());
         verify_self_signed(&cert).unwrap();
+    }
+
+    /// Yseult finding 1 / WO-1.2's low-order key: the identity binding's
+    /// shared verification helper (`verify_self_signed` and
+    /// `verify_signature` both call it) must reject the same low-order
+    /// public key and low-order signature `mosschat_core::identity::verify`
+    /// rejects, since it is now the one path both go through. Before this
+    /// fix, `authed.rs` called `ed25519-dalek`'s plain `verify`, which
+    /// "verifies" this pair against any message with no private key
+    /// involved (`VerifyingKey::verify_strict`'s doc, `is_small_order`).
+    #[test]
+    fn low_order_key_and_signature_are_rejected_on_the_authed_verification_path() {
+        let mut public = [0u8; 32];
+        public[0] = 0x01;
+        let mut sig = [0u8; 64];
+        sig[0] = 0x01;
+        let msg = b"an arbitrary message the authed path never signed";
+        assert!(verify_ed25519(&public, msg, &sig).is_err());
     }
 }

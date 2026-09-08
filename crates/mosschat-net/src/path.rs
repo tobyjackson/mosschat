@@ -20,6 +20,27 @@ use std::time::Instant as ProtoInstant;
 
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics, CubicConfig};
 
+/// Builds the `TransportConfig` every peer (house to house) connection must
+/// use (section 3): MTU discovery disabled and pinned at QUIC's 1200 byte
+/// floor, since the relay path's payload cap is 1200 bytes and an
+/// undiscovered direct path silently negotiating a larger one would fall
+/// back to `relay_stream_fallback` on every switch; and the
+/// epoch-resetting congestion controller factory installed from the start,
+/// sharing `epoch` with that peer's [`PathEntry`], so a future path switch
+/// (WO-1.3b) restarts slow start rather than carrying stale window state
+/// across paths that share nothing. Previously this lived only in the test
+/// file's own `peer_transport_config`, so nothing outside a test ever
+/// actually shipped it (Konrad finding 9).
+#[must_use]
+pub fn peer_transport_config(epoch: Arc<AtomicU64>) -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.mtu_discovery_config(None);
+    transport.initial_mtu(1200);
+    transport.min_mtu(1200);
+    transport.congestion_controller_factory(Arc::new(EpochControllerFactory::new(epoch)));
+    Arc::new(transport)
+}
+
 /// The kind of path a peer is currently using. WO-1.3a only ever produces
 /// [`PathKind::Relay`]; WO-1.3b adds [`PathKind::Direct`] and the switching
 /// logic that bumps a peer's epoch when it changes.

@@ -1,6 +1,0 @@
-    Finished `bench` profile [optimized] target(s) in 0.13s
-     Running benches/porch_socket.rs (target/release/deps/porch_socket-f8f5b8737c1d2774)
-plain tokio socket recv median: 128.75µs (2000 iterations)
-porch socket recv median:       129.958µs (2000 iterations)
-delta (porch - plain):           1 microseconds
-reversing condition (b) [held]: porch socket adds no more than 20 microseconds at the median
