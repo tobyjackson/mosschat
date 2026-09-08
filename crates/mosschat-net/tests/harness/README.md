@@ -290,18 +290,84 @@ a connection to still be there a minute later: `blackout-60s` and
 that stays running and a caller that holds a visit open, so from here the
 row command is one `doctor` run rather than a `spike dial`.
 
-**house-b runs the callee.** It needs a friends file naming every identity
-that will visit it, which is every row's own doctor identity (see "One
-identity cannot run every row" below): a knock from a key that is not on
-that list is answered with silence, and the row would record
-`introduce_timeout` rather than its fault. The same keys go in the gate's
-`members.txt`, for the same reason the house's own key does.
+**Seeds go in files here, not in variables.** `house` and `doctor` both
+take `--identity-file`, a path holding 64 hex characters, rather than the
+`--identity <hex>` the spike sections above use, because a seed on a
+command line is readable by any local user through `ps`. Write one per
+identity before starting anything: house-b's, and one per matrix row (see
+"One identity cannot run every row" below). `.run/` is gitignored, and
+these files are this run's private keys, so give them 0600 and delete them
+with the rest of `.run/` at teardown.
+
+Each identity is made once and used twice: the seed goes in a file for
+`house`/`doctor`, and its public key goes in the gate's `members.txt` and,
+for a row, in house-b's `friends.txt`. The public key comes from the
+binaries rather than being typed: `spike listen` prints
+`spike: identity <64 hex>` as soon as it has bound, before it waits for
+anything, which is the same trick the spike section above uses. The helper
+below runs it outside the namespaces (no root, no `ip netns`), reads that
+one line and lets `timeout` end it.
 
 ```
-printf '%s\n' "$ROW_1_PUB" "$ROW_2_PUB" ... > crates/mosschat-net/tests/harness/.run/friends.txt
+RUN=crates/mosschat-net/tests/harness/.run
+mkdir -p "$RUN"
+umask 077
 
-sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/house-b.pid; exec ip netns exec house-b $MOSSCHAT_BIN house --headless --gate 203.0.113.1:443 --community $COMMUNITY --identity-file /path/to/house-b.seed --friends crates/mosschat-net/tests/harness/.run/friends.txt" | tee /tmp/house-b.jsonl
+# $1 = a name. Writes $RUN/$1.seed (0600) and prints that identity's
+# public key. The seed is on spike's command line, and so is briefly
+# visible in `ps`, exactly as the spike section above already does it;
+# these are throwaway harness identities, and the file is what `house`
+# and `doctor` read precisely so their seeds are never in argv.
+new_identity() {
+  seed=$(openssl rand -hex 32)
+  printf '%s\n' "$seed" > "$RUN/$1.seed"
+  timeout 2 "$SPIKE_BIN" listen --identity "$seed" --bind 127.0.0.1:0 \
+    | sed -n 's/^spike: identity //p' | head -1
+}
+
+HOUSE_B_PUB=$(new_identity house-b)
+
+# One identity per row. Take the row ids from
+# `fault-matrix.sh --help` and list them here; there is no parsing of
+# that output, on purpose, so a change to it cannot silently produce
+# fewer identities than rows.
+ROWS="loss-1pct loss-5pct loss-20pct delay-50ms delay-200ms delay-1000ms reorder duplicate bandwidth-256kbit blackout-60s asymmetric-loss gatehouse-killed"
+
+: > "$RUN/friends.txt"
+for row in $ROWS; do
+  new_identity "row-$row" >> "$RUN/friends.txt"
+done
+
+# The gate seats house-b and every row; house-b answers every row.
+cp "$RUN/friends.txt" "$RUN/members.txt"
+printf '%s\n' "$HOUSE_B_PUB" >> "$RUN/members.txt"
+
+wc -l "$RUN/friends.txt" "$RUN/members.txt"
+awk 'length != 64 { print FILENAME": bad line "NR": "$0; bad=1 } END { exit bad }' \
+  "$RUN/friends.txt" "$RUN/members.txt" && echo "both files are 64 hex per line"
 ```
+
+Check `$ROWS` against `fault-matrix.sh --help` before running it: a row
+with no identity of its own falls back to sharing one, which is the thing
+"One identity cannot run every row" below exists to stop.
+`MemberList::load` reads both files and refuses any non-blank, non-`#`
+line that is not exactly 64 hex characters
+(`crates/mosschat-net/src/gate/mod.rs`), so a blank line or a stray
+placeholder stops the gate or the house at start rather than halfway
+through the matrix, which is what the `awk` check above catches first.
+
+**house-b runs the callee**, after those two files exist and after the
+gatehouse is up with this `members.txt` (the gate reads it once, at
+start, and on `SIGHUP`, so every key goes in before it starts or the
+reload does):
+
+```
+sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/house-b.pid; exec ip netns exec house-b $MOSSCHAT_BIN house --headless --gate 203.0.113.1:443 --community $COMMUNITY --identity-file crates/mosschat-net/tests/harness/.run/house-b.seed --friends crates/mosschat-net/tests/harness/.run/friends.txt" | tee /tmp/house-b.jsonl
+```
+
+It prints one line on stderr before anything else saying what its output
+contains (addresses, its friends' fingerprints, its own public key), and
+then one JSON object per line on stdout.
 
 Same pidfile rule as the gatehouse and the same reason (issue #50): the pid
 is written from inside the process that becomes the house, by its own `$$`,
@@ -309,21 +375,28 @@ right before `exec`, so it is never sudo's or a wrapper's. Leave that
 terminal running; `tee` keeps its stdout, which is one JSON object per line
 and the callee's own account of every visit, beside the caller's record.
 Its first line names this house's public key, which is what `--friend`
-below takes:
+below takes and what the `HOUSE_B_PUB` line above reads:
 
 ```
 {"detail":"house <64 hex>, gate 203.0.113.1:443, observed 10.2.0.2:51820, secondary port 444","event":"registered","peer":null,"ts_ms":1757362800123}
 ```
 
-**house-a runs the row.** With house-b's key in `$HOUSE_B_PUB`:
+**house-a runs the row**, one seed file per row:
 
 ```
 sudo bash crates/mosschat-net/tests/harness/fault-matrix.sh -- \
   ip netns exec house-a $MOSSCHAT_BIN doctor \
     --gate 203.0.113.1:443 --community $COMMUNITY \
-    --identity-file /path/to/this-row.seed \
+    --identity-file $RUN/row-blackout-60s.seed \
     --friend $HOUSE_B_PUB --hold 90 --json
 ```
+
+**Case (e), hole punching forced off**, is the one row that changes both
+commands: add `--no-punch` to the `doctor` line above. The flag rides the
+candidate exchange, so house-b is told and neither side probes; adding it
+to the house as well makes the row's intent obvious in both accounts and
+is what the tests cover. Both records then say `punch_disabled`, which is
+the result that row is looking for, and neither says a failure.
 
 `--hold 90` is what makes the row a measurement rather than a connect:
 after the visit goes live it stays open for 90 seconds, sending section 4's
@@ -336,11 +409,18 @@ frame 9 before WO-1.5a, and a hold that outlives a registration is exactly
 how that was found.
 
 Exit codes read differently for a held run, and `fault-matrix.sh` records
-them: 0 for any visit that went live, whatever happened to its path
-afterwards, because a path lost mid visit is the thing `--hold` measures;
-non-zero only for a run that never got a visit open, naming the step that
-failed. `--json` puts the whole record on stdout, which is the row's raw
-file.
+them. 0 means the visit went live and every step that *builds* it
+succeeded: the gate dial, the registration, the introduction, the relay
+session, the peer handshake and the candidate exchange. Non-zero means one
+of those failed, or the visit never went live, or it was cut short, and
+the message names the step. A row that stayed on the relay for its whole
+hold, or upgraded and then lost the path, is a **green** row with a record
+that says so: a relayed path is a result WO-1.5 asks for by name, and a
+lost path is what `--hold` is for. `--json` puts the whole record on
+stdout, which is the row's raw file.
+
+`--hold` takes at most 86400 seconds. A measurement wanting longer wants a
+house on both ends rather than a doctor.
 
 **What each row reads out of that record.** All of it is in one JSON object
 (`docs/dev/gatehouse-design.md` section 7, plus its amendment 4):

@@ -140,6 +140,16 @@ impl HouseEvent {
     }
 }
 
+/// The line a house prints before anything else, on stderr, so nobody
+/// keeps this output without knowing what is in it.
+///
+/// Section 7's own reason for `doctor`'s notice, applied to the role whose
+/// stdout an operator is told to keep: a house's lines carry addresses,
+/// and the first of them carries this house's own public key in full,
+/// which section 7 permits a role to print about itself.
+pub const PRIVACY_NOTICE: &str = "This house's output contains IP addresses, your friends' \
+                                  fingerprints, and this house's own public key.";
+
 /// Where a house's events go. The binary prints them; a test collects
 /// them.
 pub type HouseEventSink = Arc<dyn Fn(HouseEvent) + Send + Sync>;

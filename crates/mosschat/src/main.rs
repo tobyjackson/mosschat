@@ -327,6 +327,13 @@ fn run_house(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::erro
         diagnostics,
     };
 
+    // The same courtesy `doctor` prints before its report, for the same
+    // reason and in the same place (stderr, so stdout stays one JSON
+    // object per line): the harness README tells an operator to keep this
+    // output, and it names addresses and this house's own public key
+    // (Yseult's Low 3 on PR 80).
+    eprintln!("{}", mosschat_net::house::PRIVACY_NOTICE);
+
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         mosschat_net::house::run(
@@ -449,6 +456,24 @@ impl DoctorArgs {
                     parsed.hold_s = seconds.parse().map_err(|_| {
                         format!("--hold takes a whole number of seconds, not {seconds:?}")
                     })?;
+                    // Bounded here, before a socket is opened, because
+                    // the alternative was a panic after the visit was
+                    // already open: `Duration::from_secs(hold) +
+                    // PROBE_GIVE_UP + 10 s` overflows for a `u64` near
+                    // its maximum, and this crate forbids panics
+                    // (Yseult's Low 1). A value that merely overflowed an
+                    // `Instant` instead meant "hold forever" with nothing
+                    // said. The library clamps too
+                    // (`mosschat_net::punch::MAX_HOLD`); this is the half
+                    // that can still tell a person what they typed.
+                    if parsed.hold_s > MAX_HOLD_S {
+                        return Err(format!(
+                            "--hold takes at most {MAX_HOLD_S} seconds (a day), not {}; a \
+                             measurement that wants longer wants a house, which holds a visit \
+                             until its peer leaves",
+                            parsed.hold_s
+                        ));
+                    }
                 }
                 "--no-punch" => parsed.no_punch = true,
                 other => return Err(format!("unknown flag {other}")),
@@ -500,6 +525,15 @@ fn friend_fingerprint(
     }
 }
 
+/// The longest `--hold` this command accepts, in seconds: a day.
+///
+/// The same number as `mosschat_net::punch::MAX_HOLD` and for the same
+/// reason. WO-1.5's rows hold a visit for 90 seconds; nothing a
+/// measurement does wants longer, and a person who wants a visit held for
+/// days wants `mosschat house --headless`, which holds one until its peer
+/// leaves.
+const MAX_HOLD_S: u64 = 86_400;
+
 /// What `mosschat doctor --help` prints.
 const DOCTOR_USAGE: &str = "\
 mosschat doctor: run the connection steps against a friend or a gate, and say what happened.
@@ -514,12 +548,14 @@ mosschat doctor: run the connection steps against a friend or a gate, and say wh
   --hold <seconds>        once the visit is live, keep it open this long: keepalives per
                           section 4, a round trip sample every second, and every path
                           event recorded with its timestamp. 0, the default, is the one
-                          shot run this command has always done.
+                          shot run this command has always done; 86400 (a day) is the
+                          most, and a longer visit wants a house rather than a doctor.
   --no-punch              exchange candidates but never probe them, so the visit stays on
                           the relay. For measurement only (WO-1.5 case (e)): it removes
                           the upgrade, not the relay, and the record says punch_disabled
                           so a reader can see it was asked for rather than inferred from
-                          a failure.
+                          a failure. The peer is told, so it does not probe either and
+                          does not wait out a start signal this run will never ask for.
   --json                  print the diagnostics record rather than the human report
   --last                  print the last record for this peer without running anything
 
@@ -587,25 +623,80 @@ fn print_record(record: &mosschat_net::diag::DiagRecord, json: bool) {
 ///
 /// A one-shot run asks "can this house reach that one and keep the path",
 /// so any failed step is the answer and [`exit_for`] reports it. A held
-/// run asks "what happened over the next N seconds", and a path lost mid
-/// visit is the thing being measured rather than the run failing: WO-1.5
-/// case (f) is a path that dies on purpose, and case (e) is a visit that
-/// is meant to stay relayed. So this exits 0 for any run whose visit
-/// reached `live`, and non-zero for one that never got that far, which is
-/// section 7's own rule read literally.
+/// run asks "what happened over the next N seconds": WO-1.5 case (f) is a
+/// path that dies on purpose and case (e) is a visit meant to stay
+/// relayed, so neither of those is a failed run. [`held_run_verdict`] is
+/// the rule; this is the exit it produces.
 fn exit_for_held(record: &mosschat_net::diag::DiagRecord) -> ! {
+    match held_run_verdict(record) {
+        Ok(()) => std::process::exit(0),
+        Err(HeldFailure::Step(step)) => {
+            eprintln!("mosschat doctor: failed at step {}", step.as_str());
+            std::process::exit(1);
+        }
+        Err(HeldFailure::NeverLive) => {
+            eprintln!("mosschat doctor: the visit never went live");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Why a held run failed, when it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldFailure {
+    /// A step that builds or ends the visit failed.
+    Step(mosschat_net::diag::Step),
+    /// The visit never opened at all.
+    NeverLive,
+}
+
+/// The steps whose failure fails a `--hold` run.
+///
+/// The ones deliberately absent describe a *path* rather than a visit:
+/// `probe_burst`, `upgrade`, `start_signal`, `path_lost`,
+/// `relay_fallback` and the two reflections. A relayed visit is a result
+/// WO-1.5 asks for by name (case (d) may relay with a reason, case (e) is
+/// meant to), and a path lost mid visit is the thing `--hold` exists to
+/// measure, so neither is a failed run. What is: a gate that would not
+/// take this house, a friend that could not be introduced or handshaken,
+/// a porch stream that never carried a candidate exchange, and a visit
+/// cut short before it settled.
+const FATAL_TO_A_VISIT: [mosschat_net::diag::Step; 7] = [
+    mosschat_net::diag::Step::GateDial,
+    mosschat_net::diag::Step::GateRegister,
+    mosschat_net::diag::Step::Introduce,
+    mosschat_net::diag::Step::RelayOpen,
+    mosschat_net::diag::Step::PeerHandshake,
+    mosschat_net::diag::Step::CandidateExchange,
+    mosschat_net::diag::Step::Closed,
+];
+
+/// Whether a `--hold` run succeeded, as a value rather than an exit.
+///
+/// `live` is recorded as soon as the visit is open on the relay, which is
+/// before the porch stream is opened, so "reached live" alone would exit 0
+/// for a run whose candidate exchange then failed with the failure sitting
+/// in its own record (Yseult's Low 2), and `fault-matrix.sh` grades a row
+/// on the exit code.
+fn held_run_verdict(record: &mosschat_net::diag::DiagRecord) -> Result<(), HeldFailure> {
+    if let Some(step) = record
+        .steps
+        .iter()
+        .filter(|step| step.outcome == mosschat_net::diag::StepOutcome::Fail)
+        .map(|step| step.step)
+        .find(|step| FATAL_TO_A_VISIT.contains(step))
+    {
+        return Err(HeldFailure::Step(step));
+    }
     let reached_live = record.steps.iter().any(|step| {
         step.step == mosschat_net::diag::Step::Live
             && step.outcome == mosschat_net::diag::StepOutcome::Ok
     });
     if reached_live {
-        std::process::exit(0);
+        Ok(())
+    } else {
+        Err(HeldFailure::NeverLive)
     }
-    match record.failed_step {
-        Some(step) => eprintln!("mosschat doctor: failed at step {}", step.as_str()),
-        None => eprintln!("mosschat doctor: the visit never went live"),
-    }
-    std::process::exit(1);
 }
 
 fn exit_for(record: &mosschat_net::diag::DiagRecord) -> ! {
@@ -883,18 +974,35 @@ async fn run_doctor_steps(
             + std::time::Duration::from_secs(10);
         let settled = tokio::time::timeout(budget, doorbell).await;
         peer_connection.close(0u32.into(), b"doctor done");
-        if settled.is_err() {
+        let overran = settled.is_err();
+        if overran {
             eprintln!(
                 "mosschat doctor: the visit did not settle inside {} s, so this record is \
                  whatever it had reached",
                 budget.as_secs()
             );
+            mosschat_net::diag::record(
+                Some(&recorder),
+                Step::Closed,
+                StepOutcome::Fail,
+                format!(
+                    "the visit did not settle inside its {} s budget and was cut short",
+                    budget.as_secs()
+                ),
+            );
         }
         deregister(&client).await;
-        // The doorbell already settled this record; `finish` is idempotent
-        // and hands back the line that was written rather than building a
-        // second one from a different reason.
-        let (record, written) = recorder.finish(Reason::Ok);
+        // The doorbell settles this record itself, and `finish` is
+        // idempotent: on the ordinary path this hands back the line that
+        // was written rather than building a second one from a different
+        // reason. The reason here is therefore only used when the doorbell
+        // never got that far, which is the overrun above, and it must not
+        // be `ok` for a visit that was cut short (Yseult's Low 2).
+        let (record, written) = recorder.finish(if overran {
+            Reason::Internal
+        } else {
+            Reason::Ok
+        });
         report_write(written);
         return Ok(record);
     }
@@ -1019,6 +1127,101 @@ fn resolve_one(target: &str) -> Result<std::net::SocketAddr, String> {
 )]
 mod tests {
     use super::*;
+
+    fn step(
+        step: mosschat_net::diag::Step,
+        outcome: mosschat_net::diag::StepOutcome,
+    ) -> mosschat_net::diag::StepRecord {
+        mosschat_net::diag::StepRecord {
+            step,
+            at_ms: 1,
+            outcome,
+            detail: String::new(),
+        }
+    }
+
+    fn held_record(steps: Vec<mosschat_net::diag::StepRecord>) -> mosschat_net::diag::DiagRecord {
+        let failed = steps
+            .iter()
+            .find(|entry| entry.outcome == mosschat_net::diag::StepOutcome::Fail)
+            .map(|entry| entry.step);
+        let mut record = mosschat_net::diag::DiagRecord::from_json_line(
+            &mosschat_net::diag::Recorder::new(
+                mosschat_net::diag::PeerFingerprint::default(),
+                None,
+            )
+            .snapshot(mosschat_net::diag::Reason::Ok)
+            .to_json_line(),
+        )
+        .unwrap();
+        record.steps = steps;
+        record.failed_step = failed;
+        record
+    }
+
+    /// Yseult's Low 2: a held run exits 0 for a visit that went live and
+    /// stayed relayed or lost its path, and non-zero when a step that
+    /// builds the visit failed even though `live` was recorded first.
+    ///
+    /// `live` is recorded as soon as the visit is open on the relay,
+    /// before the porch stream is opened, so the second case is a real
+    /// one: `fault-matrix.sh` grades a row on this exit code, and it
+    /// scored such a row green.
+    ///
+    /// Deliberate break to fail this test: return `Ok(())` from
+    /// `held_run_verdict` whenever a successful `live` step is present,
+    /// which is what it did.
+    #[test]
+    fn a_held_run_fails_on_a_broken_visit_and_not_on_a_broken_path() {
+        use mosschat_net::diag::Step;
+        use mosschat_net::diag::StepOutcome::{Fail, Ok as StepOk};
+
+        // Live, relayed the whole way, nothing probeable: the ordinary
+        // shape of WO-1.5 cases (d) and (e).
+        assert_eq!(
+            held_run_verdict(&held_record(vec![
+                step(Step::Live, StepOk),
+                step(Step::ProbeBurst, Fail),
+            ])),
+            Ok(())
+        );
+        // Live, upgraded, then the path died: what --hold measures.
+        assert_eq!(
+            held_run_verdict(&held_record(vec![
+                step(Step::Live, StepOk),
+                step(Step::Upgrade, StepOk),
+                step(Step::PathLost, Fail),
+                step(Step::RelayFallback, StepOk),
+            ])),
+            Ok(())
+        );
+        // Live, and then the porch stream never carried an exchange.
+        assert_eq!(
+            held_run_verdict(&held_record(vec![
+                step(Step::Live, StepOk),
+                step(Step::CandidateExchange, Fail),
+            ])),
+            Err(HeldFailure::Step(Step::CandidateExchange))
+        );
+        // Live, and then cut short before it settled.
+        assert_eq!(
+            held_run_verdict(&held_record(vec![
+                step(Step::Live, StepOk),
+                step(Step::Closed, Fail),
+            ])),
+            Err(HeldFailure::Step(Step::Closed))
+        );
+        // Never live at all.
+        assert_eq!(
+            held_run_verdict(&held_record(vec![step(Step::GateDial, StepOk)])),
+            Err(HeldFailure::NeverLive)
+        );
+        // A gate that would not take this house.
+        assert_eq!(
+            held_run_verdict(&held_record(vec![step(Step::GateRegister, Fail)])),
+            Err(HeldFailure::Step(Step::GateRegister))
+        );
+    }
 
     /// Konrad's must 2: one port of two failing is not section 7's
     /// `udp_blocked`, which means neither port was reachable.
