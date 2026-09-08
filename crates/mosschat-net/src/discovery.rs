@@ -659,6 +659,22 @@ mod tests {
         (key, public)
     }
 
+    /// Writes one line to the real stderr, bypassing libtest's output
+    /// capture.
+    ///
+    /// `eprintln!` goes through `std::io::_eprint`, which libtest redirects
+    /// per test thread and prints only for a *failing* test, so a skip
+    /// notice written with it is invisible in a CI log: the run looks
+    /// identical whether the multicast test exercised the group or returned
+    /// on its first line. `std::io::stderr()` is the process's own handle
+    /// and is not redirected, so the line appears either way, which is what
+    /// makes "it ran on this platform" a checkable claim rather than an
+    /// assumption.
+    fn note(line: &str) {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+
     /// Section 6's frame, byte for byte: 144 bytes, the stated layout, and
     /// a signature over the context string and the first 80 bytes that
     /// `mosschat_core::identity::verify` accepts.
@@ -950,9 +966,9 @@ mod tests {
         ) {
             Ok(socket) => socket,
             Err(error) => {
-                eprintln!(
-                    "skipped: this machine will not join {DISCOVERY_GROUP_V4} on {interface} ({error})"
-                );
+                note(&format!(
+                    "discovery: SKIPPED, will not join {DISCOVERY_GROUP_V4} on {interface} ({error})"
+                ));
                 return;
             }
         };
@@ -965,9 +981,9 @@ mod tests {
         ) {
             Ok(socket) => socket,
             Err(error) => {
-                eprintln!(
-                    "skipped: this machine will not join {DISCOVERY_GROUP_V4} on {interface} ({error})"
-                );
+                note(&format!(
+                    "discovery: SKIPPED, will not join {DISCOVERY_GROUP_V4} on {interface} ({error})"
+                ));
                 return;
             }
         };
@@ -983,7 +999,9 @@ mod tests {
             .await
             .is_err()
         {
-            eprintln!("skipped: this machine will not send to {DISCOVERY_GROUP_V4}");
+            note(&format!(
+                "discovery: SKIPPED, will not send to {DISCOVERY_GROUP_V4}"
+            ));
             return;
         }
         bob_socket
@@ -1011,7 +1029,7 @@ mod tests {
 
         let Some(bob_seen_by_alice) = hear(&alice_socket, &mut alice_discovery, bob_key).await
         else {
-            eprintln!("skipped: no multicast datagram was delivered on this machine");
+            note("discovery: SKIPPED, no multicast datagram was delivered");
             return;
         };
         let bob_seen = hear(&bob_socket, &mut bob_discovery, alice_key)
@@ -1020,6 +1038,10 @@ mod tests {
 
         assert_eq!(bob_seen_by_alice.key, bob_key);
         assert_eq!(bob_seen_by_alice.addr.port(), 4434, "bob's QUIC port");
+        note(&format!(
+            "discovery: RAN, both houses discovered each other at {} and {}",
+            bob_seen_by_alice.addr, bob_seen.addr
+        ));
         assert_eq!(bob_seen.key, alice_key);
         assert_eq!(bob_seen.addr.port(), 4433, "alice's QUIC port");
         assert_eq!(
