@@ -43,11 +43,11 @@ use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::io::Interest;
 
-use crate::gate::limits::INBOUND_RELAY_QUEUE_CAP;
+use crate::gate::limits::{INBOUND_PROBE_QUEUE_CAP, INBOUND_RELAY_QUEUE_CAP};
 use crate::gate::wire::{decode_relay, encode_relay};
 use crate::lockext::LockExt;
 use crate::path::{PathEntry, PathTable};
-use crate::punch::{PROBE_LEN, is_probe};
+use crate::punch::{PROBE_LEN, Probe, is_probe};
 
 /// Builds the stable synthetic address for `peer_key` (section 3): `fd`, 5
 /// bytes randomised per process (`process_salt`), 10 bytes of
@@ -121,12 +121,44 @@ pub struct PorchSocket {
     /// before quinn ever sees them (section 3, "telling probes from
     /// QUIC"), with the real source address they arrived from, which is the
     /// address the doorbell scores.
-    inbound_probes: Mutex<VecDeque<(SocketAddr, [u8; PROBE_LEN])>>,
+    ///
+    /// **Authenticated before it is queued, and bounded** (Yseult's High,
+    /// Konrad's must 1). A probe segment never reaches quinn, so section
+    /// 3's drop rule cannot protect this queue; and a probe's source
+    /// address deliberately cannot be checked against anything, since the
+    /// whole point of the burst is to hear from a mapping nobody has seen
+    /// yet. What can be checked is the thing section 2 says authenticates a
+    /// probe: the keyed hash. So a segment is queued only if it verifies
+    /// under a currently armed attempt key, which is stronger than a source
+    /// check rather than weaker, and the queue is capped at
+    /// [`INBOUND_PROBE_QUEUE_CAP`] on top of that.
+    inbound_probes: Mutex<VecDeque<(SocketAddr, Probe)>>,
+    /// The probe keys currently armed, by attempt id. Empty means no
+    /// attempt is running, and then every probe segment is dropped and
+    /// counted rather than queued for a consumer that does not exist.
+    probe_keys: Mutex<HashMap<[u8; 16], [u8; 32]>>,
+    /// Probe segments dropped because no armed key authenticated them.
+    probes_unauthenticated: AtomicU64,
+    /// Authenticated probes dropped because the queue was already at
+    /// [`INBOUND_PROBE_QUEUE_CAP`]: the newest is dropped and counted, the
+    /// same policy and the same reasoning as the relay queue's.
+    inbound_probes_dropped: AtomicU64,
     probe_waker: Mutex<Option<Waker>>,
     /// The real source addresses whose QUIC packets may reach quinn
     /// unchanged: the gate addresses this house itself dialled. See
     /// [`PorchSocket::allow_source`].
     allowed_sources: Mutex<HashSet<SocketAddr>>,
+    /// Whether section 3's drop rule is in force.
+    ///
+    /// Set by [`PorchSocket::arm`] and by [`PorchSocket::attach_gate`], and
+    /// **never cleared**. It used to be inferred from `allowed_sources`
+    /// being empty, which fails *open*: `forget_source` takes a
+    /// caller-supplied address, and a gate naming a `secondary_port` equal
+    /// to its primary port would empty the set and disable the rule for the
+    /// life of the process (Yseult's Medium, Konrad's must 2). An explicit
+    /// flag fails closed instead: once armed, an unknown source is dropped
+    /// whatever the allow-list happens to hold.
+    armed: std::sync::atomic::AtomicBool,
     /// Count of inbound QUIC segments dropped for arriving from an address
     /// in neither the path table nor the allow-list (section 3).
     unknown_source_dropped: AtomicU64,
@@ -180,8 +212,12 @@ impl PorchSocket {
             paths: Mutex::new(PathTable::new()),
             inbound_synthetic: Mutex::new(VecDeque::new()),
             inbound_probes: Mutex::new(VecDeque::new()),
+            probe_keys: Mutex::new(HashMap::new()),
+            probes_unauthenticated: AtomicU64::new(0),
+            inbound_probes_dropped: AtomicU64::new(0),
             probe_waker: Mutex::new(None),
             allowed_sources: Mutex::new(HashSet::new()),
+            armed: std::sync::atomic::AtomicBool::new(false),
             unknown_source_dropped: AtomicU64::new(0),
             waker: Mutex::new(None),
             inbound_relay_dropped: AtomicU64::new(0),
@@ -202,6 +238,7 @@ impl PorchSocket {
     /// addresses.
     pub fn attach_gate(self: &Arc<Self>, gate: quinn::Connection) {
         self.allow_source(gate.remote_address());
+        self.arm();
         {
             let mut routes = self.relay.lock_or_recover();
             routes.gate = Some(gate.clone());
@@ -268,6 +305,50 @@ impl PorchSocket {
         if let Some(waker) = self.waker.lock_or_recover().take() {
             waker.wake();
         }
+    }
+
+    /// Puts section 3's drop rule in force, from this call onwards and
+    /// permanently. Called before the gate is dialled, so the rule is armed
+    /// from the first packet, and again by
+    /// [`PorchSocket::attach_gate`]. Nothing un-arms it.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the drop rule is in force.
+    #[must_use]
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::SeqCst)
+    }
+
+    /// Arms `attempt`'s probe key, so probes authenticating under it are
+    /// queued for the doorbell instead of dropped.
+    pub fn arm_probe_key(&self, attempt: [u8; 16], key: [u8; 32]) {
+        self.probe_keys.lock_or_recover().insert(attempt, key);
+    }
+
+    /// Disarms `attempt`'s probe key and discards anything of that
+    /// attempt's still queued, which is what ends a doorbell attempt as far
+    /// as this socket is concerned.
+    pub fn disarm_probe_key(&self, attempt: &[u8; 16]) {
+        self.probe_keys.lock_or_recover().remove(attempt);
+        self.inbound_probes
+            .lock_or_recover()
+            .retain(|(_, probe)| probe.attempt != *attempt);
+    }
+
+    /// Probe segments dropped because no armed key authenticated them,
+    /// which includes every probe-shaped packet arriving while no attempt
+    /// is running.
+    #[must_use]
+    pub fn probes_unauthenticated(&self) -> u64 {
+        self.probes_unauthenticated.load(Ordering::Relaxed)
+    }
+
+    /// Authenticated probes dropped because the queue was full.
+    #[must_use]
+    pub fn inbound_probes_dropped(&self) -> u64 {
+        self.inbound_probes_dropped.load(Ordering::Relaxed)
     }
 
     /// The form `addr` must take to be sent from this socket: a V4
@@ -375,7 +456,7 @@ impl PorchSocket {
     /// Takes the next probe lifted out of the inbound stream, if one is
     /// waiting, with the real source address it arrived from.
     #[must_use]
-    pub fn try_recv_probe(&self) -> Option<(SocketAddr, [u8; PROBE_LEN])> {
+    pub fn try_recv_probe(&self) -> Option<(SocketAddr, Probe)> {
         self.inbound_probes.lock_or_recover().pop_front()
     }
 
@@ -384,7 +465,7 @@ impl PorchSocket {
     /// One waiter at a time: the doorbell is a single task per house, and a
     /// second waiter would silently displace the first, which is the very
     /// shape issue #19 was.
-    pub async fn recv_probe(&self) -> (SocketAddr, [u8; PROBE_LEN]) {
+    pub async fn recv_probe(&self) -> (SocketAddr, Probe) {
         std::future::poll_fn(|cx| {
             if let Some(probe) = self.try_recv_probe() {
                 return Poll::Ready(probe);
@@ -444,16 +525,57 @@ impl PorchSocket {
             // IPv4, and a pong whose source does not compare equal to the
             // candidate it answers proves nothing at all.
             let source = unmap_v4(meta.addr);
-            let mut queue = self.inbound_probes.lock_or_recover();
-            for probe in probes {
-                queue.push_back((source, probe));
-            }
-            drop(queue);
-            if let Some(waker) = self.probe_waker.lock_or_recover().take() {
-                waker.wake();
-            }
+            self.queue_probes(source, &probes);
         }
         write
+    }
+
+    /// Authenticates each extracted probe segment against every armed
+    /// attempt key and queues what verifies, bounded and counted.
+    ///
+    /// Nothing unauthenticated is ever queued, so a stranger reaching the
+    /// porch port cannot grow this queue at all, which is the property the
+    /// cap alone would not give: with no attempt running there is no armed
+    /// key, so every probe-shaped packet is dropped here and the queue
+    /// stays empty rather than filling with 81 bytes per packet for a
+    /// consumer that does not exist. A probe's *source* deliberately is not
+    /// checked, since the whole point of the burst is to hear from a
+    /// mapping nobody has seen yet; the keyed hash section 2 specifies is
+    /// the check, and it is the stronger of the two.
+    fn queue_probes(&self, source: SocketAddr, segments: &[[u8; PROBE_LEN]]) {
+        let keys: Vec<[u8; 32]> = {
+            let armed = self.probe_keys.lock_or_recover();
+            if armed.is_empty() {
+                self.probes_unauthenticated
+                    .fetch_add(segments.len() as u64, Ordering::Relaxed);
+                return;
+            }
+            armed.values().copied().collect()
+        };
+        let mut woke = false;
+        for segment in segments {
+            let Some(probe) = keys.iter().find_map(|key| Probe::decode(segment, key)) else {
+                self.probes_unauthenticated.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let pushed = {
+                let mut queue = self.inbound_probes.lock_or_recover();
+                if queue.len() >= INBOUND_PROBE_QUEUE_CAP {
+                    false
+                } else {
+                    queue.push_back((source, probe));
+                    true
+                }
+            };
+            if pushed {
+                woke = true;
+            } else {
+                self.inbound_probes_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if woke && let Some(waker) = self.probe_waker.lock_or_recover().take() {
+            waker.wake();
+        }
     }
 
     /// What quinn may be shown of a packet from real source `addr`
@@ -484,26 +606,25 @@ impl PorchSocket {
         // reversing condition (b), so the `Vec` an
         // "every direct address" call would build is one allocation per
         // packet and is not used here.
-        let bare = {
-            let allowed = self.allowed_sources.lock_or_recover();
-            if allowed.contains(&addr) {
-                return SourceVerdict::Keep;
-            }
-            allowed.is_empty()
-        };
+        if self.allowed_sources.lock_or_recover().contains(&addr) {
+            return SourceVerdict::Keep;
+        }
         if let Some(synthetic) = self.paths.lock_or_recover().synthetic_for_direct(addr) {
             return SourceVerdict::Rewrite(synthetic);
         }
-        if bare {
-            // A porch socket that has dialled nothing and proved nothing is
-            // not yet in the regime this rule governs: the rule exists to
-            // keep a stranger's packet away from a *peer* connection, and a
-            // peer connection cannot exist before an introduction, which
-            // cannot happen before a gate is dialled. Dropping here instead
-            // would make a bare `PorchSocket` silently deaf, which is what
-            // it did when this landed: the section 3 reversing-condition
+        if !self.armed.load(Ordering::SeqCst) {
+            // A porch socket that has not been armed has dialled nothing
+            // and can hold no peer connection, so the rule below has
+            // nothing to guard yet; without this arm the section 3
             // benchmark, which measures exactly a bare porch socket, hung
             // for 53 minutes on 0.05 s of CPU with every packet dropped.
+            // Keyed on an explicit flag that nothing clears, rather than on
+            // the allow-list being empty, which fails *open* the moment
+            // `forget_source` empties it (Konrad's must 2, Yseult's
+            // Medium). The rewrite above is deliberately ahead of it: a
+            // proved direct path must be presented as its synthetic address
+            // whether or not the rule is in force, or quinn's client
+            // connection meets a remote it has never heard of.
             return SourceVerdict::Keep;
         }
         SourceVerdict::Drop
@@ -1081,14 +1202,25 @@ mod tests {
         const PROBE_KEY: [u8; 32] = [11u8; 32];
         const ATTEMPT: [u8; 16] = [12u8; 16];
 
-        fn a_probe() -> [u8; PROBE_LEN] {
+        fn ping() -> Probe {
             Probe {
                 kind: PROBE_PING,
                 attempt: ATTEMPT,
                 tx: [1u8; 8],
                 observed: crate::gate::wire::Addr::default(),
             }
-            .encode(&PROBE_KEY)
+        }
+
+        fn a_probe() -> [u8; PROBE_LEN] {
+            ping().encode(&PROBE_KEY)
+        }
+
+        /// A porch socket with this test module's probe key armed, since a
+        /// probe is queued only if it authenticates under an armed key.
+        fn porch_with_probe_key() -> Arc<PorchSocket> {
+            let socket = porch();
+            socket.arm_probe_key(ATTEMPT, PROBE_KEY);
+            socket
         }
 
         /// Waits until the real socket is writable, through the same
@@ -1121,7 +1253,7 @@ mod tests {
         /// packet's length stays 1281, and `try_recv_probe` returns `None`.
         #[tokio::test]
         async fn probe_and_quic_in_one_gro_batch_each_reach_their_own_consumer() {
-            let socket = porch();
+            let socket = porch_with_probe_key();
             let synthetic = synthetic_addr([1, 2, 3, 4, 5], &[9u8; 32]);
             let direct: SocketAddr = "203.0.113.4:4433".parse().unwrap();
             let entry = socket.insert_relay_path([9u8; 32], synthetic);
@@ -1153,7 +1285,7 @@ mod tests {
                 &quic[..],
                 "the QUIC packet is unaltered"
             );
-            assert_eq!(socket.try_recv_probe(), Some((direct, probe)));
+            assert_eq!(socket.try_recv_probe(), Some((direct, ping())));
             assert_eq!(socket.try_recv_probe(), None);
         }
 
@@ -1164,7 +1296,7 @@ mod tests {
         /// return `Ok(0)`.
         #[tokio::test]
         async fn a_batch_of_only_probes_leaves_quinn_nothing_to_read() {
-            let socket = porch();
+            let socket = porch_with_probe_key();
             let probe = a_probe();
             let source: SocketAddr = "203.0.113.8:4433".parse().unwrap();
             let mut storage = [0u8; PROBE_LEN * 3];
@@ -1182,7 +1314,7 @@ mod tests {
             assert_eq!(socket.demultiplex(&mut bufs, &mut meta, 1), 0);
             assert_eq!(meta[0].len, 0);
             for _ in 0..3 {
-                assert_eq!(socket.try_recv_probe(), Some((source, probe)));
+                assert_eq!(socket.try_recv_probe(), Some((source, ping())));
             }
             assert_eq!(socket.try_recv_probe(), None);
         }
@@ -1192,10 +1324,9 @@ mod tests {
         /// is moved to the front rather than left where it lay.
         #[tokio::test]
         async fn a_leading_probe_is_removed_and_what_follows_is_repacked() {
-            let socket = porch();
+            let socket = porch_with_probe_key();
             let probe = a_probe();
             let source: SocketAddr = "203.0.113.8:4433".parse().unwrap();
-            socket.allow_source(source);
             let quic = [0xC3u8; PROBE_LEN];
             let mut storage = [0u8; PROBE_LEN * 2];
             storage[..PROBE_LEN].copy_from_slice(&probe);
@@ -1211,7 +1342,122 @@ mod tests {
             assert_eq!(socket.demultiplex(&mut bufs, &mut meta, 1), 1);
             assert_eq!(meta[0].len, PROBE_LEN);
             assert_eq!(&bufs[0][..PROBE_LEN], &quic);
-            assert_eq!(socket.try_recv_probe(), Some((source, probe)));
+            assert_eq!(socket.try_recv_probe(), Some((source, ping())));
+        }
+
+        /// Yseult's High, Konrad's must 1: a stranger reaching the porch
+        /// port cannot grow the probe queue. Nothing unauthenticated is
+        /// queued at all, and even an authenticated flood stops at
+        /// [`INBOUND_PROBE_QUEUE_CAP`], the newest dropped and counted.
+        ///
+        /// Deliberate break to fail this test: in
+        /// `PorchSocket::queue_probes`, replace the `keys.iter().find_map`
+        /// authentication with `Probe::decode(segment, &[0u8; 32])`
+        /// unconditionally queued, and delete the `queue.len() >=
+        /// INBOUND_PROBE_QUEUE_CAP` branch. The queue then grows past the
+        /// cap and both counters stay 0.
+        #[tokio::test]
+        async fn an_unknown_source_cannot_grow_the_probe_queue_past_its_cap() {
+            let socket = porch();
+            socket.arm();
+            let stranger: SocketAddr = "203.0.113.77:4433".parse().unwrap();
+            let flood = 64usize;
+
+            // With no attempt running there is no armed key, so every
+            // probe-shaped packet from anywhere is dropped and counted and
+            // the queue stays empty: the case that had nothing draining it.
+            for _ in 0..flood {
+                deliver_one_probe(&socket, stranger, &a_probe());
+            }
+            assert_eq!(socket.probes_unauthenticated(), flood as u64);
+            assert!(socket.try_recv_probe().is_none());
+            assert_eq!(socket.inbound_probes.lock_or_recover().len(), 0);
+
+            // A key armed for a different attempt does not authenticate
+            // this one either: the check is the keyed hash, not the shape.
+            socket.arm_probe_key([0xAAu8; 16], [0xBBu8; 32]);
+            for _ in 0..flood {
+                deliver_one_probe(&socket, stranger, &a_probe());
+            }
+            assert_eq!(socket.probes_unauthenticated(), (flood * 2) as u64);
+            assert!(socket.try_recv_probe().is_none());
+
+            // With the right key armed the queue fills to the cap and not
+            // one past it, and every further arrival is counted.
+            socket.arm_probe_key(ATTEMPT, PROBE_KEY);
+            let overflow = 5usize;
+            for _ in 0..(INBOUND_PROBE_QUEUE_CAP + overflow) {
+                deliver_one_probe(&socket, stranger, &a_probe());
+            }
+            assert_eq!(
+                socket.inbound_probes.lock_or_recover().len(),
+                INBOUND_PROBE_QUEUE_CAP
+            );
+            assert_eq!(socket.inbound_probes_dropped(), overflow as u64);
+            assert_eq!(socket.probes_unauthenticated(), (flood * 2) as u64);
+
+            // Disarming ends the attempt as far as the socket is concerned
+            // and takes its queued probes with it.
+            socket.disarm_probe_key(&ATTEMPT);
+            assert_eq!(socket.inbound_probes.lock_or_recover().len(), 0);
+        }
+
+        /// Feeds one probe-shaped datagram through the real receive path.
+        fn deliver_one_probe(
+            socket: &Arc<PorchSocket>,
+            source: SocketAddr,
+            probe: &[u8; PROBE_LEN],
+        ) {
+            let mut storage = *probe;
+            let mut bufs = [IoSliceMut::new(&mut storage)];
+            let mut meta = [RecvMeta {
+                addr: source,
+                len: PROBE_LEN,
+                stride: PROBE_LEN,
+                ecn: None,
+                dst_ip: None,
+            }];
+            socket.demultiplex(&mut bufs, &mut meta, 1);
+        }
+
+        /// Konrad's must 2 and Yseult's Medium: once armed, emptying the
+        /// allow-list must not reopen the rule. It used to, because the
+        /// bare-socket hatch was keyed on `allowed_sources.is_empty()` and
+        /// `forget_source` takes a caller-supplied address.
+        ///
+        /// Deliberate break to fail this test: in
+        /// `PorchSocket::classify_source`, replace
+        /// `!self.armed.load(Ordering::SeqCst)` with
+        /// `self.allowed_sources.lock_or_recover().is_empty()`. The
+        /// stranger's packet is then kept and the count stays 0.
+        #[tokio::test]
+        async fn emptying_the_allow_list_does_not_disarm_the_drop_rule() {
+            let socket = porch();
+            let gate: SocketAddr = "203.0.113.1:4433".parse().unwrap();
+            let stranger: SocketAddr = "203.0.113.99:4433".parse().unwrap();
+            socket.allow_source(gate);
+            socket.arm();
+            assert!(socket.is_armed());
+
+            // The exact shape of the hole: a gate naming a `secondary_port`
+            // equal to its primary port would have `reflect` withdraw the
+            // only allowed address when that short connection closed.
+            socket.forget_source(&gate);
+            assert!(socket.allowed_sources.lock_or_recover().is_empty());
+            assert!(socket.is_armed(), "nothing clears the armed flag");
+
+            let mut storage = [0xC3u8; 40];
+            let mut bufs = [IoSliceMut::new(&mut storage)];
+            let mut meta = [RecvMeta {
+                addr: stranger,
+                len: 40,
+                stride: 40,
+                ecn: None,
+                dst_ip: None,
+            }];
+            assert_eq!(socket.demultiplex(&mut bufs, &mut meta, 1), 0);
+            assert_eq!(meta[0].len, 0);
+            assert_eq!(socket.unknown_source_dropped(), 1);
         }
 
         /// A porch socket that has dialled nothing and proved nothing
@@ -1251,6 +1497,7 @@ mod tests {
         #[tokio::test]
         async fn a_quic_packet_from_an_undialled_unproved_source_is_dropped_and_counted() {
             let socket = porch();
+            socket.arm();
             let dialled: SocketAddr = "203.0.113.1:4433".parse().unwrap();
             let stranger: SocketAddr = "203.0.113.99:4433".parse().unwrap();
             socket.allow_source(dialled);
@@ -1271,9 +1518,9 @@ mod tests {
             assert_eq!(socket.unknown_source_dropped(), 1);
 
             // Withdrawing the address (a `Reflect` connection closing) puts
-            // it back outside the rule. The gate's primary stays allowed,
-            // so the socket is not the bare one the arm above covers.
-            socket.allow_source("203.0.113.2:4433".parse().unwrap());
+            // it back outside the rule, and emptying the allow-list
+            // altogether does not reopen it: the rule is keyed on the armed
+            // flag, not on the set being non-empty.
             socket.forget_source(&dialled);
             let mut storage = [0xC3u8; 40];
             let mut bufs = [IoSliceMut::new(&mut storage)];

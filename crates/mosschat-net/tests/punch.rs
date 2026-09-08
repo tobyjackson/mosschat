@@ -378,6 +378,7 @@ mod punch {
                         role: 2,
                         peer_key: alice_key,
                         candidates,
+                        peer_observed: bob.peer_observed_for(outcome.session),
                     },
                     &bob_control,
                 )
@@ -399,6 +400,7 @@ mod punch {
                         role: 1,
                         peer_key: bob_key,
                         candidates,
+                        peer_observed: alice.peer_observed_for(outcome.session),
                     },
                     &alice_control,
                 )
@@ -481,6 +483,95 @@ mod punch {
         bob_control.stop_answering_probes();
         alice_peer.close(0u32.into(), b"done");
         let _ = tokio::time::timeout(Duration::from_secs(20), bob_doorbell).await;
+    }
+
+    /// Yseult's Medium: a `Start` naming a session this house does not hold
+    /// is ignored, so a hostile gate cannot walk session ids and grow the
+    /// `starts` map, and a taken signal leaves no slot behind.
+    ///
+    /// The gate here is honest, so the hostile case is produced the only
+    /// way a test can produce it: asking this house to wait on a session id
+    /// it was never introduced to, and showing the map never grows for it.
+    ///
+    /// Deliberate break to fail this test: in `client.rs`'s reader loop,
+    /// delete the `if !inner.sessions.lock_or_recover().contains_key(...)`
+    /// guard and the `starts.remove(&session)` on the taken path. The map
+    /// then keeps a slot per `Start` the gate chooses to send.
+    #[tokio::test]
+    async fn a_start_for_a_session_this_house_does_not_hold_is_ignored() {
+        let community = random_seed();
+        let alice_seed = random_seed();
+        let bob_seed = random_seed();
+        let alice_key = public_key_of(&alice_seed);
+        let bob_key = public_key_of(&bob_seed);
+
+        let gate = GateServer::bind(GateServerConfig {
+            community,
+            identity_seed: random_seed(),
+            members: MemberList::from_keys([alice_key, bob_key]),
+            primary_bind: "127.0.0.1:0".parse().unwrap(),
+            secondary_bind: "127.0.0.1:0".parse().unwrap(),
+            max_registrations: 256,
+        })
+        .unwrap();
+
+        let alice_friends = Arc::new(InMemoryFriendStore::new());
+        let bob_friends = Arc::new(InMemoryFriendStore::new());
+        alice_friends.add(bob_key);
+        bob_friends.add(alice_key);
+
+        let connect = async |seed, friends| {
+            GateClient::connect(
+                gate.primary_addr(),
+                seed,
+                community,
+                None,
+                friends,
+                Arc::new(InMemoryInviteStore::new()),
+            )
+            .await
+            .unwrap()
+        };
+        let alice = connect(alice_seed, alice_friends).await;
+        let _bob = connect(bob_seed, bob_friends).await;
+
+        let outcome = alice.introduce(bob_key, 30, None).await.unwrap();
+        // The session this house does hold carries the peer's gate-observed
+        // address, which is what the doorbell needs to accept a same-LAN
+        // candidate from that peer.
+        assert!(alice.peer_observed_for(outcome.session).is_some());
+        assert_eq!(
+            alice.peer_observed_for(outcome.session.wrapping_add(1)),
+            None
+        );
+        assert_eq!(alice.pending_start_slots(), 0);
+
+        // A session alice does not hold: no slot is ever created for it,
+        // waiting or received.
+        assert!(
+            alice
+                .await_start(outcome.session.wrapping_add(1), Duration::from_millis(300))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            alice.pending_start_slots(),
+            0,
+            "a timed-out wait leaves nothing behind either"
+        );
+
+        // The real session's `Start` is delivered and its slot removed.
+        alice.request_start(outcome.session).await.unwrap();
+        let start = alice
+            .await_start(outcome.session, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(start.session, outcome.session);
+        assert_eq!(
+            alice.pending_start_slots(),
+            0,
+            "a taken signal leaves no slot behind"
+        );
     }
 
     /// Section 1 on frame 8: the gate fires a start only for a session the

@@ -233,7 +233,7 @@ const T_PORCH_GOODBYE: u8 = 19;
 /// pinned keys and forwarded by the gate as opaque `Relay` payloads. Same
 /// deterministic CBOR array shape as [`crate::gate::wire::Frame`], and the
 /// same 4 byte big-endian length prefix on the wire (D7).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PorchFrame {
     /// Frame 16, both ways, the first frame each way on the porch stream.
     Candidates {
@@ -266,6 +266,59 @@ pub enum PorchFrame {
     /// Frame 19, both ways: a clean exit, so the peer goes straight to dead
     /// without passing through stale (section 4).
     Goodbye { v: u8, reason: u8 },
+}
+
+/// Redacted by hand rather than derived (Yseult's Note): `probe_half` is
+/// half of a shared secret, and this type is formatted into an error string
+/// on the porch stream's first-frame path. The crate has no logging call
+/// today, so nothing leaks yet; WO-1.4 is when it would.
+impl std::fmt::Debug for PorchFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Candidates {
+                v, attempt, addrs, ..
+            } => f
+                .debug_struct("Candidates")
+                .field("v", v)
+                .field("attempt", &hex16(attempt))
+                .field("addrs", &addrs.len())
+                .field("probe_half", &"<redacted>")
+                .finish(),
+            Self::PathUp {
+                v,
+                attempt,
+                addr,
+                rtt_us,
+            } => f
+                .debug_struct("PathUp")
+                .field("v", v)
+                .field("attempt", &hex16(attempt))
+                .field("addr", addr)
+                .field("rtt_us", rtt_us)
+                .finish(),
+            Self::PathDown {
+                v,
+                attempt,
+                addr,
+                reason,
+            } => f
+                .debug_struct("PathDown")
+                .field("v", v)
+                .field("attempt", &hex16(attempt))
+                .field("addr", addr)
+                .field("reason", reason)
+                .finish(),
+            Self::Goodbye { v, reason } => f
+                .debug_struct("Goodbye")
+                .field("v", v)
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
+fn hex16(bytes: &[u8; 16]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl PorchFrame {
@@ -543,6 +596,55 @@ fn is_probeable(addr: SocketAddr) -> bool {
     }
 }
 
+/// Whether `addr` is an address the wider internet could have routed to
+/// this house, as opposed to one that names something on this machine or
+/// inside this house's own network.
+///
+/// The distinction exists because of what a peer can do with a candidate
+/// list (Yseult's Medium): a peer names up to 16 addresses and this house
+/// then aims about 37 packets at each, so a peer naming `127.0.0.1:631` or
+/// `192.168.1.1:53` turns the doorbell into a scanner of its correspondent's
+/// own machine and LAN. Loopback and link-local can never be right coming
+/// from a peer. Private ranges *can* be right, since two houses on one LAN
+/// are the case section 6 exists for, but only when something other than
+/// the peer's own say-so vouches for the address; see
+/// [`Attempt::add_candidate`].
+fn is_globally_routable(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_private()
+                && !v4.is_unspecified()
+                && !v4.is_broadcast()
+                && !v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && !is_link_local_v6(v6)
+                && !is_unique_local_v6(v6)
+        }
+    }
+}
+
+/// `fe80::/10`, hand-rolled because `Ipv6Addr::is_unicast_link_local` is
+/// unstable.
+fn is_link_local_v6(addr: std::net::Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    segments
+        .first()
+        .is_some_and(|first| first & 0xffc0 == 0xfe80)
+}
+
+/// `fc00::/7`, hand-rolled because `Ipv6Addr::is_unique_local` is unstable.
+fn is_unique_local_v6(addr: std::net::Ipv6Addr) -> bool {
+    addr.octets()
+        .first()
+        .is_some_and(|first| first & 0xfe == 0xfc)
+}
+
 // ----------------------------------------------------------------------
 // The candidate table and the upgrade rule (section 2 steps 4 to 7)
 // ----------------------------------------------------------------------
@@ -611,22 +713,48 @@ pub struct Winner {
 /// It owns no clock and no socket: every method takes the `now` the caller
 /// read and returns what to send, so the whole of section 2's timing is
 /// exercised by the tests below without a sleep, a timer or any load.
-#[derive(Debug)]
 pub struct Attempt {
     id: [u8; 16],
     key: [u8; 32],
+    /// The peer's address as the gate observed it for this attempt (frame
+    /// 6's `peer_observed`), which is the one address a peer may name that
+    /// is not globally routable: the gate saw the packet come from it, so
+    /// it is not a third party this peer picked. See
+    /// [`Attempt::add_candidate`].
+    gate_reflected_peer: Option<SocketAddr>,
     fire_at: Option<Instant>,
     candidates: Vec<Candidate>,
     winner: Option<Winner>,
 }
 
+/// Redacted by hand rather than derived (Yseult's Note): `key` is the
+/// shared `probe_key`.
+impl std::fmt::Debug for Attempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Attempt")
+            .field("id", &hex16(&self.id))
+            .field("key", &"<redacted>")
+            .field("candidates", &self.candidates.len())
+            .field("winner", &self.winner)
+            .finish()
+    }
+}
+
 impl Attempt {
     /// A fresh attempt with no candidates and no start signal yet.
+    ///
+    /// `gate_reflected_peer` is the peer's address as the gate observed it
+    /// for this attempt (frame 6's `peer_observed`). It is the one
+    /// non-globally-routable address the peer is allowed to name, because
+    /// the gate saw a packet arrive from it rather than taking the peer's
+    /// word; `None` means the peer may name only globally routable
+    /// addresses.
     #[must_use]
-    pub fn new(id: [u8; 16], key: [u8; 32]) -> Self {
+    pub fn new(id: [u8; 16], key: [u8; 32], gate_reflected_peer: Option<SocketAddr>) -> Self {
         Self {
             id,
             key,
+            gate_reflected_peer,
             fire_at: None,
             candidates: Vec::new(),
             winner: None,
@@ -639,12 +767,30 @@ impl Attempt {
         self.id
     }
 
-    /// Adds a candidate, returning `false` if it is a duplicate or the
-    /// [`MAX_CANDIDATES`] cap is already reached.
+    /// Adds a candidate, returning `false` if it is a duplicate, the
+    /// [`MAX_CANDIDATES`] cap is already reached, or the address is one a
+    /// peer may not point this house at.
+    ///
+    /// **What a peer may name** (Yseult's Medium). An address this house
+    /// gathered for itself, or discovered on its own network, is trusted
+    /// because this house found it. An address the *peer* named is trusted
+    /// only if the wider internet could have routed it here, or if it is
+    /// exactly the address the gate observed that peer at for this attempt,
+    /// which is the same-LAN case section 6 exists for and which the gate,
+    /// not the peer, vouches for. Anything else, a peer naming
+    /// `127.0.0.1:631` or a router on this house's LAN, is refused: 16
+    /// candidates at about 37 probes each is a scan, and a keyed hash does
+    /// not make it not one.
     pub fn add_candidate(&mut self, addr: SocketAddr, source: CandidateSource) -> bool {
         if self.candidates.len() >= MAX_CANDIDATES
             || !is_probeable(addr)
             || self.candidates.iter().any(|c| c.addr == addr)
+        {
+            return false;
+        }
+        if source == CandidateSource::PeerReported
+            && !is_globally_routable(addr)
+            && self.gate_reflected_peer != Some(addr)
         {
             return false;
         }
@@ -884,6 +1030,70 @@ pub const LIVE_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// which is when traffic moves back to the relay.
 pub const LIVE_PROBES_TO_STALE: u32 = 3;
 
+/// The ceiling on pongs one attempt will emit per second (Yseult's Medium).
+///
+/// A ping carries no timestamp and its tx id is meaningful only to the side
+/// that drew it, so one captured ping replays for the life of the attempt
+/// from any spoofed source, and `pong_for` answers a non-candidate by
+/// design, since that is how a peer behind a symmetric NAT is heard from at
+/// all. Answering is 1:1 so there is no amplification, but it is an
+/// uncapped source-laundering reflector without a ceiling. Legitimate load
+/// is one ping per 100 ms per attempt, so ten a second; 64 is six times
+/// that and still a hard ceiling.
+pub const PONG_ANSWERS_PER_SECOND: u32 = 64;
+
+/// How many answered tx ids one attempt remembers, so a replayed ping is
+/// answered once and not again. 4096 covers every ping a legitimate attempt
+/// can send (10 a second for 10 seconds, per candidate, is 1600 at the
+/// 16-candidate cap for the far side's whole burst) and bounds the set at
+/// 4096 * 8 bytes.
+pub const ANSWERED_TX_MEMORY: usize = 4096;
+
+/// A token bucket over one-second windows, and the set of tx ids already
+/// answered, which together stop a captured ping being replayed into an
+/// unbounded reflector.
+#[derive(Debug)]
+struct PongLimiter {
+    window_start: Instant,
+    answered_in_window: u32,
+    seen: std::collections::HashSet<[u8; 8]>,
+    order: std::collections::VecDeque<[u8; 8]>,
+}
+
+impl PongLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            answered_in_window: 0,
+            seen: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Whether a ping with this tx id may be answered now: once per tx id,
+    /// and at most [`PONG_ANSWERS_PER_SECOND`] in any one-second window.
+    fn may_answer(&mut self, tx: [u8; 8], now: Instant) -> bool {
+        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+            self.window_start = now;
+            self.answered_in_window = 0;
+        }
+        if self.answered_in_window >= PONG_ANSWERS_PER_SECOND {
+            return false;
+        }
+        if !self.seen.insert(tx) {
+            return false;
+        }
+        self.order.push_back(tx);
+        while self.order.len() > ANSWERED_TX_MEMORY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.answered_in_window = self.answered_in_window.saturating_add(1);
+        true
+    }
+}
+
 /// What a house needs to know before it can run the doorbell for one peer.
 #[derive(Debug, Clone)]
 pub struct DoorbellParams {
@@ -898,6 +1108,10 @@ pub struct DoorbellParams {
     /// This house's own candidate addresses, already gathered
     /// ([`gather`]).
     pub candidates: Vec<SocketAddr>,
+    /// The peer's address as the gate observed it for this attempt (frame
+    /// 6's `peer_observed`), which is the one address outside the globally
+    /// routable range the peer may name. See [`Attempt::add_candidate`].
+    pub peer_observed: Option<SocketAddr>,
 }
 
 /// A live doorbell's one control: whether it still answers pings.
@@ -1081,7 +1295,14 @@ pub async fn run_doorbell(
     };
     let key = probe_key(&attempt, &half_initiator, &half_responder);
 
-    let mut state = Attempt::new(attempt, key);
+    // Arming the key is what lets the porch socket queue this attempt's
+    // probes at all: anything not authenticating under an armed key is
+    // dropped and counted there rather than queued (Yseult's High). The
+    // guard disarms on every exit, including an error return, so a
+    // finished attempt cannot leave a key live.
+    let _armed = ArmedProbeKey::arm(porch, attempt, key);
+
+    let mut state = Attempt::new(attempt, key, params.peer_observed);
     for addr in peer_addrs {
         if let Some(addr) = addr.to_socket_addr() {
             state.add_candidate(addr, CandidateSource::PeerReported);
@@ -1108,6 +1329,7 @@ pub async fn run_doorbell(
     let mut live_misses = 0u32;
     let mut live_outstanding: Option<[u8; 8]> = None;
     let mut live_last_sent: Option<Instant> = None;
+    let mut pongs = PongLimiter::new(Instant::now());
 
     loop {
         let now = Instant::now();
@@ -1168,27 +1390,35 @@ pub async fn run_doorbell(
         // roughly its true round trip rather than rounded up to the next
         // schedule point.
         let mut decided = None;
-        while let Some((from, bytes)) = porch.try_recv_probe() {
-            let Some(probe) = Probe::decode(&bytes, &key) else {
-                continue;
-            };
+        while let Some((from, probe)) = porch.try_recv_probe() {
             if probe.attempt != attempt {
                 continue;
             }
+            let arrived = Instant::now();
             match probe.kind {
                 PROBE_PING => {
-                    if control.answering() {
+                    // Answered once per tx id and at most
+                    // `PONG_ANSWERS_PER_SECOND`, so a captured ping cannot
+                    // be replayed into a reflector (Yseult's Medium).
+                    if control.answering() && pongs.may_answer(probe.tx, arrived) {
                         let _ = porch.send_probe(from, &state.pong_for(&probe, from));
                     }
                 }
                 _ => {
-                    if outcome.upgraded_to.is_some() {
-                        if live_outstanding == Some(probe.tx) {
+                    if let Some(winner) = outcome.upgraded_to {
+                        // The source must be the live path itself
+                        // (Yseult's Low): a pong arriving over the relay,
+                        // or from anywhere else, would hold a dead direct
+                        // path up indefinitely.
+                        if from == winner && live_outstanding == Some(probe.tx) {
+                            if let (Some(path), Some(sent)) = (path.as_ref(), live_last_sent) {
+                                path.record_rtt(arrived.duration_since(sent));
+                            }
                             live_outstanding = None;
                             live_misses = 0;
                         }
                     } else {
-                        state.on_pong(from, &probe, Instant::now());
+                        state.on_pong(from, &probe, arrived);
                     }
                 }
             }
@@ -1202,6 +1432,11 @@ pub async fn run_doorbell(
             // out, and the relay session stays open but idle.
             if let Some(path) = path.as_ref() {
                 path.upgrade_to(winner.addr);
+                // Section 3: the new path's smoothed RTT is seeded from its
+                // own first sample, which is the winning probe's, rather
+                // than left `None` until the first live probe answers
+                // (Konrad's should 4).
+                path.record_rtt(winner.rtt);
             }
             outcome.upgraded_to = Some(winner.addr);
             live_last_sent = Some(Instant::now());
@@ -1224,6 +1459,31 @@ pub async fn run_doorbell(
             () = tokio::time::sleep(Duration::from_millis(20)) => {}
             _ = peer.closed() => return Ok(outcome),
         }
+    }
+}
+
+/// Arms an attempt's probe key on the porch socket for as long as the
+/// attempt runs, and disarms it on drop, whichever way `run_doorbell`
+/// leaves.
+struct ArmedProbeKey<'a> {
+    porch: &'a std::sync::Arc<crate::sock::PorchSocket>,
+    attempt: [u8; 16],
+}
+
+impl<'a> ArmedProbeKey<'a> {
+    fn arm(
+        porch: &'a std::sync::Arc<crate::sock::PorchSocket>,
+        attempt: [u8; 16],
+        key: [u8; 32],
+    ) -> Self {
+        porch.arm_probe_key(attempt, key);
+        Self { porch, attempt }
+    }
+}
+
+impl Drop for ArmedProbeKey<'_> {
+    fn drop(&mut self) {
+        self.porch.disarm_probe_key(&self.attempt);
     }
 }
 
@@ -1452,7 +1712,7 @@ mod tests {
     /// the first probes fire exactly `FIRE_IN_MS` later, not on receipt.
     #[test]
     fn nothing_fires_before_the_start_signal_plus_fire_in_ms() {
-        let mut attempt = Attempt::new(ID, KEY);
+        let mut attempt = Attempt::new(ID, KEY, None);
         let mut tx = tx_counter();
         assert!(attempt.add_candidate(addr(4433), CandidateSource::Local));
         let t0 = Instant::now();
@@ -1481,7 +1741,7 @@ mod tests {
     /// the slow phase fails.
     #[test]
     fn the_probe_schedule_is_fast_for_three_seconds_then_slow_then_given_up() {
-        let mut attempt = Attempt::new(ID, KEY);
+        let mut attempt = Attempt::new(ID, KEY, None);
         let mut tx = tx_counter();
         attempt.add_candidate(addr(4433), CandidateSource::Local);
         let t0 = Instant::now();
@@ -1531,7 +1791,7 @@ mod tests {
     /// together and the candidate wins on a path that dropped a probe.
     #[test]
     fn three_consecutive_answers_win_and_a_lost_probe_resets_the_streak() {
-        let mut attempt = Attempt::new(ID, KEY);
+        let mut attempt = Attempt::new(ID, KEY, None);
         let mut tx = tx_counter();
         let candidate = addr(4433);
         attempt.add_candidate(candidate, CandidateSource::PeerReported);
@@ -1598,7 +1858,7 @@ mod tests {
     /// candidate, which is first in the table, then takes the path.
     #[test]
     fn a_tie_at_three_is_broken_by_the_lowest_round_trip() {
-        let mut attempt = Attempt::new(ID, KEY);
+        let mut attempt = Attempt::new(ID, KEY, None);
         let mut tx = tx_counter();
         let slow = addr(4433);
         let fast = addr(4434);
@@ -1653,7 +1913,7 @@ mod tests {
     /// that does not exist.
     #[test]
     fn a_symmetric_nat_forces_the_relay_inside_the_probe_deadline() {
-        let mut attempt = Attempt::new(ID, KEY);
+        let mut attempt = Attempt::new(ID, KEY, None);
         let mut tx = tx_counter();
         for port in 0..4u16 {
             attempt.add_candidate(addr(4433 + port), CandidateSource::PeerReported);
@@ -1695,7 +1955,7 @@ mod tests {
 
     #[test]
     fn a_failed_path_clears_the_winner_so_a_fresh_attempt_reruns_everything() {
-        let mut attempt = Attempt::new(ID, KEY);
+        let mut attempt = Attempt::new(ID, KEY, None);
         let mut tx = tx_counter();
         let candidate = addr(4433);
         attempt.add_candidate(candidate, CandidateSource::Local);
@@ -1717,7 +1977,7 @@ mod tests {
 
     #[test]
     fn the_candidate_table_caps_at_sixteen_and_refuses_duplicates() {
-        let mut attempt = Attempt::new(ID, KEY);
+        let mut attempt = Attempt::new(ID, KEY, None);
         for port in 0..MAX_CANDIDATES as u16 {
             assert!(attempt.add_candidate(addr(4433 + port), CandidateSource::Local));
         }
@@ -1728,9 +1988,94 @@ mod tests {
         assert_eq!(attempt.source_of(addr(9999)), None);
     }
 
+    /// Yseult's Medium: a peer may not aim this house's probe burst at
+    /// this house's own machine or its LAN. What it may name is what the
+    /// internet could have routed here, plus exactly the address the gate
+    /// observed it at for this attempt, which the gate vouches for and the
+    /// peer does not.
+    ///
+    /// Deliberate break to fail this test: in `Attempt::add_candidate`,
+    /// delete the `source == CandidateSource::PeerReported && ...` block.
+    /// The loopback, link-local, RFC1918 and ULA addresses are then all
+    /// accepted from the peer.
+    #[test]
+    fn a_peer_may_not_name_a_loopback_link_local_or_private_candidate() {
+        let reflected: SocketAddr = "192.168.7.7:4433".parse().unwrap();
+        let mut attempt = Attempt::new(ID, KEY, Some(reflected));
+        for refused in [
+            "127.0.0.1:631",
+            "169.254.1.1:4433",
+            "192.168.1.1:53",
+            "10.0.0.1:4433",
+            "172.16.0.1:4433",
+            "[::1]:4433",
+            "[fe80::1]:4433",
+            "[fd00::1]:4433",
+        ] {
+            let addr: SocketAddr = refused.parse().unwrap();
+            assert!(
+                !attempt.add_candidate(addr, CandidateSource::PeerReported),
+                "{refused} must be refused from a peer"
+            );
+        }
+        // The gate's own reflection of this peer for this attempt is the
+        // exception, which is the same-LAN case section 6 exists for.
+        assert!(attempt.add_candidate(reflected, CandidateSource::PeerReported));
+        // A globally routable address the peer names is fine.
+        assert!(attempt.add_candidate(addr(4433), CandidateSource::PeerReported));
+        // And this house's own gathering is trusted, because this house
+        // found it rather than being told it.
+        assert!(
+            attempt.add_candidate("192.168.1.50:4433".parse().unwrap(), CandidateSource::Local)
+        );
+        assert!(attempt.add_candidate(
+            "[fd00::9]:4433".parse().unwrap(),
+            CandidateSource::Discovery
+        ));
+        assert_eq!(attempt.candidate_count(), 4);
+
+        // With no gate reflection to vouch for anything, a peer gets only
+        // globally routable addresses.
+        let mut bare = Attempt::new(ID, KEY, None);
+        assert!(!bare.add_candidate(reflected, CandidateSource::PeerReported));
+    }
+
+    /// Yseult's Medium: a captured ping replays for the life of an
+    /// attempt from any spoofed source, so answering is capped and each tx
+    /// id is answered once.
+    ///
+    /// Deliberate break to fail this test: in `PongLimiter::may_answer`,
+    /// change `if !self.seen.insert(tx)` to `self.seen.insert(tx);` with no
+    /// early return. The replayed tx id is then answered every time and the
+    /// first assertion fails.
+    #[test]
+    fn a_replayed_ping_is_answered_once_and_answers_are_capped_per_second() {
+        let t0 = Instant::now();
+        let mut limiter = PongLimiter::new(t0);
+        assert!(limiter.may_answer([1u8; 8], t0));
+        assert!(
+            !limiter.may_answer([1u8; 8], t0 + Duration::from_millis(10)),
+            "the same tx id is answered once"
+        );
+
+        // The per-second ceiling, counted across distinct tx ids.
+        let mut answered = 1u32;
+        for i in 0..u32::from(u16::MAX) {
+            let mut tx = [0u8; 8];
+            tx[..4].copy_from_slice(&(i + 2).to_be_bytes());
+            if limiter.may_answer(tx, t0 + Duration::from_millis(500)) {
+                answered += 1;
+            }
+        }
+        assert_eq!(answered, PONG_ANSWERS_PER_SECOND);
+
+        // The window rolls, and the budget with it.
+        assert!(limiter.may_answer([9u8; 8], t0 + Duration::from_millis(1001)));
+    }
+
     #[test]
     fn srtt_seeds_on_the_first_sample_and_smooths_after_it() {
-        let mut attempt = Attempt::new(ID, KEY);
+        let mut attempt = Attempt::new(ID, KEY, None);
         let mut tx = tx_counter();
         let candidate = addr(4433);
         attempt.add_candidate(candidate, CandidateSource::Local);

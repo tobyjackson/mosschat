@@ -22,7 +22,7 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::authed::{self, AuthedConnection};
 use crate::gate::wire::{self, Addr, Frame};
-use crate::gate::{GateError, SeenSet, now_ms, within_freshness_window};
+use crate::gate::{GateError, SeenSet, limits, now_ms, within_freshness_window};
 use crate::lockext::LockExt;
 use crate::sock::{self, PorchSocket};
 
@@ -358,6 +358,17 @@ struct Inner {
     /// discarded, so a house could learn either only out of band).
     registered_observed: std::net::SocketAddr,
     registered_secondary_port: u16,
+    /// The sessions this house actually holds, from its own `Introduce` or
+    /// from an `Introduction` following a `Knock` it accepted.
+    ///
+    /// A `Start` naming anything else is ignored (Yseult's Medium): the
+    /// gate supplies the session id, so `entry(session).or_default()` on
+    /// every `Start` let a hostile gate walk session ids and grow this map
+    /// without bound. Bounded by
+    /// [`limits::MAX_SESSIONS_PER_REGISTRATION`], which is the gate's own
+    /// cap on how many a registration may hold, with each session's
+    /// `peer_observed` beside it.
+    sessions: StdMutex<HashMap<u32, std::net::SocketAddr>>,
     starts: StdMutex<HashMap<u32, StartSlot>>,
 }
 
@@ -536,6 +547,7 @@ impl GateClient {
             auto_answer_knocks: std::sync::atomic::AtomicBool::new(true),
             registered_observed,
             registered_secondary_port,
+            sessions: StdMutex::new(HashMap::new()),
             starts: StdMutex::new(HashMap::new()),
         });
 
@@ -545,6 +557,23 @@ impl GateClient {
         });
 
         Ok(Self { inner })
+    }
+
+    /// The peer's gate-observed address for `session`, if this house holds
+    /// that session. It is frame 6's `peer_observed`, and the doorbell
+    /// needs it because it is the one address outside the globally routable
+    /// range a peer may name as a candidate.
+    #[must_use]
+    pub fn peer_observed_for(&self, session: u32) -> Option<std::net::SocketAddr> {
+        self.inner.sessions.lock_or_recover().get(&session).copied()
+    }
+
+    /// How many `Start` slots are outstanding, for tests: a slot exists
+    /// only between a wait being registered and the signal arriving, and a
+    /// taken or timed-out one leaves nothing behind.
+    #[must_use]
+    pub fn pending_start_slots(&self) -> usize {
+        self.inner.starts.lock_or_recover().len()
     }
 
     /// This house's public key.
@@ -694,6 +723,9 @@ impl GateClient {
             let mut starts = self.inner.starts.lock_or_recover();
             let slot = starts.entry(session).or_default();
             if let Some(signal) = slot.received.take() {
+                // Taken, so the slot is gone: nothing is left behind on the
+                // success path either (Konrad's should 6).
+                starts.remove(&session);
                 return Ok(signal);
             }
             let (tx, rx) = oneshot::channel();
@@ -755,6 +787,8 @@ impl GateClient {
             Ok(Ok(outcome)) => {
                 let synthetic = self.synthetic_addr_for(&peer_key);
                 self.inner
+                    .remember_session(outcome.session, outcome.peer_observed.to_socket_addr());
+                self.inner
                     .porch
                     .register_relay_session(outcome.session, synthetic);
                 // Section 2 step 2: the peer starts relayed, so its path
@@ -782,6 +816,22 @@ pub fn pair_tag(community: &[u8; 32], a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     input.extend_from_slice(lo);
     input.extend_from_slice(hi);
     *blake3::hash(&input).as_bytes()
+}
+
+impl Inner {
+    /// Records a session this house holds, bounded by the gate's own cap on
+    /// sessions per registration.
+    fn remember_session(&self, session: u32, peer_observed: Option<std::net::SocketAddr>) {
+        let mut sessions = self.sessions.lock_or_recover();
+        if sessions.len() >= limits::MAX_SESSIONS_PER_REGISTRATION
+            && !sessions.contains_key(&session)
+        {
+            return;
+        }
+        if let Some(peer_observed) = peer_observed {
+            sessions.insert(session, peer_observed);
+        }
+    }
 }
 
 async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
@@ -815,6 +865,7 @@ async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
                     let peer_key = { inner.pending_accepts.lock_or_recover().remove(&tag) };
                     if let Some(peer_key) = peer_key {
                         let synthetic = sock::synthetic_addr(inner.process_salt, &peer_key);
+                        inner.remember_session(session, peer_observed.to_socket_addr());
                         inner.porch.register_relay_session(session, synthetic);
                         inner.porch.insert_relay_path(peer_key, synthetic);
                     }
@@ -834,6 +885,12 @@ async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
                 gate_ms,
                 ..
             } => {
+                // Only for a session this house actually holds. The gate
+                // chooses session ids, so accepting a `Start` for any id it
+                // names is a map this house does not control the size of.
+                if !inner.sessions.lock_or_recover().contains_key(&session) {
+                    continue;
+                }
                 let signal = StartSignal {
                     session,
                     fire_in_ms,
@@ -841,9 +898,15 @@ async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
                     received_at: std::time::Instant::now(),
                 };
                 let mut starts = inner.starts.lock_or_recover();
+                if starts.len() >= limits::MAX_SESSIONS_PER_REGISTRATION
+                    && !starts.contains_key(&session)
+                {
+                    continue;
+                }
                 let slot = starts.entry(session).or_default();
                 match slot.waiter.take() {
                     Some(waiter) => {
+                        starts.remove(&session);
                         let _ = waiter.send(signal);
                     }
                     None => slot.received = Some(signal),

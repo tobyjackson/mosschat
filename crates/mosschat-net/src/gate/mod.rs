@@ -195,6 +195,17 @@ pub mod limits {
     /// not be, since the real socket is what feeds the queue. Konrad's
     /// merge review of PR #17 flagged the mismatch.)
     pub const INBOUND_RELAY_QUEUE_CAP: usize = 1024;
+    /// The bound on the porch socket's inbound *probe* queue (`sock.rs`).
+    ///
+    /// Section 3 bounds the relay queue at 1024 and is silent about this
+    /// one, which did not exist when it was written; the smaller reading is
+    /// the same number, and it is generous here, one probe being 81 bytes
+    /// against the relay queue's 1200, so a full probe queue is 81 KiB.
+    /// The queue is fed only by probes whose keyed hash already verified
+    /// under a currently armed attempt key, so filling it needs the shared
+    /// `probe_key`, which crossed the gate inside the end to end TLS; the
+    /// cap is the second line, not the first.
+    pub const INBOUND_PROBE_QUEUE_CAP: usize = 1024;
 }
 
 /// The gate's member list: ed25519 public keys read from a file, one 64

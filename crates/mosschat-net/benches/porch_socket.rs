@@ -54,6 +54,20 @@ async fn bench_porch_socket() -> Result<Duration, Box<dyn Error>> {
     let receiver_addr = receiver_std.local_addr()?;
     let porch = PorchSocket::new(receiver_std)?;
 
+    // Konrad's should 3: measure the configuration a running house is in,
+    // not the empty one. An unarmed socket with an empty allow-list and an
+    // empty path table short-circuits both lookups on the receive path, so
+    // timing it says nothing about what section 3's drop rule costs. So:
+    // the rule armed, a gate address allowed (which is what the sender
+    // stands in for here), and one peer already on a proved direct path, so
+    // `classify_source` does the allow-list hit *and* the path table is
+    // non-empty behind it.
+    porch.allow_source(sender.local_addr()?);
+    porch
+        .insert_relay_path([9u8; 32], "[fd00::9]:1".parse()?)
+        .upgrade_to("203.0.113.9:4433".parse()?);
+    porch.arm();
+
     let mut samples = Vec::with_capacity(ITERATIONS);
     let mut buf = [0u8; 1500];
     for _ in 0..ITERATIONS {
