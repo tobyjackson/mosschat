@@ -1,0 +1,20 @@
+# x86_64-unknown-linux-musl: force the fully static (crt-static) build the
+# artifacts-linux job's musl leg in .github/workflows/ci.yml uploads, so the
+# binary has no dynamic linker interpreter at all and runs on musl-only
+# distros with no glibc present (Toby's hewn-pc). Kept here rather than as a
+# one-off RUSTFLAGS in the workflow so `cargo build --target
+# x86_64-unknown-linux-musl` behaves identically for CI and for anyone
+# building the same target locally.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# ring and blake3 both carry a `cc` build-dependency that compiles C/asm for
+# performance; cross-compiling from the ubuntu-latest glibc host to a musl
+# target needs a musl-targeted C compiler. musl-tools' musl-gcc wrapper
+# covers it; naming the target-suffixed env var here (rather than in the
+# workflow) means the same `cargo build --target x86_64-unknown-linux-musl`
+# works unmodified on any machine that has musl-gcc on PATH. Harmless for
+# every other target: the `cc` crate only reads this var when actually
+# compiling for x86_64-unknown-linux-musl.
+[env]
+CC_x86_64_unknown_linux_musl = "musl-gcc"
