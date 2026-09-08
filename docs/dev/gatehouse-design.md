@@ -70,7 +70,7 @@ opaque `Relay` payloads.
 | 13 | `Relay` (datagram, not a frame) | `[0x01][session: u32 BE][payload]`, payload cap 1200 bytes | H to G and G to H | Every packet of a relayed peer connection. |
 | 14 | `Knock` | `v: u8`, `tag: bytes[32]`, `ttl_s: u16`, `sealed: bytes` | G to H | The gate matched an `Introduce` tag against this registration and forwarded its `sealed` verbatim. It names no key and no address. |
 | 15 | `KnockAnswer` | `v: u8`, `tag: bytes[32]`, `accept: bool` | H to G | Reply to 14, decided by the receiving house alone. Decline and timeout look the same to the asker. |
-| 16 | `Candidates` | `v: u8`, `attempt: bytes[16]`, `addrs: [Addr]` cap 16, `probe_half: bytes[32]` | both ways | First frame each way on the porch stream. |
+| 16 | `Candidates` | `v: u8`, `attempt: bytes[16]`, `addrs: [Addr]` cap 16, `probe_half: bytes[32]`, `no_upgrade: bool` | both ways | First frame each way on the porch stream. `no_upgrade` (amendment 4) says this side will not probe this attempt, so neither side waits on a start signal nobody will ask for. |
 | 17 | `PathUp` | `v: u8`, `attempt: bytes[16]`, `addr: Addr`, `rtt_us: u32` | both ways | The sender has moved its outbound traffic for this peer to `addr`. |
 | 18 | `PathDown` | `v: u8`, `attempt: bytes[16]`, `addr: Addr`, `reason: u8` | both ways | The sender has moved back to the relay. |
 | 19 | `Goodbye` | `v: u8`, `reason: u8` | both ways | Clean exit, so the peer goes straight to dead without passing through stale (section 4). |
@@ -189,7 +189,10 @@ itself, fall back on failure. Nothing waits on a hole punch.
  the Phase 1 target is a first relayed packet under 1 second, knock included.
 3. **Exchange.** `Candidates` each way on the porch stream, inside the sealed connection, so the gate sees candidate
  lists as ciphertext. Each side contributes 32 random bytes and both derive `probe_key = BLAKE3("mosschat-probe-v1"
- || attempt || half_initiator || half_responder)`.
+ || attempt || half_initiator || half_responder)`. The frame also carries `no_upgrade` (amendment 4): a side that has
+ been told not to punch says so here, before the start signal, and a side that reads it skips steps 4 to 6 and records
+ `punch_disabled` rather than waiting out a start that was never requested. The lists are still exchanged both ways, so
+ both records still show what would have been probed.
 4. **Start.** Either side sends `StartRequest`; the gate sends `Start` to both back to back with `fire_in_ms = 200`,
  and each fires 200 ms after receiving it. No clock is synchronised: the skew is the difference in the two one way
  delays from the gate, tens of milliseconds, and research B only needs both first packets inside the same few
@@ -566,3 +569,33 @@ times, and every one of those is a property of a visit under way. Five changes, 
   `no_candidates` name failures that did not happen, and `internal` is this design's catch-all for a failure it cannot name,
   which is the opposite of a path taken on purpose. A record written before this amendment still reads: every new field is
   optional on the way in.
+
+**Amendment 4, continued: what review changed in it** (Yseult and Wystan on PRs 79 and 80, same day). Six corrections, each
+against the bullet above it that was wrong or thin.
+
+- **`--no-punch` is on the wire**, as frame 16's `no_upgrade` above. It was local to the side that held the flag, so the peer
+  waited out the 10 second start window for a `Start` nobody had asked for and recorded `start_signal` failed and `internal`
+  as its reason: a failure that did not happen, in the field this amendment exists to make trustworthy. WO-1.5 case (e) puts
+  the flag on the caller alone, so this was the row's ordinary shape rather than an edge.
+- **Gathering does rerun**, as step 7 says. The rerun re-offered the list the caller gathered before the path died, which
+  cannot contain the address a machine has after a local address change, so case (f)'s recovery was structurally unreachable.
+  A rerun now offers the union of that list and a fresh gather, keeping what only the caller knew and adding what only this
+  moment knows. The 1 second interface poll section 4 specifies is still not implemented: a rerun picks up a new address
+  because the path died, which in case (f) is the same event.
+- **The reason a held visit ends with describes what happened, not which timer won.** A hold shorter than section 2 step 5's
+  ten second give-up ended before anything had set a reason, and the fall-through said `path_idle_timeout`, whose own
+  definition is a path that was had and lost. A visit that never upgraded now reports what the give-up branch would have
+  reported (`no_candidates`, or section 7's probe-failure inference), and `path_idle_timeout` is reserved for a visit that
+  actually had a direct path.
+- **A house holds at most 8 visits, and at most 2 from one peer.** One relay session carries as many end to end connections
+  as its peer opens, so the gate's cap on sessions bounded nothing here: an accepted friend could spawn a task, a record and
+  a stdout line per connection. Past either cap the dial is refused, the connection closed, and a `refused` event printed,
+  which is a tenth name in the event vocabulary above and stdout only, a refused dial having no attempt and so no record.
+  The same event says when an introduction never arrived and how many gate events had to be dropped, which was silent.
+- **`Hold::For` is clamped at a day**, and `doctor` refuses a longer `--hold` at the command line before any network work. An
+  unbounded value overflowed the deadline arithmetic and panicked after the visit was already open, in a crate that forbids
+  panics, or degraded into "hold forever" through a `checked_add` that quietly returned `None`.
+- **Text from off the machine is capped and stripped before it reaches a house's stdout**, the same two rules the gate's own
+  text already gets: a peer's QUIC close reason is bytes it chose, and it reached an operator's log through a visit that
+  ended before it opened. The `goodbye` event is also stamped when the frame is sent rather than after its acknowledgement,
+  which inflated it by up to a second in exactly the case a reader correlates two logs for: a peer that had already gone.

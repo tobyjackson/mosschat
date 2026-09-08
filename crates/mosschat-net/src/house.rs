@@ -46,6 +46,29 @@ use crate::punch::{DoorbellControl, DoorbellParams, Hold, VisitEventSink, run_do
 /// behind it is refused rather than held.
 const SESSION_WAIT: Duration = Duration::from_secs(5);
 
+/// How many visits this house holds at once.
+///
+/// Section 1 caps a registration at 8 live sessions at the gate, so 8 is
+/// the ceiling the protocol already imposes on how many peers can have
+/// been introduced to this house at one time. It is not a ceiling on
+/// *connections*: one relay session carries as many end to end QUIC
+/// connections as its peer opens, quinn demultiplexes them by connection
+/// id, and the porch presents every one of them at the same synthetic
+/// address, so without this an accepted friend could spawn a task, a
+/// recorder and a stdout line per connection for as long as it liked
+/// (Yseult's Medium 1). Past it a dial is refused, said so on stdout, and
+/// the connection closed.
+pub const MAX_LIVE_VISITS: usize = crate::gate::limits::MAX_SESSIONS_PER_REGISTRATION;
+
+/// How many visits one peer holds at once.
+///
+/// 2, not 1: a peer that reconnects while its previous visit is still
+/// tearing down is ordinary, and refusing that would make a flapping
+/// friend unreachable. More than that is not something this design has a
+/// use for, and letting one friend fill all [`MAX_LIVE_VISITS`] slots is
+/// letting it lock every other friend out of a house that is home.
+pub const MAX_VISITS_PER_PEER: usize = 2;
+
 /// How long a stopping house gives its visits to say goodbye.
 ///
 /// Each visit writes one frame and waits for its acknowledgement on the
@@ -211,6 +234,11 @@ pub async fn run(
     // ends, so this does not grow with uptime.
     let controls: Arc<Mutex<HashMap<u64, Arc<DoorbellControl>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // How many visits each peer currently holds, so one friend cannot
+    // fill every slot. Counted once its key is proven, which is the first
+    // moment there is a peer to count, and given back when the visit ends
+    // however it ends.
+    let peers: Arc<Mutex<HashMap<[u8; 32], usize>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut next_visit = 0u64;
     let mut visits = tokio::task::JoinSet::new();
     let endpoint = client.endpoint();
@@ -242,6 +270,24 @@ pub async fn run(
             }
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
+                let live = controls.lock_or_recover().len();
+                if live >= MAX_LIVE_VISITS {
+                    // Refused before a handshake is spent on it, and said
+                    // out loud: a house that quietly stopped answering
+                    // would look to its friends exactly like a house that
+                    // had gone away.
+                    incoming.refuse();
+                    emit(
+                        &events,
+                        VisitEventKind::Refused,
+                        None,
+                        format!(
+                            "no room: this house already holds {live} visits, the most it will \
+                             ({MAX_LIVE_VISITS})"
+                        ),
+                    );
+                    continue;
+                }
                 let control = DoorbellControl::new();
                 let id = next_visit;
                 next_visit = next_visit.saturating_add(1);
@@ -250,12 +296,14 @@ pub async fn run(
                     id,
                     client: Arc::clone(&client),
                     sessions: Arc::clone(&sessions),
+                    peers: Arc::clone(&peers),
                     controls: Arc::clone(&controls),
                     events: Arc::clone(&events),
                     sink: sink.clone(),
                     salt,
                     no_punch: config.no_punch,
                     control,
+                    counted: Mutex::new(None),
                 };
                 visits.spawn(async move { visit.run(incoming).await });
             }
@@ -290,39 +338,103 @@ struct Visit {
     id: u64,
     client: Arc<GateClient>,
     sessions: Arc<Mutex<HashMap<[u8; 32], u32>>>,
+    peers: Arc<Mutex<HashMap<[u8; 32], usize>>>,
     controls: Arc<Mutex<HashMap<u64, Arc<DoorbellControl>>>>,
     events: HouseEventSink,
     sink: Option<Arc<DiagSink>>,
     salt: InstallSalt,
     no_punch: bool,
     control: Arc<DoorbellControl>,
+    /// The peer this visit charged a slot to, once its key was proven, so
+    /// [`Visit::run`] gives back exactly what [`Visit::serve`] took and
+    /// nothing when it took nothing.
+    counted: Mutex<Option<[u8; 32]>>,
 }
 
 impl Visit {
     /// Accepts `incoming`, runs the doorbell for it as the responder, and
-    /// takes its control out of the house's table however it ends.
+    /// takes its control and its peer's slot out of the house's tables
+    /// however it ends.
     async fn run(self, incoming: quinn::Incoming) {
         let outcome = self.serve(incoming).await;
         if let Err(err) = outcome {
             // A failed visit is one visit, never the house: a peer that
             // dials and cannot finish a handshake must not take the
             // registration down with it.
+            //
+            // The text is capped and stripped (Yseult's Low 5): a
+            // `GateError::Connection` renders the peer's own QUIC close
+            // reason, which is up to a packet's worth of bytes it chose,
+            // and this line goes on a stdout the harness tells an
+            // operator to keep.
             emit(
                 &self.events,
-                VisitEventKind::Goodbye,
+                VisitEventKind::Refused,
                 None,
-                format!("the visit ended without opening: {err}"),
+                format!(
+                    "the visit ended without opening: {}",
+                    diag::safe_text(&err.to_string())
+                ),
             );
         }
         self.controls.lock_or_recover().remove(&self.id);
+        if let Some(peer_key) = self.counted.lock_or_recover().take() {
+            let mut peers = self.peers.lock_or_recover();
+            if let Some(held) = peers.get_mut(&peer_key) {
+                *held = held.saturating_sub(1);
+                if *held == 0 {
+                    peers.remove(&peer_key);
+                }
+            }
+        }
     }
 
     async fn serve(&self, incoming: quinn::Incoming) -> Result<(), GateError> {
         let (peer_key, connection) = self.client.accept_peer(incoming).await?;
         let peer = PeerFingerprint::from_key(&self.salt, &peer_key);
-        let session = self.wait_for_session(&peer_key).await.ok_or_else(|| {
-            GateError::Protocol("a peer dialled with no introduction behind it".into())
-        })?;
+        // The per-peer cap, taken the moment there is a proven key to
+        // charge it to. One friend must not be able to fill every slot
+        // this house has (Yseult's Medium 1).
+        {
+            let mut peers = self.peers.lock_or_recover();
+            let held = peers.entry(peer_key).or_insert(0);
+            if *held >= MAX_VISITS_PER_PEER {
+                let held = *held;
+                drop(peers);
+                connection.close(0u32.into(), b"too many visits from this peer");
+                emit(
+                    &self.events,
+                    VisitEventKind::Refused,
+                    Some(peer),
+                    format!(
+                        "no room for this peer: it already holds {held} visits, the most one \
+                         peer will ({MAX_VISITS_PER_PEER})"
+                    ),
+                );
+                return Ok(());
+            }
+            *held = held.saturating_add(1);
+        }
+        *self.counted.lock_or_recover() = Some(peer_key);
+        let Some(session) = self.wait_for_session(&peer_key).await else {
+            // The introduction never arrived. It is worth saying how many
+            // the client had to drop, because a full event queue is the
+            // one way this happens with nothing else wrong, and it was
+            // silent before (Yseult's Low 6).
+            connection.close(0u32.into(), b"no introduction for this dial");
+            emit(
+                &self.events,
+                VisitEventKind::Refused,
+                Some(peer),
+                format!(
+                    "no introduction arrived for this dial inside {} s ({} gate events dropped \
+                     so far)",
+                    SESSION_WAIT.as_secs(),
+                    self.client.events_dropped(),
+                ),
+            );
+            return Ok(());
+        };
 
         let recorder = Recorder::new(peer, self.sink.clone());
         diag::record(

@@ -261,6 +261,17 @@ pub enum PorchFrame {
         addrs: Vec<Addr>,
         /// This side's 32 random bytes of the [`probe_key`] input.
         probe_half: [u8; 32],
+        /// This side will not probe this attempt and asks the peer not to
+        /// either: `--no-punch`, WO-1.5 case (e) (design amendment 4).
+        ///
+        /// It rides `Candidates` rather than a frame of its own because
+        /// this is the moment the peer needs it: the start signal comes
+        /// next, and a peer told afterwards has already spent 10 seconds
+        /// waiting for a `Start` that was never asked for and recorded a
+        /// failure that did not happen. The candidate lists are still
+        /// exchanged both ways, so both records still show what would have
+        /// been probed.
+        no_upgrade: bool,
     },
     /// Frame 17, both ways: the sender has moved its outbound traffic for
     /// this peer to `addr`.
@@ -292,13 +303,18 @@ impl std::fmt::Debug for PorchFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Candidates {
-                v, attempt, addrs, ..
+                v,
+                attempt,
+                addrs,
+                no_upgrade,
+                ..
             } => f
                 .debug_struct("Candidates")
                 .field("v", v)
                 .field("attempt", &hex16(attempt))
                 .field("addrs", &addrs.len())
                 .field("probe_half", &"<redacted>")
+                .field("no_upgrade", no_upgrade)
                 .finish(),
             Self::PathUp {
                 v,
@@ -355,8 +371,9 @@ impl PorchFrame {
                 attempt,
                 addrs,
                 probe_half,
+                no_upgrade,
             } => {
-                enc.array(5).unwrap();
+                enc.array(6).unwrap();
                 enc.u8(T_CANDIDATES).unwrap();
                 enc.u8(*v).unwrap();
                 enc.bytes(attempt).unwrap();
@@ -365,6 +382,7 @@ impl PorchFrame {
                     enc.bytes(&addr_to_raw(*addr)).unwrap();
                 }
                 enc.bytes(probe_half).unwrap();
+                enc.bool(*no_upgrade).unwrap();
             }
             Self::PathUp {
                 v,
@@ -420,7 +438,7 @@ impl PorchFrame {
             .ok_or_else(|| DecodeError::message("porch frame must be a definite-length array"))?;
         let frame_type = dec.u8()?;
         let frame = match (frame_type, len) {
-            (T_CANDIDATES, 5) => {
+            (T_CANDIDATES, 6) => {
                 let v = dec.u8()?;
                 let attempt = read_16(&mut dec)?;
                 let count = dec.array()?.ok_or_else(|| {
@@ -434,11 +452,13 @@ impl PorchFrame {
                     addrs.push(read_addr(&mut dec)?);
                 }
                 let probe_half = read_32(&mut dec)?;
+                let no_upgrade = dec.bool()?;
                 Self::Candidates {
                     v,
                     attempt,
                     addrs,
                     probe_half,
+                    no_upgrade,
                 }
             }
             (T_PATH_UP, 5) => Self::PathUp {
@@ -1417,7 +1437,7 @@ pub enum Hold {
     #[default]
     UntilAttemptSettles,
     /// Hold the visit open for this long, then say goodbye
-    /// (`doctor --friend --hold <seconds>`).
+    /// (`doctor --friend --hold <seconds>`), clamped at [`MAX_HOLD`].
     For(Duration),
     /// Hold it open until the peer leaves or this house is asked to stop
     /// (`mosschat house --headless`).
@@ -1496,6 +1516,21 @@ pub const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// events beside it.
 pub const MAX_RTT_SAMPLES: usize = 4096;
 
+/// The longest a visit may be held open by [`Hold::For`], and the value a
+/// longer one is clamped to.
+///
+/// A day. Chosen, not measured, and generous for the thing it bounds: a
+/// measurement holds a visit for tens of seconds (WO-1.5's rows hold 90),
+/// and anything that wants a visit open for longer wants a house, which
+/// holds one until its peer leaves. The clamp is what stops a
+/// `Hold::For(Duration::MAX)` from overflowing the deadline arithmetic
+/// this hold is measured against, which is a panic in a crate that
+/// forbids them, or from degrading into "hold forever" through a
+/// `checked_add` that quietly returned `None` (Yseult's Low 1 on PR 80).
+/// `doctor` refuses a larger `--hold` at the command line, before any
+/// network work; this is the library's own floor under that.
+pub const MAX_HOLD: Duration = Duration::from_secs(86_400);
+
 /// The `Goodbye.reason` a visit ending on its own terms sends (frame 19).
 /// Section 1 defines no enum of values for the field, so 0 is the plain
 /// clean exit every caller in this workspace already uses.
@@ -1527,10 +1562,19 @@ struct RttSamples {
 }
 
 impl RttSamples {
-    fn new() -> Self {
+    /// A fresh set, whose first sample falls one [`RTT_SAMPLE_INTERVAL`]
+    /// after `started` rather than at once.
+    ///
+    /// Seeded rather than left `None` (Wystan's precision note): an
+    /// immediate first sample on a relayed visit reads
+    /// `Connection::rtt()` while the handshake's own estimate is all it
+    /// has, which is not a steady-state round trip and not what "sampled
+    /// once a second" promises. A 20 second hold therefore takes about 20
+    /// samples starting at 1 s, not 20 starting at 0.
+    fn new(started: Instant) -> Self {
         Self {
             samples: Vec::new(),
-            last_sample: None,
+            last_sample: Some(started),
             source: diag::RttSource::NotSampled,
             latest_probe: None,
             full: false,
@@ -1785,7 +1829,10 @@ pub async fn run_doorbell(
 
     let started = Instant::now();
     let hold_until = match params.hold {
-        Hold::For(duration) => started.checked_add(duration),
+        // Clamped, then added: `MAX_HOLD` is a day, so the sum is
+        // representable on every platform this builds for and the `None`
+        // arm below cannot be reached by a caller asking for too much.
+        Hold::For(duration) => started.checked_add(duration.min(MAX_HOLD)),
         Hold::UntilAttemptSettles | Hold::UntilPeerLeaves => None,
     };
     let mut outcome = DoorbellOutcome {
@@ -1793,32 +1840,74 @@ pub async fn run_doorbell(
         upgraded_to: None,
         fell_back: false,
     };
-    let mut rtt = RttSamples::new();
+    let mut rtt = RttSamples::new(started);
     let mut pongs = PongLimiter::new(started);
     // The `Candidates` frame that started a rerun, when this side read it
     // out of the queue rather than being the side that wrote it.
-    let mut adopted: Option<([u8; 16], Vec<Addr>, [u8; 32])> = None;
-    // The reason a visit that never proved a candidate ends with, kept
-    // across the rest of the hold so the record still names it.
-    let mut give_up_reason: Option<Reason> = None;
+    let mut adopted: Option<Exchanged> = None;
+    // The reason a visit that never proved a candidate ends with. Cleared
+    // at the top of every attempt: a rerun that upgrades has undone
+    // whatever the last one gave up on, and a visit that ended healthy
+    // must not be reported by the reason of an attempt it recovered from
+    // (Yseult's Low 4).
+    let mut give_up_reason: Option<Reason>;
+    let mut attempts = 0u32;
 
     'attempts: loop {
+        give_up_reason = None;
+        // Section 2 step 7: "what reruns, with a fresh attempt id, is
+        // gathering, exchange and probing, steps 1 and 3 to 6". Gathering
+        // is step 1, so a rerun gathers again rather than re-offering the
+        // list the caller built before the path died: WO-1.5 case (f) is a
+        // local address change, and a stale list cannot contain the
+        // address the machine now has (Yseult's Medium 2). The first
+        // attempt keeps the caller's own list, which the caller gathered
+        // moments ago and which may hold what only it knows (a discovered
+        // peer, a test's chosen candidate).
+        let candidates = if attempts == 0 {
+            params.candidates.clone()
+        } else {
+            regather(gate, &params.candidates, &params.peer_discovered)
+        };
+        attempts = attempts.saturating_add(1);
         let mut half = [0u8; 32];
         rand::rng().fill(&mut half);
         let exchanged = match adopted.take() {
             // A rerun this side is joining: the peer's `Candidates` is
             // already in hand, so only this side's own half goes out.
-            Some((attempt, addrs, peer_half)) => {
-                match write_candidates(&mut send, attempt, &params.candidates, half).await {
-                    Ok(()) => Ok((attempt, addrs, peer_half)),
+            Some(exchanged) => {
+                match write_candidates(
+                    &mut send,
+                    exchanged.attempt,
+                    &candidates,
+                    half,
+                    params.no_punch,
+                )
+                .await
+                {
+                    Ok(()) => Ok(exchanged),
                     Err(e) => Err(e),
                 }
             }
             None => {
-                exchange_candidates(initiator, &mut send, &frames, &params, half, deadline).await
+                exchange_candidates(
+                    initiator,
+                    &mut send,
+                    &frames,
+                    &candidates,
+                    half,
+                    params.no_punch,
+                    deadline,
+                )
+                .await
             }
         };
-        let (attempt, peer_addrs, peer_half) = match exchanged {
+        let Exchanged {
+            attempt,
+            peer_addrs,
+            peer_half,
+            peer_no_upgrade,
+        } = match exchanged {
             Ok(exchanged) => exchanged,
             Err(e) => {
                 diag::record(
@@ -1879,7 +1968,7 @@ pub async fn run_doorbell(
             StepOutcome::Ok,
             format!(
                 "{local} local, {peer} from the peer, {discovered} discovered, {probed} probed",
-                local = params.candidates.len(),
+                local = candidates.len(),
                 peer = peer_addrs.len(),
                 discovered = params.peer_discovered.len(),
                 probed = state.candidate_count(),
@@ -1887,18 +1976,30 @@ pub async fn run_doorbell(
         );
 
         let mut phase = Phase::Probing;
-        if params.no_punch {
+        if params.no_punch || peer_no_upgrade {
             // WO-1.5 case (e), and the one thing this flag does: the
             // candidates were still exchanged, so both sides' records show
             // what would have been probed, and nothing is probed. Recorded
-            // as an `ok` step, because nothing failed here: this house was
-            // told not to.
+            // as an `ok` step, because nothing failed here: one side or
+            // the other was told not to.
+            //
+            // **Both sides stop, and both say the same word.** Frame 16
+            // carries the intent (design amendment 4), so a peer running
+            // `--no-punch` is not left waiting out the 10 s start window
+            // for a `Start` nobody asked for and recording an `internal`
+            // failure that did not happen, which is what this did before
+            // the flag was on the wire.
+            let whose = if params.no_punch {
+                "this run"
+            } else {
+                "the peer's run"
+            };
             diag::record(
                 rec,
                 Step::ProbeBurst,
                 StepOutcome::Ok,
                 format!(
-                    "skipped: hole punching is off for this run (--no-punch), \
+                    "skipped: hole punching is off for {whose} (--no-punch), \
                      {probed} candidates not probed",
                     probed = state.candidate_count()
                 ),
@@ -1986,16 +2087,12 @@ pub async fn run_doorbell(
                     },
                 )
                 .await;
-                // A goodbye that never left is not a goodbye: `close`
-                // abandons data not yet transmitted and the caller closes
-                // this connection as soon as this returns, so the frame is
-                // finished and its receipt waited for on a bounded budget,
-                // the same shape `GateClient::goodbye` uses for frame 11.
-                // Running out of that budget is not an error: section 4
-                // makes the goodbye a courtesy whose absence the peer is
-                // entitled to handle, and it does, through stale and dead.
-                let _ = send.finish();
-                let _ = tokio::time::timeout(GOODBYE_ACK_DEADLINE, send.stopped()).await;
+                // Stamped where the decision was taken, before the wait
+                // below (Wystan's D2): a peer that cannot acknowledge is
+                // exactly the case a reader correlates this event against
+                // the other side's log for, and charging it the whole
+                // acknowledgement budget put the timestamp up to a second
+                // after the visit actually ended.
                 emit(
                     rec,
                     sink,
@@ -2006,7 +2103,24 @@ pub async fn run_doorbell(
                         "the hold elapsed"
                     },
                 );
-                let reason = end_of_visit_reason(&params, give_up_reason, path.as_ref());
+                // A goodbye that never left is not a goodbye: `close`
+                // abandons data not yet transmitted and the caller closes
+                // this connection as soon as this returns, so the frame is
+                // finished and its receipt waited for on a bounded budget,
+                // the same shape `GateClient::goodbye` uses for frame 11.
+                // Running out of that budget is not an error: section 4
+                // makes the goodbye a courtesy whose absence the peer is
+                // entitled to handle, and it does, through stale and dead.
+                let _ = send.finish();
+                let _ = tokio::time::timeout(GOODBYE_ACK_DEADLINE, send.stopped()).await;
+                let reason = end_of_visit_reason(
+                    &params,
+                    give_up_reason,
+                    path.as_ref(),
+                    &state,
+                    rec,
+                    outcome.upgraded_to.is_some() || outcome.fell_back,
+                );
                 finish_visit(rec, &rtt, path.as_ref(), reason);
                 return Ok(outcome);
             }
@@ -2302,13 +2416,28 @@ pub async fn run_doorbell(
                             "the peer said goodbye",
                         );
                         diag::record(rec, Step::Closed, StepOutcome::Ok, "the peer said goodbye");
-                        finish_visit(rec, &rtt, path.as_ref(), Reason::PeerGoodbye);
+                        // How the visit ended is `peer_goodbye`, and for
+                        // an ordinary visit that is the whole answer. The
+                        // one exception is a visit nobody probed by
+                        // instruction: WO-1.5 case (e) cites this field
+                        // for why the visit stayed relayed, and which
+                        // side hung up first must not change that answer
+                        // from row to row. The goodbye is still in the
+                        // record twice over, as a `closed` step and as an
+                        // event.
+                        let reason = if give_up_reason == Some(Reason::PunchDisabled) {
+                            Reason::PunchDisabled
+                        } else {
+                            Reason::PeerGoodbye
+                        };
+                        finish_visit(rec, &rtt, path.as_ref(), reason);
                         return Ok(outcome);
                     }
                     Ok(PorchFrame::Candidates {
                         attempt: peer_attempt,
                         addrs,
                         probe_half,
+                        no_upgrade,
                         ..
                     }) => {
                         // The other side reran the doorbell (step 7). Only
@@ -2316,7 +2445,12 @@ pub async fn run_doorbell(
                         // initiator writes it.
                         if peer_attempt != attempt {
                             note_superseded_path(rec, sink, &phase, path.as_ref());
-                            adopted = Some((peer_attempt, addrs, probe_half));
+                            adopted = Some(Exchanged {
+                                attempt: peer_attempt,
+                                peer_addrs: addrs,
+                                peer_half: probe_half,
+                                peer_no_upgrade: no_upgrade,
+                            });
                             continue 'attempts;
                         }
                     }
@@ -2404,7 +2538,14 @@ pub async fn run_doorbell(
                     // section 7's own catch-all for a failure it does not
                     // name.
                     let reason = if held || outcome.upgraded_to.is_some() {
-                        end_of_visit_reason(&params, give_up_reason, path.as_ref())
+                        end_of_visit_reason(
+                            &params,
+                            give_up_reason,
+                            path.as_ref(),
+                            &state,
+                            rec,
+                            outcome.upgraded_to.is_some() || outcome.fell_back,
+                        )
                     } else {
                         Reason::Internal
                     };
@@ -2448,15 +2589,35 @@ fn note_superseded_path(
 
 /// The reason a visit that ran its course ends with.
 ///
-/// `punch_disabled` for a run told not to punch, whatever else happened;
-/// the reason a give-up already named where nothing ever proved itself;
-/// `path_idle_timeout` for a visit that upgraded, fell back and never got
-/// the path again, which is the ending state a reader wants; `ok`
-/// otherwise.
+/// **It describes what happened, not which timer won** (Wystan's D1). A
+/// held visit ends when its hold elapses or its peer leaves, and that can
+/// land anywhere in an attempt: before the probe burst has given up,
+/// during it, or long after. The reason must read the same either way, so
+/// this asks what the visit actually did rather than which branch it left
+/// through:
+///
+/// - `punch_disabled` for a run told not to punch, whatever else happened;
+/// - the reason a give-up already named, where the burst ran out first;
+/// - `path_idle_timeout` only for a visit that **had** a direct path and
+///   ended without it, which is what that reason's own doc says it means;
+///   a visit that never upgraded at all is the opposite of it;
+/// - the probe burst's own inference (`no_candidates` with nothing to
+///   probe, otherwise section 7's `probe_timeout`/`hairpin_failure`/
+///   `endpoint_dependent_mapping` rule) for a visit that was still
+///   probing when it ended;
+/// - `ok` for a visit that ended on a direct path.
+///
+/// Before this, a `--hold 5` run against a friend with nothing probeable
+/// reported `path_idle_timeout` while the identical `--hold 0` run
+/// reported `no_candidates`, because 5 seconds is under section 2 step
+/// 5's 10 second give-up and nothing else had set a reason.
 fn end_of_visit_reason(
     params: &DoorbellParams,
     give_up_reason: Option<Reason>,
     path: Option<&crate::path::PathEntry>,
+    state: &Attempt,
+    recorder: Option<&Recorder>,
+    ever_upgraded: bool,
 ) -> Reason {
     if params.no_punch {
         return Reason::PunchDisabled;
@@ -2464,10 +2625,58 @@ fn end_of_visit_reason(
     if let Some(reason) = give_up_reason {
         return reason;
     }
+    if !ever_upgraded {
+        // Still probing when the visit ended, or never able to: the same
+        // inference the give-up branch makes, so the two agree whichever
+        // of them the run reaches.
+        if state.candidate_count() == 0 {
+            return Reason::NoCandidates;
+        }
+        return recorder.map_or(Reason::ProbeTimeout, Recorder::probe_failure_reason);
+    }
     match path {
         Some(path) if path.direct_addr().is_none() => Reason::PathIdleTimeout,
         _ => Reason::Ok,
     }
+}
+
+/// Section 2 step 1, run again for a rerun: what the caller offered for
+/// the first attempt, plus every local address of this machine, the gate's
+/// reflection of it, and anything discovery has heard, de-duplicated and
+/// capped at [`MAX_CANDIDATES`].
+///
+/// **A union, not a replacement.** The new half is the point: WO-1.5 case
+/// (f) is a local address change, and a list gathered before the change
+/// cannot contain the address the machine now has. Keeping the old half
+/// costs one 81 byte packet every 100 ms for at most 10 seconds against an
+/// address that has stopped answering, and it keeps two things a fresh
+/// gather cannot produce: an address the caller knew and this code does
+/// not (a test's chosen candidate, a peer heard on a network this house
+/// only learns about from its caller), and a loopback address, which
+/// [`gather`] drops by design because offering one to a peer usually tells
+/// it to probe itself.
+///
+/// The cost of the fresh half is two UDP sockets bound and `connect`ed for
+/// a route lookup (see [`local_addresses`]), once per rerun, which is
+/// nothing against the 10 second probe burst that follows it.
+fn regather(
+    gate: &crate::gate::client::GateClient,
+    original: &[SocketAddr],
+    discovered: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = original.to_vec();
+    out.truncate(MAX_CANDIDATES);
+    let local = local_addresses(gate.local_port().unwrap_or_default());
+    let reflections = [gate.registered_observed()];
+    for (addr, _source) in gather(&local, &reflections, discovered) {
+        if out.len() >= MAX_CANDIDATES {
+            break;
+        }
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
 }
 
 /// Closes a held visit: the shaper counters, the round trip percentiles
@@ -2484,12 +2693,24 @@ fn finish_visit(
     settle(recorder, reason);
 }
 
+/// What one attempt's candidate exchange (frame 16 each way) produced.
+struct Exchanged {
+    attempt: [u8; 16],
+    peer_addrs: Vec<Addr>,
+    peer_half: [u8; 32],
+    /// The peer said it will not probe this attempt (`--no-punch` on its
+    /// side), so this house does not either and neither side waits on a
+    /// start signal nobody will ask for.
+    peer_no_upgrade: bool,
+}
+
 /// Writes this house's own `Candidates` (frame 16).
 async fn write_candidates(
     send: &mut quinn::SendStream,
     attempt: [u8; 16],
     candidates: &[SocketAddr],
     half: [u8; 32],
+    no_upgrade: bool,
 ) -> Result<(), GateError> {
     write_porch_frame(
         send,
@@ -2502,6 +2723,7 @@ async fn write_candidates(
                 .map(Addr::from_socket_addr)
                 .collect(),
             probe_half: half,
+            no_upgrade,
         },
     )
     .await
@@ -2517,25 +2739,26 @@ async fn exchange_candidates(
     initiator: bool,
     send: &mut quinn::SendStream,
     frames: &std::sync::Arc<Mutex<VecDeque<Result<PorchFrame, GateError>>>>,
-    params: &DoorbellParams,
+    candidates: &[SocketAddr],
     half: [u8; 32],
+    no_upgrade: bool,
     deadline: Duration,
-) -> Result<([u8; 16], Vec<Addr>, [u8; 32]), GateError> {
+) -> Result<Exchanged, GateError> {
     if initiator {
         let mut attempt = [0u8; 16];
         rand::rng().fill(&mut attempt);
-        write_candidates(send, attempt, &params.candidates, half).await?;
-        let (peer_attempt, addrs, peer_half) = expect_candidates(frames, deadline).await?;
-        if peer_attempt != attempt {
+        write_candidates(send, attempt, candidates, half, no_upgrade).await?;
+        let exchanged = expect_candidates(frames, deadline).await?;
+        if exchanged.attempt != attempt {
             return Err(GateError::Protocol(
                 "the responder's Candidates named a different attempt".into(),
             ));
         }
-        Ok((attempt, addrs, peer_half))
+        Ok(exchanged)
     } else {
-        let (attempt, addrs, peer_half) = expect_candidates(frames, deadline).await?;
-        write_candidates(send, attempt, &params.candidates, half).await?;
-        Ok((attempt, addrs, peer_half))
+        let exchanged = expect_candidates(frames, deadline).await?;
+        write_candidates(send, exchanged.attempt, candidates, half, no_upgrade).await?;
+        Ok(exchanged)
     }
 }
 
@@ -2588,7 +2811,7 @@ impl Drop for AttemptGuard<'_> {
 async fn expect_candidates(
     frames: &std::sync::Arc<Mutex<VecDeque<Result<PorchFrame, GateError>>>>,
     deadline: Duration,
-) -> Result<([u8; 16], Vec<Addr>, [u8; 32]), GateError> {
+) -> Result<Exchanged, GateError> {
     let waiting = async {
         loop {
             let next = frames.lock_or_recover().pop_front();
@@ -2597,8 +2820,16 @@ async fn expect_candidates(
                     attempt,
                     addrs,
                     probe_half,
+                    no_upgrade,
                     ..
-                })) => return Ok((attempt, addrs, probe_half)),
+                })) => {
+                    return Ok(Exchanged {
+                        attempt,
+                        peer_addrs: addrs,
+                        peer_half: probe_half,
+                        peer_no_upgrade: no_upgrade,
+                    });
+                }
                 Some(Ok(other)) => {
                     return Err(GateError::Protocol(format!(
                         "expected Candidates as the first porch frame, got {other:?}"
@@ -2722,6 +2953,17 @@ mod tests {
                     Addr::from_socket_addr("[2001:db8::5]:4433".parse().unwrap()),
                 ],
                 probe_half: [5u8; 32],
+                no_upgrade: false,
+            },
+            // The same frame carrying the intent of `--no-punch` (design
+            // amendment 4), which a peer reads before it waits on a start
+            // signal nobody will ask for.
+            PorchFrame::Candidates {
+                v: 1,
+                attempt: ID,
+                addrs: Vec::new(),
+                probe_half: [6u8; 32],
+                no_upgrade: true,
             },
             PorchFrame::PathUp {
                 v: 1,
@@ -2750,7 +2992,7 @@ mod tests {
     fn a_candidates_frame_past_its_cap_is_refused_on_the_declared_count() {
         let mut buf = Vec::new();
         let mut enc = Encoder::new(&mut buf);
-        enc.array(5).unwrap();
+        enc.array(6).unwrap();
         enc.u8(16).unwrap();
         enc.u8(1).unwrap();
         enc.bytes(&ID).unwrap();
@@ -3229,6 +3471,150 @@ mod tests {
             mapped.source_of(link_local),
             Some(CandidateSource::Discovery),
             "vouched and stored in its IPv4 form, so one address has one verdict"
+        );
+    }
+
+    /// Wystan's D3: the nearest-rank percentiles the record reports, over
+    /// vectors small enough to check by hand.
+    ///
+    /// The contract, in one place: nearest rank (`ceil(p * n)`) over the
+    /// samples this visit took, so every number reported is a round trip
+    /// that was actually measured and never an interpolation between two;
+    /// on an even count the median is the lower of the two middle
+    /// samples; and no sample is taken before the first full
+    /// [`RTT_SAMPLE_INTERVAL`], so the handshake's own estimate is never
+    /// one of them.
+    ///
+    /// Deliberate break to fail this test: use `floor` instead of `ceil`
+    /// in `percentiles`, or drop the `.max(1)` clamp. The p95 of ten
+    /// samples then reads 900 or the median of one sample panics on an
+    /// empty index.
+    #[test]
+    fn the_percentiles_are_nearest_rank_over_the_samples_actually_taken() {
+        let start = Instant::now();
+        let take = |values: &[u64]| {
+            let mut samples = RttSamples::new(start);
+            for (i, us) in values.iter().enumerate() {
+                let at = start + RTT_SAMPLE_INTERVAL * (u32::try_from(i).unwrap_or(0) + 1);
+                samples.observe_probe(Duration::from_micros(*us));
+                samples.tick(at, Duration::from_micros(9_999));
+            }
+            samples.percentiles()
+        };
+
+        // n = 0: nothing measured, nothing claimed.
+        assert_eq!(RttSamples::new(start).percentiles(), (0, 0, 0));
+        // n = 1: the one sample is both the median and the p95.
+        assert_eq!(take(&[400]), (400, 400, 1));
+        // n = 2: ceil(0.5 * 2) = 1, so the median is the lower of the two;
+        // ceil(0.95 * 2) = 2, so the p95 is the higher.
+        assert_eq!(take(&[400, 800]), (400, 800, 2));
+        // n = 3, odd: ceil(1.5) = 2, the middle one.
+        assert_eq!(take(&[300, 400, 500]), (400, 500, 3));
+        // n = 4, even: ceil(2) = 2, the lower middle.
+        assert_eq!(take(&[100, 200, 300, 400]), (200, 400, 4));
+        // n = 10: ceil(5) = 5 and ceil(9.5) = 10, and the input is
+        // deliberately out of order to prove the sort.
+        assert_eq!(
+            take(&[1000, 100, 900, 200, 800, 300, 700, 400, 600, 500]),
+            (500, 1000, 10)
+        );
+
+        // The first interval is not sampled: a tick before it takes
+        // nothing, so a relayed visit never reports the handshake's own
+        // estimate as a round trip.
+        let mut early = RttSamples::new(start);
+        early.observe_probe(Duration::from_micros(400));
+        early.tick(start + Duration::from_millis(999), Duration::from_micros(1));
+        assert_eq!(early.percentiles(), (0, 0, 0));
+        early.tick(start + RTT_SAMPLE_INTERVAL, Duration::from_micros(1));
+        assert_eq!(early.percentiles(), (400, 400, 1));
+    }
+
+    /// A relayed visit's samples come from the end to end connection and
+    /// say so; a visit that changed path says `mixed`.
+    #[test]
+    fn the_rtt_source_says_what_the_samples_measured() {
+        let start = Instant::now();
+        let mut relayed = RttSamples::new(start);
+        relayed.tick(start + RTT_SAMPLE_INTERVAL, Duration::from_micros(5_000));
+        assert_eq!(relayed.source, diag::RttSource::Quic);
+        relayed.observe_probe(Duration::from_micros(400));
+        relayed.tick(
+            start + RTT_SAMPLE_INTERVAL * 2,
+            Duration::from_micros(5_000),
+        );
+        assert_eq!(relayed.source, diag::RttSource::Mixed);
+        assert_eq!(relayed.percentiles(), (400, 5_000, 2));
+    }
+
+    /// Wystan's D1: the reason a held visit ends with describes what
+    /// happened, not which of the hold and the probe give-up ran out
+    /// first.
+    ///
+    /// Deliberate break to fail this test: delete the `if !ever_upgraded`
+    /// arm from `end_of_visit_reason`. A visit that never had a direct
+    /// path then reports `path_idle_timeout`, whose own doc says it means
+    /// a path that was had and lost, which is what a `--hold 5` run
+    /// against a friend with nothing probeable used to say.
+    #[test]
+    fn the_end_of_visit_reason_never_calls_an_unprobed_visit_an_idle_path() {
+        let params = |no_punch: bool| DoorbellParams {
+            session: 1,
+            role: 1,
+            peer_key: [4u8; 32],
+            candidates: Vec::new(),
+            peer_observed: None,
+            peer_discovered: Vec::new(),
+            hold: Hold::For(Duration::from_secs(5)),
+            no_punch,
+            events: None,
+            recorder: None,
+        };
+        let empty = Attempt::new(ID, KEY, None);
+        let mut probed = Attempt::new(ID, KEY, None);
+        assert!(probed.add_candidate(addr(4433), CandidateSource::PeerReported));
+        let relayed = crate::path::PathEntry::new_relay();
+        let direct = crate::path::PathEntry::new_relay();
+        direct.upgrade_to(addr(4433));
+
+        // Never upgraded, nothing to probe: the same answer the give-up
+        // branch gives, whichever of them the hold beat.
+        assert_eq!(
+            end_of_visit_reason(&params(false), None, Some(&relayed), &empty, None, false),
+            Reason::NoCandidates
+        );
+        // Never upgraded, candidates that never answered.
+        assert_eq!(
+            end_of_visit_reason(&params(false), None, Some(&relayed), &probed, None, false),
+            Reason::ProbeTimeout
+        );
+        // Upgraded and lost: this is what `path_idle_timeout` means.
+        assert_eq!(
+            end_of_visit_reason(&params(false), None, Some(&relayed), &probed, None, true),
+            Reason::PathIdleTimeout
+        );
+        // Upgraded and still there.
+        assert_eq!(
+            end_of_visit_reason(&params(false), None, Some(&direct), &probed, None, true),
+            Reason::Ok
+        );
+        // Told not to punch, whatever else happened.
+        assert_eq!(
+            end_of_visit_reason(&params(true), None, Some(&relayed), &empty, None, false),
+            Reason::PunchDisabled
+        );
+        // A reason a give-up already named wins over the inference.
+        assert_eq!(
+            end_of_visit_reason(
+                &params(false),
+                Some(Reason::HairpinFailure),
+                Some(&relayed),
+                &probed,
+                None,
+                false
+            ),
+            Reason::HairpinFailure
         );
     }
 

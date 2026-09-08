@@ -388,11 +388,17 @@ pub enum VisitEventKind {
     Recovered,
     /// The visit ended cleanly: frame 19 out, in, or both.
     Goodbye,
+    /// A dial was refused before it became a visit: this house is already
+    /// holding as many as it will, this peer is already holding as many
+    /// as it will, or no introduction ever arrived to explain it. House
+    /// stdout only, because a refused dial has no attempt and so no
+    /// record.
+    Refused,
 }
 
 impl VisitEventKind {
     /// All variants, in the order a visit produces them.
-    pub const ALL: [VisitEventKind; 9] = [
+    pub const ALL: [VisitEventKind; 10] = [
         VisitEventKind::Registered,
         VisitEventKind::Knock,
         VisitEventKind::VisitOpen,
@@ -402,6 +408,7 @@ impl VisitEventKind {
         VisitEventKind::FellBack,
         VisitEventKind::Recovered,
         VisitEventKind::Goodbye,
+        VisitEventKind::Refused,
     ];
 
     /// The `snake_case` spelling used in the record and on a house's
@@ -418,6 +425,7 @@ impl VisitEventKind {
             VisitEventKind::FellBack => "fell_back",
             VisitEventKind::Recovered => "recovered",
             VisitEventKind::Goodbye => "goodbye",
+            VisitEventKind::Refused => "refused",
         }
     }
 
@@ -964,6 +972,23 @@ fn cap_text(s: &str) -> std::borrow::Cow<'_, str> {
         end -= 1;
     }
     std::borrow::Cow::Owned(format!("{}...[truncated]", s.get(..end).unwrap_or("")))
+}
+
+/// Text from off this machine, made safe to print or to record: control
+/// characters dropped and the rest cut to [`MAX_FREE_TEXT_LEN`] with the
+/// cut marked.
+///
+/// The same two rules `gate::client`'s own `gate_text` applies to text the
+/// gate authored, at the record's length rather than the wire's, and for
+/// the same reason (Yseult's Low 5): a peer's QUIC close reason is
+/// whatever bytes it chose, up to about a packet's worth, and it reaches a
+/// house's stdout through a visit that ended before it opened. JSON
+/// escaping stops it forging a line or a second object; this stops it
+/// filling a harness's log file and moving a terminal's cursor.
+#[must_use]
+pub fn safe_text(text: &str) -> String {
+    let stripped: String = text.chars().filter(|c| !c.is_control()).collect();
+    cap_text(&stripped).into_owned()
 }
 
 /// Renders an [`Addr`] as `"host:port"`, the human-readable form section 7

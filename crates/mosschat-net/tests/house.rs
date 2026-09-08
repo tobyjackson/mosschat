@@ -142,6 +142,8 @@ mod house {
         gate_addr: SocketAddr,
         community: [u8; 32],
         house_key: [u8; 32],
+        /// A gate member the house has never listed as a friend.
+        stranger_seed: [u8; 32],
         events: Collected,
         house_diagnostics: std::path::PathBuf,
         stop_house: Option<tokio::sync::oneshot::Sender<()>>,
@@ -155,13 +157,18 @@ mod house {
             let community = random_seed();
             let house_seed = random_seed();
             let caller_seed = random_seed();
+            let stranger_seed = random_seed();
             let house_key = public_key_of(&house_seed);
             let caller_key = public_key_of(&caller_seed);
+            // A member of the community whose knock this house will not
+            // answer: on the gate's list, absent from the house's
+            // friends.
+            let stranger_key = public_key_of(&stranger_seed);
 
             let gate = GateServer::bind(GateServerConfig {
                 community,
                 identity_seed: random_seed(),
-                members: MemberList::from_keys([house_key, caller_key]),
+                members: MemberList::from_keys([house_key, caller_key, stranger_key]),
                 primary_bind: "127.0.0.1:0".parse().unwrap(),
                 secondary_bind: "127.0.0.1:0".parse().unwrap(),
                 max_registrations: 256,
@@ -207,6 +214,7 @@ mod house {
                     gate_addr,
                     community,
                     house_key,
+                    stranger_seed,
                     events,
                     house_diagnostics,
                     stop_house: Some(stop_house),
@@ -216,15 +224,15 @@ mod house {
             )
         }
 
-        /// Connects a caller, knocks, and opens the end to end connection
-        /// through the relay.
-        async fn call(&self, caller_seed: [u8; 32]) -> (Arc<GateClient>, quinn::Connection, u32) {
+        /// Registers one house-side client at the gate, friendly to the
+        /// house.
+        async fn connect(&self, seed: [u8; 32]) -> Arc<GateClient> {
             let friends = Arc::new(InMemoryFriendStore::new());
             friends.add(self.house_key);
-            let caller = Arc::new(
+            Arc::new(
                 GateClient::connect(
                     self.gate_addr,
-                    caller_seed,
+                    seed,
                     self.community,
                     None,
                     friends,
@@ -232,7 +240,13 @@ mod house {
                 )
                 .await
                 .unwrap(),
-            );
+            )
+        }
+
+        /// Connects a caller, knocks, and opens the end to end connection
+        /// through the relay.
+        async fn call(&self, caller_seed: [u8; 32]) -> (Arc<GateClient>, quinn::Connection, u32) {
+            let caller = self.connect(caller_seed).await;
             let outcome = caller.introduce(self.house_key, 30, None).await.unwrap();
             assert_eq!(outcome.role, 1, "the caller is the initiator");
             let connection = caller.dial_peer(&self.house_key).await.unwrap();
@@ -261,6 +275,15 @@ mod house {
         control: &'a Arc<DoorbellControl>,
         diagnostics: &'a std::path::Path,
         events: Option<VisitEventSink>,
+        /// What this caller offers. `None` is its own loopback address,
+        /// which is what makes a same-machine pair upgradeable at all;
+        /// `Some(vec![])` is a caller with nothing to offer, which is how
+        /// a visit with nothing probeable is produced on purpose.
+        candidates: Option<Vec<SocketAddr>>,
+        /// Whether the gate's observation of the peer vouches for it. A
+        /// test that wants nothing probeable withholds it, since it is
+        /// what admits a private or loopback address the peer named.
+        vouch_peer: bool,
     }
 
     impl Held<'_> {
@@ -275,8 +298,15 @@ mod house {
                 session: self.session,
                 role: 1,
                 peer_key: self.peer_key,
-                candidates: vec![loopback_candidate(self.caller)],
-                peer_observed: self.caller.peer_observed_for(self.session),
+                candidates: self
+                    .candidates
+                    .clone()
+                    .unwrap_or_else(|| vec![loopback_candidate(self.caller)]),
+                peer_observed: if self.vouch_peer {
+                    self.caller.peer_observed_for(self.session)
+                } else {
+                    None
+                },
                 peer_discovered: Vec::new(),
                 hold: self.hold,
                 no_punch: self.no_punch,
@@ -345,6 +375,8 @@ mod house {
             control: &control,
             diagnostics: &caller_diagnostics,
             events: None,
+            candidates: None,
+            vouch_peer: true,
         }
         .spawn();
 
@@ -437,6 +469,8 @@ mod house {
             control: &control,
             diagnostics: &caller_diagnostics,
             events: None,
+            candidates: None,
+            vouch_peer: true,
         }
         .spawn();
 
@@ -499,6 +533,300 @@ mod house {
                 .is_none(),
             "the caller's path table left the relay"
         );
+
+        connection.close(0u32.into(), b"test over");
+        let _ = std::fs::remove_dir_all(&caller_diagnostics);
+        fixture.stop().await;
+    }
+
+    /// Yseult's uncovered case: a knock from a member of the community
+    /// who is not on this house's friend list produces nothing at all.
+    ///
+    /// Not a decline, not a line on stdout, not a record: section 1 makes
+    /// a decline, a tag that matched nobody and a house that never
+    /// answered one silence, and the house's own stdout must not be the
+    /// oracle the protocol refuses to be.
+    ///
+    /// Deliberate break to fail this test: emit `KnockAccepted` in
+    /// `answer_knock` before the `friends.is_friend(&body.from)` decision
+    /// rather than after it. The house then prints a `knock` line for a
+    /// stranger and the event assertion fails.
+    #[tokio::test]
+    async fn a_knock_from_a_member_who_is_not_a_friend_says_nothing_at_all() {
+        let (fixture, _caller_seed) = Fixture::start("stranger", false).await;
+        let stranger = fixture.connect(fixture.stranger_seed).await;
+
+        // The gate forwards the knock (this key is a member); the house
+        // opens the seal, finds no friend, and stays silent, so the
+        // asker's only answer is its own `ttl_s` elapsing.
+        let refused = stranger.introduce(fixture.house_key, 3, None).await;
+        assert!(
+            refused.is_err(),
+            "a stranger must get silence, which reads as introduce_timeout"
+        );
+
+        assert_eq!(
+            fixture.events.kinds(),
+            vec![VisitEventKind::Registered],
+            "the house said it registered and nothing else"
+        );
+        assert!(
+            records_in(&fixture.house_diagnostics).is_empty(),
+            "a knock that was never accepted is not an attempt, so it is not a record"
+        );
+        fixture.stop().await;
+    }
+
+    /// Yseult's Medium 1: one friend cannot fill every slot this house
+    /// has, and a refusal says so out loud.
+    ///
+    /// One relay session carries as many end to end connections as its
+    /// peer opens, so the cap that matters is on visits and not on
+    /// sessions. The third connection from one peer is refused, and the
+    /// two before it go on running.
+    ///
+    /// Deliberate break to fail this test: remove the
+    /// `MAX_VISITS_PER_PEER` check from `Visit::serve`. The third dial
+    /// then becomes a third visit and no `refused` line is printed.
+    #[tokio::test]
+    async fn one_peer_cannot_take_more_than_its_share_of_the_visits() {
+        let (fixture, caller_seed) = Fixture::start("percap", false).await;
+        let (caller, first, _session) = fixture.call(caller_seed).await;
+
+        // Two more end to end connections over the same relay session,
+        // which is what a peer opening connections in a loop looks like.
+        let second = caller.dial_peer(&fixture.house_key).await.unwrap();
+        let third = caller.dial_peer(&fixture.house_key).await.unwrap();
+
+        let refused = fixture
+            .events
+            .wait_for(VisitEventKind::Refused, Duration::from_secs(15))
+            .await
+            .expect("the third visit from one peer must be refused");
+        assert!(
+            refused.detail.contains("no room for this peer"),
+            "the refusal says which cap it hit: {}",
+            refused.detail
+        );
+        assert!(
+            refused.peer.is_some(),
+            "a refusal after the handshake names the peer it refused"
+        );
+        let opened = fixture
+            .events
+            .kinds()
+            .into_iter()
+            .filter(|kind| *kind == VisitEventKind::VisitOpen)
+            .count();
+        assert_eq!(opened, mosschat_net::house::MAX_VISITS_PER_PEER, "{opened}");
+
+        for connection in [&first, &second, &third] {
+            connection.close(0u32.into(), b"test over");
+        }
+        fixture.stop().await;
+    }
+
+    /// Yseult's other uncovered case: `accept_peer` refuses a dial from a
+    /// key this house never had introduced to it.
+    ///
+    /// This deliberately steps past the *first* gate to exercise the
+    /// second. Section 3's porch socket drops a datagram whose source is
+    /// in no peer's candidate table, so an uninvited dial normally never
+    /// reaches quinn at all; the test hands that source a lease
+    /// (`allow_source`) so the handshake happens and `accept_peer`'s own
+    /// check is the thing under test.
+    ///
+    /// The other half of that check, a proven key with no relay path, is
+    /// not reachable from outside: it needs a gate that forwards a
+    /// session's datagrams for a third key, which `forward_relay` refuses.
+    /// It stays as belt to this braces.
+    ///
+    /// Deliberate break to fail this test: return the connection from
+    /// `accept_peer` without the `path_by_synthetic` check. The dial then
+    /// becomes a visit from a house nobody introduced.
+    #[tokio::test]
+    async fn accept_peer_refuses_a_dial_from_a_key_it_never_introduced() {
+        let (fixture, caller_seed) = Fixture::start("uninvited", false).await;
+        // A house-side client of our own, so the refusal is observed
+        // directly rather than through the headless house's task.
+        let victim = fixture.connect(caller_seed).await;
+        let victim_addr = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            victim.porch().local_addr().unwrap().port(),
+        );
+
+        mosschat_net::authed::install_crypto_provider();
+        let stranger_seed = random_seed();
+        let (cert, key) = mosschat_net::authed::self_signed_cert(&stranger_seed).unwrap();
+        let tls = mosschat_net::authed::client_tls_config(cert, key, b"moss-gate").unwrap();
+        let mut stranger = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        stranger.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        )));
+        let stranger_addr = stranger.local_addr().unwrap();
+
+        // Past the first gate, on purpose and only for this test.
+        let _lease = victim.porch().allow_source(stranger_addr);
+        let dial = tokio::spawn(async move {
+            let _ = stranger.connect(victim_addr, "peer").unwrap().await;
+            stranger
+        });
+
+        let incoming = tokio::time::timeout(Duration::from_secs(10), victim.endpoint().accept())
+            .await
+            .expect("the dial must arrive")
+            .expect("the endpoint is open");
+        let refused = victim.accept_peer(incoming).await;
+        assert!(
+            refused.is_err(),
+            "a dial from a key with no relay path must be refused"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), dial).await;
+        fixture.stop().await;
+    }
+
+    /// Yseult's Medium 3 and the wire flag that answers it: `--no-punch`
+    /// on one side alone leaves the *other* side honest.
+    ///
+    /// Before frame 16 carried the intent, a `--no-punch` caller left its
+    /// peer waiting out the whole 10 s start window for a `Start` nobody
+    /// asked for, recording `start_signal / fail` and settling
+    /// `internal`, which amendment 4's own words call the opposite of a
+    /// path taken on purpose. WO-1.5's case (e) row puts the flag on the
+    /// caller, so this is the row's own shape.
+    ///
+    /// Deliberate break to fail this test: stop reading `no_upgrade` in
+    /// `run_doorbell` (treat it as `false`). The house then waits out the
+    /// start window and its record names a failed step.
+    #[tokio::test]
+    async fn one_sided_no_punch_leaves_the_peer_honest_too() {
+        let (fixture, caller_seed) = Fixture::start("onesided", false).await;
+        let (caller, connection, session) = fixture.call(caller_seed).await;
+
+        let caller_diagnostics = diag_dir("onesided-caller");
+        let control = DoorbellControl::new();
+        let held = Held {
+            caller: &caller,
+            connection: &connection,
+            session,
+            peer_key: fixture.house_key,
+            hold: Hold::For(Duration::from_secs(3)),
+            // Only this side is told not to punch. The house was started
+            // without the flag.
+            no_punch: true,
+            control: &control,
+            diagnostics: &caller_diagnostics,
+            events: None,
+            candidates: None,
+            vouch_peer: true,
+        }
+        .spawn();
+
+        let record = tokio::time::timeout(Duration::from_secs(30), held)
+            .await
+            .expect("the caller's hold must end")
+            .unwrap();
+        assert_eq!(record.reason, Reason::PunchDisabled);
+        connection.close(0u32.into(), b"test over");
+
+        // The house's own record for the same visit, once its side has
+        // settled. It is written when the visit ends, which is the peer's
+        // goodbye arriving.
+        let house_record = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(record) = records_in(&fixture.house_diagnostics).into_iter().next() {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the house must write its own record for the visit");
+
+        assert_eq!(
+            house_record.reason,
+            Reason::PunchDisabled,
+            "the peer names the flag, not a failure of its own: {:?}",
+            house_record.steps
+        );
+        assert_eq!(
+            house_record.failed_step, None,
+            "nothing failed on the house's side: {:?}",
+            house_record.steps
+        );
+        assert!(
+            !house_record.steps.iter().any(|step| {
+                step.step == mosschat_net::diag::Step::StartSignal
+                    && step.outcome == mosschat_net::diag::StepOutcome::Fail
+            }),
+            "the house waited out a start signal nobody asked for: {:?}",
+            house_record.steps
+        );
+        assert!(
+            !fixture.events.kinds().contains(&VisitEventKind::Upgraded),
+            "neither side probed"
+        );
+
+        let _ = std::fs::remove_dir_all(&caller_diagnostics);
+        fixture.stop().await;
+    }
+
+    /// Wystan's D1, end to end: a hold shorter than section 2 step 5's ten
+    /// second give-up must name the same reason a longer one does.
+    ///
+    /// The visit here has nothing probeable on purpose: this caller
+    /// offers no candidates and withholds the gate's observation of its
+    /// peer, so the peer's own private-range address is refused
+    /// (`Attempt::add_candidate`) and the table is empty. A three second
+    /// hold ends the visit long before the burst gives up, and the record
+    /// must still say `no_candidates` rather than `path_idle_timeout`,
+    /// whose own doc means a path that was had and lost.
+    ///
+    /// Deliberate break to fail this test: delete the `if !ever_upgraded`
+    /// arm from `end_of_visit_reason`.
+    #[tokio::test]
+    async fn a_hold_shorter_than_the_give_up_still_names_what_happened() {
+        let (fixture, caller_seed) = Fixture::start("shorthold", false).await;
+        let (caller, connection, session) = fixture.call(caller_seed).await;
+
+        let caller_diagnostics = diag_dir("shorthold-caller");
+        let control = DoorbellControl::new();
+        let held = Held {
+            caller: &caller,
+            connection: &connection,
+            session,
+            peer_key: fixture.house_key,
+            hold: Hold::For(Duration::from_secs(3)),
+            no_punch: false,
+            control: &control,
+            diagnostics: &caller_diagnostics,
+            events: None,
+            candidates: Some(Vec::new()),
+            vouch_peer: false,
+        }
+        .spawn();
+
+        let record = tokio::time::timeout(Duration::from_secs(30), held)
+            .await
+            .expect("the caller's hold must end")
+            .unwrap();
+        assert_ne!(
+            record.reason,
+            Reason::PathIdleTimeout,
+            "a visit that never had a direct path cannot have lost one: {:?}",
+            record.steps
+        );
+        assert_eq!(
+            record.reason,
+            Reason::NoCandidates,
+            "nothing was probeable, and that is what the record must say. \
+             (A machine whose own primary address is globally routable would \
+             see probe_timeout here instead, since the peer's address would \
+             then be admissible: {:?})",
+            record.steps
+        );
+        assert!(record.failed_step.is_some(), "the burst had nothing to do");
 
         connection.close(0u32.into(), b"test over");
         let _ = std::fs::remove_dir_all(&caller_diagnostics);
@@ -725,6 +1053,8 @@ mod house {
             control: &control,
             diagnostics: &caller_diagnostics,
             events: None,
+            candidates: None,
+            vouch_peer: true,
         }
         .spawn();
 
