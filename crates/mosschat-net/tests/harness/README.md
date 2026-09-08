@@ -298,6 +298,43 @@ in house-b between rows, or write a small wrapper script that does that
 and pass the wrapper as the command instead. `fault-matrix.sh --help`
 lists every row id if you want to run a subset with `--rows`.
 
+### `run-harness.sh matrix` drives a live visit, not a bare dial
+
+**This depends on WO-1.5a (`house --headless`, `doctor --hold` and
+`--no-punch`, PR 79 and PR 80), not merged yet, and has not been run.**
+Once it lands, `sudo bash run-harness.sh matrix` wraps everything above
+into one command, and `blackout-60s` and `gatehouse-killed` measure a
+real visit instead of a dial that finished before either fault landed.
+
+It mints 14 identities, not 12: seeds 01 to 13 are the doctor's, one per
+doctor run (the unshaped smoke run plus the fault matrix's 12 rows,
+exactly the identity-per-row rule below), and seed 14 is house-b's own,
+the long-lived callee those two rows need something to still be
+connected to. All 14 public keys go in the gate's `members.txt`, as
+before; only 01 to 13 go in a `friends.txt` that house-b answers knocks
+from.
+
+After the gatehouse is up, `run-harness.sh` starts `house --headless`
+inside the `house-b` namespace on its own identity, waits up to 10
+seconds for its `registered` line, and reads house-b's public key off
+that line's `detail` field rather than typing it anywhere. Every row's
+command is then `doctor --gate 203.0.113.1:443 --community $MOSS_COMMUNITY
+--identity-file <next seed> --friend <house-b's key> --hold 90 --json`
+from house-a; the unshaped smoke run is the same command with `--hold 5`.
+`fault-matrix.sh` runs with `--row-timeout 240 --blackout-start-delay 10`,
+so a 90 second hold with a 60 second blackout starting 10 seconds in
+comfortably fits inside the row timeout.
+
+`sudo bash run-harness.sh matrix --relay-only` adds `--no-punch` to both
+house-b and every doctor row, the harness equivalent of WO-1.5 case (e):
+every visit stays relayed on purpose, and the matrix-setup file says which
+mode ran.
+
+`down` stops house-b the same way it stops the gatehouse, by the pid its
+own pidfile records, and copies `.run/house-b.jsonl`, the callee's own
+account of every visit, to `docs/measurements/<date>-house-b.jsonl` before
+teardown deletes `.run`.
+
 ### One identity cannot run every row
 
 `mosschat doctor` is a real house session: it registers on the gate's
