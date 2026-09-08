@@ -470,7 +470,18 @@ async fn run_doctor_steps(
                 // carrying what actually happened.
                 let in_flight = match recorder.last_step() {
                     None => Step::GateDial,
-                    Some(_) => Step::GateRegister,
+                    Some(Step::GateDial) => Step::GateRegister,
+                    // Unreachable today: `connect` records `gate_register`
+                    // and `reflect_primary` together and has nothing
+                    // fallible after them. If a fallible step is ever added
+                    // there, this records the last step the attempt is
+                    // known to have reached rather than asserting a failure
+                    // in a step the same record already shows succeeding,
+                    // which would be a record contradicting itself
+                    // (Yseult's I1 on PR 69). The step that owns the new
+                    // failure should record it in `connect`, as every other
+                    // one there does.
+                    Some(step) => step,
                 };
                 mosschat_net::diag::record(
                     Some(&recorder),

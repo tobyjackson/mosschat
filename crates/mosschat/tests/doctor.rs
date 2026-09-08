@@ -191,6 +191,16 @@ fn an_unreachable_gate_exits_non_zero_and_its_json_parses_back() {
 // These two tests are that pair of defects, reproduced with no netem, no
 // root and no shaped network: a gate in this process, and the real binary
 // run against it.
+//
+// Which refusal is proven where, precisely (Yseult's item 5 on PR 69). At
+// binary level these cover the refusal that arrives as a **connection
+// close** carrying section 7's code: an empty member list, refused in the
+// handshake before any stream exists. The refusal that arrives as **frame
+// 12**, which is the per-key capacity one the fault matrix actually hit,
+// is covered in process by `mosschat-net`'s
+// `third_connection_for_one_key_is_refused_not_evicted`, which asserts the
+// house receives the code. Both shapes reach `run_doctor_steps` through
+// the same `Err` arm.
 
 const IDENTITY_BYTES: [u8; 32] = [0x22; 32];
 const COMMUNITY_BYTES: [u8; 32] = [0x11; 32];
