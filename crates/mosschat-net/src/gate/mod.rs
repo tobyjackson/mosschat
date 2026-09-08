@@ -155,10 +155,13 @@ pub mod limits {
     /// Any control frame's burst allowance (section 1: "32 frames per
     /// second per connection with burst 64").
     pub const FRAME_RATE_BURST: u32 = 64;
-    /// `Reflect`: one per connection is the intended use, 2 per minute,
-    /// tracked per key since each `Reflect` rides its own short-lived
-    /// secondary-port connection.
-    pub const REFLECT_PER_MINUTE: u32 = 2;
+    /// `Reflect`: 2 per connection (amendment 3, 2026-09-08), a hard cap
+    /// and not a rate: reconnecting resets it, and the per-key brake is
+    /// [`REGISTER_ATTEMPTS_PER_MINUTE`], which bounds one key at 8
+    /// reflections a minute. Per key, as this was, it was stricter than the
+    /// connection rate it sits under, so a member allowed 4 connection
+    /// attempts a minute could reflect on only 2 of them.
+    pub const REFLECT_PER_CONNECTION: u32 = 2;
     /// `Keepalive`: one per `keepalive_s`, 3 per second tolerated, per
     /// connection.
     pub const KEEPALIVE_PER_SECOND: u32 = 3;

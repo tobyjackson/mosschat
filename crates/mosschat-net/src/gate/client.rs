@@ -952,6 +952,13 @@ impl GateClient {
         // record with no failed step and `doctor --gate` exited 0 on a
         // reflection that never happened.
         let reflect_step = |e: GateError| {
+            // The lease goes back on every exit, not only the happy one.
+            // These three paths used to return without it, leaving the
+            // gate's secondary address in the porch socket's live source
+            // set (section 3) for the life of the process, so packets from
+            // that address stayed admissible long after the short
+            // connection that justified them had gone.
+            self.inner.porch.forget_source(lease);
             record_gate_close(rec, Step::ReflectSecondary, &e, &connection);
             e
         };
