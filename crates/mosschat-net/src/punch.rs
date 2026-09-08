@@ -1069,11 +1069,33 @@ impl Attempt {
     /// halves inside the end to end TLS.
     #[must_use]
     pub fn pong_for(&self, ping: &Probe, from: SocketAddr) -> [u8; PROBE_LEN] {
+        self.pong_with_observed(ping, Addr::from_socket_addr(from))
+    }
+
+    /// The pong for a ping that arrived over the relay, whose `observed`
+    /// field is left all zero.
+    ///
+    /// **A synthetic address never leaves the machine** (section 3, and
+    /// Yseult's Low 1 on PR 89). The source of a relayed ping is the
+    /// peer's synthetic address, which is `fd`, this process's 5 random
+    /// salt bytes and 80 bits of an unsalted hash of the peer's public
+    /// key. Echoing it would put a key-derived identifier on the relay leg
+    /// in cleartext, where a packet capture on the gate host outlives the
+    /// session table, and it would tell the peer nothing: `observed` exists
+    /// so a house behind a NAT learns the mapping its ping came out of, and
+    /// a relayed ping came out of no mapping. Nothing reads the field on
+    /// receipt.
+    #[must_use]
+    pub fn pong_for_relayed(&self, ping: &Probe) -> [u8; PROBE_LEN] {
+        self.pong_with_observed(ping, Addr::default())
+    }
+
+    fn pong_with_observed(&self, ping: &Probe, observed: Addr) -> [u8; PROBE_LEN] {
         Probe {
             kind: PROBE_PONG,
             attempt: ping.attempt,
             tx: ping.tx,
-            observed: Addr::from_socket_addr(from),
+            observed,
         }
         .encode(&self.key)
     }
@@ -2490,7 +2512,12 @@ pub async fn run_doorbell(
                         // cannot be replayed into a reflector (Yseult's
                         // Medium).
                         if control.answering() && pongs.may_answer(probe.tx, arrived) {
-                            let _ = porch.send_probe(from, &state.pong_for(&probe, from));
+                            let pong = if from == synthetic {
+                                state.pong_for_relayed(&probe)
+                            } else {
+                                state.pong_for(&probe, from)
+                            };
+                            let _ = porch.send_probe(from, &pong);
                         }
                     }
                     _ => match &mut phase {
@@ -3980,6 +4007,41 @@ mod tests {
             ),
             Reason::PathIdleTimeout
         );
+    }
+
+    /// Yseult's Low 1 on PR 89: the pong answering a relayed ping carries
+    /// no `observed` address, because the source of one is this house's
+    /// synthetic address for the peer and section 3 says that never leaves
+    /// the machine.
+    ///
+    /// Deliberate break to fail this test: call `pong_for(&ping, from)`
+    /// rather than `pong_for_relayed(&ping)` in `run_doorbell`'s
+    /// `PROBE_PING` arm, which is what it did. The pong then carries
+    /// `fd..`, this process's salt and 80 bits of an unsalted hash of a
+    /// member's public key, in cleartext on the relay leg.
+    #[test]
+    fn a_relayed_pong_carries_no_observed_address() {
+        let key = [4u8; 32];
+        let attempt = [5u8; 16];
+        let state = Attempt::new(attempt, key, None);
+        let ping = Probe {
+            kind: PROBE_PING,
+            attempt,
+            tx: [6u8; 8],
+            observed: Addr::default(),
+        };
+        let synthetic = crate::sock::synthetic_addr([1, 2, 3, 4, 5], &[9u8; 32]);
+
+        let relayed = Probe::decode(&state.pong_for_relayed(&ping), &key).unwrap();
+        assert_eq!(relayed.kind, PROBE_PONG);
+        assert_eq!(relayed.tx, ping.tx);
+        assert_eq!(relayed.observed, Addr::default());
+        assert_eq!(relayed.observed.to_socket_addr(), None);
+
+        // The direct form still reports the mapping, which is the whole
+        // point of the field on a path that has one.
+        let direct = Probe::decode(&state.pong_for(&ping, synthetic), &key).unwrap();
+        assert_eq!(direct.observed.to_socket_addr(), Some(synthetic));
     }
 
     /// Yseult's High 2: discovery gets its own bounded slot count and

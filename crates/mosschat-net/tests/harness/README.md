@@ -534,6 +534,17 @@ anyway, for the case where the relay behaviour itself is what is being
 measured; `--relay-only` skips the check outright, that mode being
 relayed on purpose.
 
+**What the copied files contain, before you commit them.** Everything
+under `docs/measurements/` goes into a public repository. A run through
+this harness is safe by construction: both roles live inside network
+namespaces, so every address in a record is 10.1.0.x, 10.2.0.x or
+203.0.113.x, a peer is a salted fingerprint and never a key, and no seed
+or payload byte is written (section 7's redaction). A run of the same
+binaries *outside* the namespaces is not: `local_observed` is then
+whatever address your gate reflected, which is your machine's. Read a
+record before committing one that did not come from this harness
+(Yseult's Info 1 on PR 89).
+
 ### One identity cannot run every row
 
 `mosschat doctor` is a real house session: it registers on the gate's

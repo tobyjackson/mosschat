@@ -536,6 +536,21 @@ fn routed_ipv4() -> Option<String> {
 /// reflected for the other, and the first to answer three consecutive
 /// probes wins. It does not cover a NAT, which needs the harness.
 ///
+/// **This one test opens a LAN reachable port** (Yseult's Low 3 on PR 89),
+/// where every other test in this file binds loopback. It has to: section
+/// 2 step 1 drops loopback from what a house offers, so with the gate on
+/// `127.0.0.1` the reflection is loopback, the exchange settles at "0
+/// probed", and there is nothing to upgrade. That is not a defect of the
+/// test, it is why the workspace had no upgrade assertion at all until run
+/// 3 went looking for one. For the few seconds it runs, a gatehouse
+/// listens on this machine's routed address on two ephemeral ports.
+/// Anything reaching it is refused before a slot is touched unless its
+/// proven key is on a member list this test generated at random moments
+/// earlier, and the community id is random per run, so what is exposed is
+/// a QUIC handshake that ends in a refusal. It panics rather than skipping
+/// on a machine with no default route, so a runner that cannot support it
+/// says so instead of passing quietly.
+///
 /// Deliberate break to fail this test: in `Attempt::add_candidate`, drop
 /// the `|| self.vouched.contains(&addr)` from the peer-reported check. The
 /// peer's reflected private address is then refused, the table is empty,

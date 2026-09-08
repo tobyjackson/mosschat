@@ -103,8 +103,14 @@ save_records(){
   for role in house-a house-b; do
     dir="$RUN/state-$role/mosschat/diagnostics"
     [ -d "$dir" ] || continue
+    # Globbed into a variable first, and the redirect only after there is
+    # something to write: `cat "$dir"/*.jsonl > "$dest"` creates $dest
+    # before cat runs, so a role with no records left a zero byte file and
+    # no line saying so (Yseult's Info 2).
+    set -- "$dir"/*.jsonl
+    [ -f "$1" ] || { echo "no records under $dir"; continue; }
     dest="$OUT/${DATE_TAG}-$role-records.jsonl"
-    cat "$dir"/*.jsonl > "$dest" 2>/dev/null || continue
+    cat "$@" > "$dest"
     echo "wrote $dest ($(wc -l < "$dest") records)"
   done
 }

@@ -579,8 +579,9 @@ times, and every one of those is a property of a visit under way. Five changes, 
   which is the opposite of a path taken on purpose. A record written before this amendment still reads: every new field is
   optional on the way in.
 
-**Amendment 4, continued: what review changed in it** (Yseult and Wystan on PRs 79 and 80, same day). Six corrections, each
-against the bullet above it that was wrong or thin.
+**Amendment 4, continued: what review changed in it** (Yseult and Wystan on PRs 79 and 80, same day). Seven corrections,
+each against the bullet above it that was wrong or thin. (Seven, not the six this said until run 3: the count was one
+short of its own list when it was written, and Yseult caught it reading PR 89.)
 
 - **`--no-punch` is on the wire**, as frame 16's `no_upgrade` above. It was local to the side that held the flag, so the peer
   waited out the 10 second start window for a `Start` nobody had asked for and recorded `start_signal` failed and `internal`
@@ -604,6 +605,14 @@ against the bullet above it that was wrong or thin.
 - **`Hold::For` is clamped at a day**, and `doctor` refuses a longer `--hold` at the command line before any network work. An
   unbounded value overflowed the deadline arithmetic and panicked after the visit was already open, in a crate that forbids
   panics, or degraded into "hold forever" through a `checked_add` that quietly returned `None`.
+- **A role may print its own public key when it starts**, which section 7's redaction paragraph now says in as many
+  words. A house's first line names its own key in full, because a friend needs it to knock and nothing else prints it,
+  and the argument for that was in a code comment where the rule it bends is in this document. The house prints the same
+  notice `doctor` does, on stderr, since the harness tells an operator to keep its stdout.
+- **Text from off the machine is capped and stripped before it reaches a house's stdout**, the same two rules the gate's own
+  text already gets: a peer's QUIC close reason is bytes it chose, and it reached an operator's log through a visit that
+  ended before it opened. The `goodbye` event is also stamped when the frame is sent rather than after its acknowledgement,
+  which inflated it by up to a second in exactly the case a reader correlates two logs for: a peer that had already gone.
 
 **Amendment 5, 2026-09-08: section 4 covers the relay path, and a house says when it loses its gate** (run 3 of the
 WO-1.6 harness, issue 84, Konrad). Two silences, both found by reading a matrix that ran to completion and reported
@@ -616,18 +625,19 @@ nothing.
   ended the visit. The relay path now carries the same section 4 policy, as the bullet in that section says, and the
   record's `reason` names the path death ahead of whatever the attempt had given up on. What this deliberately does not
   do is notice a relay that comes back after `dead`: probing stops there, and re-establishing a visit across a dead
-  relay is the redial question issue 84 asks.
+  relay is the redial question issue 84 asks. Amended once more by review before merging: probing does not stop at
+  dead after all, because dead arrives in about 9 seconds and quinn takes 30 to close, so an outage between those two
+  numbers would have left a live visit with no liveness at all. One probe a second through the dead state, which is what
+  this section already spends through the stale grace, and an answer rebuilds the watch and says `recovered`.
+- **What the relay leg now carries.** Section 1's "what the gate learns, plainly" gains one line: a relayed probe is an
+  81 byte payload the gate forwards opaquely, and what is readable in it is the discriminator, the attempt id and
+  whether it is a ping or a pong. Nothing else: the `observed` field of a pong answering a relayed ping is left all
+  zero, because the source of one is a synthetic address and section 3 says those never leave the machine. Reading the
+  attempt lifecycle off the relay (a new id is a rerun, probes ceasing is an upgrade) is the cost of putting section 4
+  on this path, and it is stated here rather than left to be discovered.
 - **A house that lost its gate said nothing and kept running.** When the gate connection hit its idle timeout the
   reader and keepalive tasks returned and nothing else noticed, so the process went on as a callee no knock could
   reach: in run 3 the two rows after the blackout both failed at `introduce` against a house that was still in the
   process table. `gate_lost` is an eleventh name in section 7's event vocabulary, house stdout only for the same reason
   `registered` is, and a house that emits it exits non-zero so a harness row cannot keep measuring against a callee
   that is gone. Redialling instead of leaving is the separate decision, and it is not taken here.
-- **A role may print its own public key when it starts**, which section 7's redaction paragraph now says in as many
-  words. A house's first line names its own key in full, because a friend needs it to knock and nothing else prints it,
-  and the argument for that was in a code comment where the rule it bends is in this document. The house prints the same
-  notice `doctor` does, on stderr, since the harness tells an operator to keep its stdout.
-- **Text from off the machine is capped and stripped before it reaches a house's stdout**, the same two rules the gate's own
-  text already gets: a peer's QUIC close reason is bytes it chose, and it reached an operator's log through a visit that
-  ended before it opened. The `goodbye` event is also stamped when the frame is sent rather than after its acknowledgement,
-  which inflated it by up to a second in exactly the case a reader correlates two logs for: a peer that had already gone.
