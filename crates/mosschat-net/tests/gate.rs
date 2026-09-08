@@ -23,7 +23,7 @@ mod gate {
     };
     use mosschat_net::gate::server::{GateServer, GateServerConfig};
     use mosschat_net::gate::wire::{self, Addr, Frame};
-    use mosschat_net::gate::{ErrorCode, GateError, MemberList};
+    use mosschat_net::gate::{ErrorCode, GateError, MemberList, limits};
     use rand::RngExt;
 
     const LOCALHOST_ANY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
@@ -1000,6 +1000,90 @@ mod gate {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a fresh connection is never rate limited for reflecting"
+        );
+    }
+
+    /// A fifth secondary-port connection for one key inside a minute is
+    /// refused, while a different key connects and reflects untouched
+    /// (amendment 3: the secondary port carries its own 4 connection
+    /// attempts per key per minute, its own bucket).
+    ///
+    /// The refusal is the connection close carrying section 7's
+    /// `gate_rate_limited` code, not frame 12: the limit is charged as soon
+    /// as the handshake completes, before any stream is awaited, because a
+    /// limit on connections that waits for a frame does not bound
+    /// connections that never send one. That is the primary port's own
+    /// shape for the identical refusal.
+    ///
+    /// Deliberate break to fail this test, run for real: in
+    /// `server.rs::handle_secondary_connection`, remove the
+    /// `secondary_attempts` block. The fifth connection then reflects like
+    /// the first four.
+    #[tokio::test]
+    async fn a_fifth_secondary_connection_for_one_key_is_refused_but_another_key_is_not() {
+        let community = random_seed();
+        let busy_seed = random_seed();
+        let other_seed = random_seed();
+        let server = start_gate(
+            &[public_key_of(&busy_seed), public_key_of(&other_seed)],
+            community,
+            256,
+        );
+
+        // Four connections, one reflection each, which is four `mosschat
+        // doctor` runs' worth of secondary-port traffic in a minute.
+        for attempt in 1..=limits::SECONDARY_ATTEMPTS_PER_MINUTE {
+            let connection = raw_secondary(server.secondary_addr(), busy_seed)
+                .await
+                .unwrap();
+            let reply = raw_reflect(&connection).await.unwrap();
+            assert!(
+                matches!(reply, Frame::Reflected { .. }),
+                "connection {attempt} of {} must be served: {reply:?}",
+                limits::SECONDARY_ATTEMPTS_PER_MINUTE
+            );
+        }
+
+        let fifth = raw_secondary(server.secondary_addr(), busy_seed)
+            .await
+            .unwrap();
+        assert!(
+            raw_reflect(&fifth).await.is_err(),
+            "the fifth connection inside the minute must not be served"
+        );
+        let closed = tokio::time::timeout(Duration::from_secs(5), fifth.closed())
+            .await
+            .expect("the gate closes a refused connection rather than holding it");
+        match closed {
+            quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
+                u64::from(close.error_code),
+                ErrorCode::RateLimited as u64,
+                "the close must carry section 7's code, which is how the house names the reason"
+            ),
+            other => panic!("expected an application close naming the refusal: {other:?}"),
+        }
+        assert_eq!(
+            server
+                .counters()
+                .secondary_attempts_rate_limited
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // The bucket is per key: another member is untouched by it.
+        let other = raw_secondary(server.secondary_addr(), other_seed)
+            .await
+            .unwrap();
+        assert!(
+            matches!(raw_reflect(&other).await.unwrap(), Frame::Reflected { .. }),
+            "a different key's first connection is not charged for this one"
+        );
+        assert_eq!(
+            server
+                .counters()
+                .secondary_attempts_rate_limited
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
     }
 
