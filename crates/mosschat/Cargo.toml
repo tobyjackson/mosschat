@@ -17,3 +17,7 @@ mosschat-core = { path = "../mosschat-core" }
 mosschat-net = { path = "../mosschat-net" }
 mosschat-door = { path = "../mosschat-door" }
 mosschat-tui = { path = "../mosschat-tui" }
+# WO-1.3a: the `gatehouse` subcommand needs an async runtime to run
+# `mosschat-net`'s gate server. Same version pinned there.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal"] }
+rand = "0.10"

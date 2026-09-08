@@ -6,6 +6,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod authed;
+pub mod gate;
+pub mod path;
+pub mod sock;
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
