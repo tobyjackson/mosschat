@@ -46,6 +46,14 @@
 
 set -euo pipefail
 
+# CI (.github/workflows/ci.yml, job artifacts-linux) publishes prebuilt
+# release binaries; this script never runs the gatehouse itself (see the
+# comment above), but the topology-ready message below tells the operator
+# what to run next, so it uses the same two variables README.md's
+# "Getting the binaries" section sets, with the same local-build fallback
+# path as its default.
+MOSSCHAT_BIN="${MOSSCHAT_BIN:-./target/release/mosschat}"
+
 MODE="eim"
 DRY_RUN=0
 
@@ -264,7 +272,7 @@ apply_nft_snat nat-b 10.2.0.0/24 veth-nb-out 203.0.113.12
 
 echo "== topology ready (mode=$MODE) =="
 echo "gatehouse binds inside the 'internet' namespace, e.g.:"
-echo "  ip netns exec internet <path-to>/mosschat gatehouse --bind 203.0.113.1:443 --secondary-bind 203.0.113.1:444 --community <hex> --members <path>"
+echo "  ip netns exec internet $MOSSCHAT_BIN gatehouse --bind 203.0.113.1:443 --secondary-bind 203.0.113.1:444 --community <hex> --members <path>"
 echo
 echo "house-a and house-b reach it as 203.0.113.1:443 / :444 through their own NAT."
 echo
