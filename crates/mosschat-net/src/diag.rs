@@ -1642,10 +1642,13 @@ impl Recorder {
     /// The last step recorded, whatever its outcome, or `None` when nothing
     /// has been recorded yet.
     ///
-    /// It is how a caller holding an error that recorded no step of its own
-    /// works out which step was in flight: section 7's steps are recorded in
-    /// the order they were tried, so the one that failed is the one that
-    /// would have followed this.
+    /// It says how far an attempt got, and nothing more. It names no
+    /// successor: section 7's step enum is the order steps are *listed* in,
+    /// not a schedule, and which step follows a given one depends on what
+    /// the caller was doing (a `--gate` run stops after the reflections; a
+    /// `--friend` run goes on). A caller holding an error that recorded no
+    /// step of its own works out what was in flight from this plus its own
+    /// knowledge of the sequence it was running.
     #[must_use]
     pub fn last_step(&self) -> Option<Step> {
         self.inner
