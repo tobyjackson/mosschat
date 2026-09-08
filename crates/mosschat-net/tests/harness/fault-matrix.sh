@@ -411,11 +411,21 @@ compute_card() {
         tally_verdict "$CARD_VERDICT"
         return
     fi
-    # exit 0 and no failed step from here on. A row whose fault only
-    # lands after a start delay (blackout-60s, gatehouse-killed) proves
-    # nothing about that fault if the doctor was already done before the
-    # delay elapsed -- exactly the "PASS" misread this card exists to
-    # catch (Toby, PR 78 review), so it is checked before PASS/SUSPECT.
+    # exit 0 and no failed step from here on. Precedence is FAIL (above)
+    # beats SUSPECT beats NOT TESTED (Toby, PR 78 review, second pass):
+    # an incomplete record (wrong reason, or fewer than four steps) means
+    # the doctor itself misbehaved, and that must never be hidden behind
+    # "the fault did not land" -- so SUSPECT is decided first, and only a
+    # record that already looks complete and ok gets checked against a
+    # row whose fault lands after a start delay (blackout-60s,
+    # gatehouse-killed), which proves nothing about that fault if the
+    # doctor was already done before the delay elapsed.
+    if [ "$ROW_REASON" != "ok" ] || [ "$ROW_STEPS_COUNT" -lt 4 ]; then
+        CARD_VERDICT="SUSPECT"
+        CARD_NOTE="exit 0 but the record does not show a complete run"
+        tally_verdict "$CARD_VERDICT"
+        return
+    fi
     delay_s="$(row_delay_seconds "$id")"
     if [ -n "$delay_s" ]; then
         last_ms="$(last_step_at_ms "$ROW_JSON")"
@@ -427,16 +437,11 @@ compute_card() {
             return
         fi
     fi
-    if [ "$ROW_FAILED_STEP" = "null" ] && [ "$ROW_REASON" = "ok" ] && [ "$ROW_STEPS_COUNT" -ge 4 ]; then
-        CARD_VERDICT="PASS"
-        dial="$(step_at_ms "$ROW_JSON" gate_dial)"
-        reg="$(step_at_ms "$ROW_JSON" gate_register)"
-        reflect="$(step_at_ms "$ROW_JSON" reflect_secondary)"
-        CARD_NOTE="dial ${dial:-?} ms, register ${reg:-?} ms, reflect ${reflect:-?} ms"
-    else
-        CARD_VERDICT="SUSPECT"
-        CARD_NOTE="exit 0 but the record does not show a complete run"
-    fi
+    CARD_VERDICT="PASS"
+    dial="$(step_at_ms "$ROW_JSON" gate_dial)"
+    reg="$(step_at_ms "$ROW_JSON" gate_register)"
+    reflect="$(step_at_ms "$ROW_JSON" reflect_secondary)"
+    CARD_NOTE="dial ${dial:-?} ms, register ${reg:-?} ms, reflect ${reflect:-?} ms"
     tally_verdict "$CARD_VERDICT"
 }
 
@@ -494,7 +499,7 @@ print_md_header() {
     echo "- host: $host (\`uname -r\`)"
     echo "- command: \`$cmd\`"
     echo
-    echo "PASS: the row's own record shows a complete run, reason ok, no failed step, and (for a row whose fault lands after a start delay) the doctor was still running when it did. FAIL: the command exited non-zero, or the record names a failed step. SUSPECT: exit 0 but the record is incomplete (fewer than four steps) or its reason is not ok. NOT TESTED: the doctor finished on its own before a delayed fault (blackout-60s, gatehouse-killed) ever landed, so the row proves nothing about that fault either way."
+    echo "Precedence where more than one could apply: FAIL beats SUSPECT beats NOT TESTED. PASS: the row's own record shows a complete run, reason ok, no failed step, and (for a row whose fault lands after a start delay) the doctor was still running when it did. FAIL: the command exited non-zero, or the record names a failed step. SUSPECT: exit 0 but the record is incomplete (fewer than four steps) or its reason is not ok. NOT TESTED: the record is otherwise complete and ok, but the doctor finished on its own before a delayed fault (blackout-60s, gatehouse-killed) ever landed, so the row proves nothing about that fault either way."
     echo
     echo "| row | condition | verdict | exit | note |"
     echo "|---|---|---|---|---|"

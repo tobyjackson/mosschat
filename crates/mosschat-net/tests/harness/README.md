@@ -374,7 +374,11 @@ code, and a plain-English note.
 Toby is not a network engineer, so the end-of-run table reads as a
 report card rather than a bare exit-code list. Each row's own
 `<row-id>.txt` (its header plus the doctor's `--json` record, if the row
-command was the doctor) is read back into one of four verdicts:
+command was the doctor) is read back into one of four verdicts. Where
+more than one could apply to the same row, the precedence is FAIL beats
+SUSPECT beats NOT TESTED: an incomplete or wrong-reason record means the
+doctor itself misbehaved, and that must never be hidden behind "the
+fault did not land".
 
 - **PASS** -- the command exited 0 and the record shows a complete run
   (`failed_step` null, `reason` `ok`, all four gate steps present), and,
@@ -385,15 +389,18 @@ command was the doctor) is read back into one of four verdicts:
   `failed_step`. The note names the failed step and the reason in
   words, for example "failed at registering with the gate: the gate
   rate limited this house".
-- **SUSPECT** -- exit 0, but the record's `reason` is not `ok` or it has
-  fewer than four steps (an unrecorded post-dial failure, see the
-  2026-09-08 hewn-mini run below). The note says so.
+- **SUSPECT** -- exit 0, no `failed_step`, but the record's `reason` is
+  not `ok` or it has fewer than four steps (an unrecorded post-dial
+  failure, see the 2026-09-08 hewn-mini run below). The note says so.
+  Decided before NOT TESTED: a row can only be NOT TESTED once its
+  record already looks complete and ok.
 - **NOT TESTED** -- only possible for a row whose fault applies after a
   start delay (today: `blackout-60s`, at `--blackout-start-delay`, and
-  `gatehouse-killed`, at its fixed 5 s kill delay). If the record's last
-  step finished before that delay elapsed, the fault never landed on a
-  live connection, so a PASS there would be exactly the misread this
-  card exists to prevent -- caught in PR 78 review, both rows had
+  `gatehouse-killed`, at its fixed 5 s kill delay), and only once the
+  record has already cleared the SUSPECT check above. If the record's
+  last step finished before that delay elapsed, the fault never landed
+  on a live connection, so a PASS there would be exactly the misread
+  this card exists to prevent -- caught in PR 78 review, both rows had
   looked like clean passes despite the doctor finishing in a few
   milliseconds, seconds before either fault applied. The note says how
   many ms it took and when the fault would have landed, for example
@@ -423,15 +430,17 @@ anything and without root. It never writes into `<dir>` (no
 `docs/measurements/2026-09-08-hewn-mini-run2/faults` to see, without a
 Linux box, what the report card says about those two runs:
 
-- Run 1: 2 PASS, 8 SUSPECT, 2 NOT TESTED. `blackout-60s` was already
-  SUSPECT before NOT TESTED existed (the doctor defect described in
-  that run's own NOTES.md, only `gate_dial` recorded, fixed by PR 69),
-  so it moves out of SUSPECT rather than PASS; `gatehouse-killed` moves
-  out of PASS. Both now read NOT TESTED, for the same underlying reason
-  either way: the doctor finished in a handful of milliseconds, well
-  before either row's fault landed at 5 s.
-- Run 2: 10 PASS, 2 NOT TESTED. Same two rows move out of what was
-  previously 12 PASS.
+- Run 1: 2 PASS, 9 SUSPECT, 1 NOT TESTED. `blackout-60s` stays SUSPECT
+  (the doctor defect described in that run's own NOTES.md, only
+  `gate_dial` recorded, fixed by PR 69, still SUSPECT under the FAIL
+  beats SUSPECT beats NOT TESTED precedence above, since it never
+  cleared the SUSPECT check to begin with); `gatehouse-killed` had a
+  complete, ok record and moves out of PASS into NOT TESTED, the doctor
+  having finished in a handful of milliseconds, well before its fault
+  landed at 5 s.
+- Run 2: 10 PASS, 2 NOT TESTED. `blackout-60s` and `gatehouse-killed`
+  both had complete, ok records and move out of what was previously 12
+  PASS.
 
 Row files written before the `# fault-matrix.sh: exit N` line existed
 (both of those) fall back to inferring 0 when the row printed anything
