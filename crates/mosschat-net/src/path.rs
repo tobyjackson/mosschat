@@ -250,8 +250,24 @@ impl PathTable {
         self.by_synthetic.get(synthetic)
     }
 
-    /// Every direct address currently in use, which is the set of remote
-    /// addresses the porch socket accepts inbound direct packets from.
+    /// The synthetic address an inbound packet from real address `direct`
+    /// must be presented to quinn as, if any peer has proved that path.
+    ///
+    /// Allocation-free and on the receive hot path: every received datagram
+    /// asks this question, so the `Vec` [`PathTable::direct_addrs`] builds
+    /// would be one allocation per packet, which is a real cost against
+    /// section 3's reversing condition (b), the porch socket adding no more
+    /// than 20 microseconds at the median per received datagram.
+    #[must_use]
+    pub fn synthetic_for_direct(&self, direct: SocketAddr) -> Option<SocketAddr> {
+        self.by_synthetic.iter().find_map(|(synthetic, entry)| {
+            (entry.direct_addr() == Some(direct)).then_some(*synthetic)
+        })
+    }
+
+    /// Every direct address currently in use, for tests and diagnostics.
+    /// The receive path uses [`PathTable::synthetic_for_direct`] instead,
+    /// which allocates nothing.
     #[must_use]
     pub fn direct_addrs(&self) -> Vec<(SocketAddr, SocketAddr)> {
         self.by_synthetic

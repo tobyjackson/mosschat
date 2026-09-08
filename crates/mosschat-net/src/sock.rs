@@ -476,18 +476,34 @@ impl PorchSocket {
         // connection over IPv4 is dropped by the rule below, which is
         // exactly what happened when this landed.
         let addr = unmap_v4(addr);
-        let direct = {
-            let paths = self.paths.lock_or_recover();
-            paths
-                .direct_addrs()
-                .into_iter()
-                .find(|(direct, _)| unmap_v4(*direct) == addr)
-                .map(|(_, synthetic)| synthetic)
+        // The allow-list is asked first because it is the common case by a
+        // wide margin (the gate connection carries every relayed byte) and
+        // because a proved direct address is never on it, so the order
+        // changes nothing but the cost. Both lookups are allocation-free:
+        // this runs once per received datagram, against section 3's
+        // reversing condition (b), so the `Vec` an
+        // "every direct address" call would build is one allocation per
+        // packet and is not used here.
+        let bare = {
+            let allowed = self.allowed_sources.lock_or_recover();
+            if allowed.contains(&addr) {
+                return SourceVerdict::Keep;
+            }
+            allowed.is_empty()
         };
-        if let Some(synthetic) = direct {
+        if let Some(synthetic) = self.paths.lock_or_recover().synthetic_for_direct(addr) {
             return SourceVerdict::Rewrite(synthetic);
         }
-        if self.allowed_sources.lock_or_recover().contains(&addr) {
+        if bare {
+            // A porch socket that has dialled nothing and proved nothing is
+            // not yet in the regime this rule governs: the rule exists to
+            // keep a stranger's packet away from a *peer* connection, and a
+            // peer connection cannot exist before an introduction, which
+            // cannot happen before a gate is dialled. Dropping here instead
+            // would make a bare `PorchSocket` silently deaf, which is what
+            // it did when this landed: the section 3 reversing-condition
+            // benchmark, which measures exactly a bare porch socket, hung
+            // for 53 minutes on 0.05 s of CPU with every packet dropped.
             return SourceVerdict::Keep;
         }
         SourceVerdict::Drop
@@ -1198,6 +1214,33 @@ mod tests {
             assert_eq!(socket.try_recv_probe(), Some((source, probe)));
         }
 
+        /// A porch socket that has dialled nothing and proved nothing
+        /// keeps everything: the rule guards peer connections, and none
+        /// can exist before a gate is dialled. Without this the section 3
+        /// benchmark, which measures exactly a bare porch socket, receives
+        /// nothing at all and hangs.
+        ///
+        /// Deliberate break to fail this test: delete the `if bare` arm in
+        /// `PorchSocket::classify_source`. Every packet is then dropped and
+        /// the assertion on `len` fails at the first iteration.
+        #[tokio::test]
+        async fn a_porch_socket_that_has_dialled_nothing_keeps_everything() {
+            let socket = porch();
+            let source: SocketAddr = "203.0.113.55:4433".parse().unwrap();
+            let mut storage = [0xC3u8; 40];
+            let mut bufs = [IoSliceMut::new(&mut storage)];
+            let mut meta = [RecvMeta {
+                addr: source,
+                len: 40,
+                stride: 40,
+                ecn: None,
+                dst_ip: None,
+            }];
+            assert_eq!(socket.demultiplex(&mut bufs, &mut meta, 1), 1);
+            assert_eq!(meta[0].len, 40);
+            assert_eq!(socket.unknown_source_dropped(), 0);
+        }
+
         /// Section 3: a QUIC packet from an address this house has neither
         /// dialled nor proved never reaches quinn, and is counted.
         ///
@@ -1228,7 +1271,9 @@ mod tests {
             assert_eq!(socket.unknown_source_dropped(), 1);
 
             // Withdrawing the address (a `Reflect` connection closing) puts
-            // it back outside the rule.
+            // it back outside the rule. The gate's primary stays allowed,
+            // so the socket is not the bare one the arm above covers.
+            socket.allow_source("203.0.113.2:4433".parse().unwrap());
             socket.forget_source(&dialled);
             let mut storage = [0xC3u8; 40];
             let mut bufs = [IoSliceMut::new(&mut storage)];
