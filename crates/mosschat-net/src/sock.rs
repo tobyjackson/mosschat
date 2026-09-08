@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -241,8 +242,37 @@ impl PorchSocket {
     }
 }
 
+/// One task's write-readiness registration on a [`PorchSocket`] (issue #19).
+///
+/// `AsyncUdpSocket::create_io_poller`'s contract is that *each* poller
+/// "can store a separate `Waker`", so that "any number of interested tasks"
+/// wait on the same socket and "be notified concurrently"
+/// (`quinn/src/runtime.rs:44-52`). That is not decoration: every
+/// `quinn::Connection` on one endpoint builds its own poller
+/// (`quinn/src/connection.rs:907`) and calls `poll_writable` before every
+/// transmit (`:1031`), so a house with a gate connection and a peer
+/// connection on the same porch socket has two tasks waiting at once.
+///
+/// So this holds its own `writable()` future rather than calling
+/// `tokio::net::UdpSocket::poll_send_ready`, which is what it used to do.
+/// `poll_send_ready` funnels every caller into tokio's *single* per
+/// direction waker slot (`tokio-1.53.1/src/runtime/io/scheduled_io.rs:316-326`
+/// stores into one `waiters.writer`, overwriting whatever was there), so
+/// the second connection's driver silently evicted the first one's waker
+/// and the first was never woken when the socket drained. An owned
+/// `writable()` future instead pushes a node onto tokio's intrusive waiter
+/// list (`:111-131`), one per poller, and every waiter is woken. This is
+/// exactly the shape quinn's own tokio socket uses
+/// (`quinn/src/runtime/tokio.rs:58-62` through `UdpPollHelper`,
+/// `quinn/src/runtime.rs:130-153`), reproduced here rather than reused
+/// because `UdpPollHelper` is crate-private to quinn.
 struct PorchPoller {
     socket: Arc<PorchSocket>,
+    /// The in-flight `writable()` future, kept across `poll_writable` calls
+    /// so its waiter-list node stays registered, and dropped as soon as it
+    /// resolves because polling a `Future` after it is ready is a logic
+    /// error.
+    writable: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>>,
 }
 
 impl fmt::Debug for PorchPoller {
@@ -254,15 +284,34 @@ impl fmt::Debug for PorchPoller {
 impl UdpPoller for PorchPoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // A relay send never blocks on socket writability at all (see the
-        // module doc's design note on `send_datagram`); a real-address send
-        // is writable exactly when the underlying UDP socket is.
-        self.socket.udp.poll_send_ready(cx)
+        // module doc's design note on `send_datagram`), but quinn calls
+        // this before it knows a transmit's destination, so a relayed peer
+        // connection waits on the real socket too; all the more reason its
+        // wakeup must not be lost.
+        //
+        // `Self` is `Unpin` (an `Arc` and a boxed future), so `get_mut` is
+        // free of the pin gymnastics `UdpPollHelper` needs for an unboxed
+        // future.
+        let Self { socket, writable } = self.get_mut();
+        let future = writable.get_or_insert_with(|| {
+            let socket = Arc::clone(socket);
+            Box::pin(async move { socket.udp.writable().await })
+                as Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>
+        });
+        let result = future.as_mut().poll(cx);
+        if result.is_ready() {
+            *writable = None;
+        }
+        result
     }
 }
 
 impl AsyncUdpSocket for PorchSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(PorchPoller { socket: self })
+        Box::pin(PorchPoller {
+            socket: self,
+            writable: None,
+        })
     }
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
@@ -516,5 +565,92 @@ mod tests {
         let queue = socket.inbound_synthetic.lock_or_recover();
         assert_eq!(queue.len(), INBOUND_RELAY_QUEUE_CAP);
         assert_eq!(queue.front().unwrap().1, vec![0u8]);
+    }
+
+    /// A waker that counts how many times it was woken, for the
+    /// write-readiness registration test below.
+    #[derive(Debug, Default)]
+    struct CountingWaker {
+        wakes: AtomicU64,
+    }
+
+    impl CountingWaker {
+        fn wakes(&self) -> u64 {
+            self.wakes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Issue #19: every `UdpPoller` handed out by one porch socket must be
+    /// woken when the socket becomes writable, not just the one that
+    /// registered last.
+    ///
+    /// This is the wakeup race behind the stall Yseult measured (4 of 11
+    /// isolated `relay_path_carries_10_mib_unchanged` runs, ~123 s of wall
+    /// on ~1 s of CPU: parked, not spinning). A house holds two
+    /// `quinn::Connection`s on one porch socket, the gate connection and
+    /// the peer connection, and each one's driver builds its own poller and
+    /// calls `poll_writable` before every transmit. Whichever registered
+    /// second used to evict the first's waker from tokio's single
+    /// `waiters.writer` slot, so under enough send pressure for the socket
+    /// to actually report not-writable, the evicted driver slept until an
+    /// unrelated timer happened to wake it.
+    ///
+    /// The test is deterministic and needs no load: `try_io` with a closure
+    /// returning `WouldBlock` clears the socket's write readiness through
+    /// tokio's own public API, which is precisely the state a real full
+    /// send buffer produces, and the reactor then re-reports writability on
+    /// its own.
+    ///
+    /// Deliberate break to fail this test: in `PorchPoller::poll_writable`,
+    /// replace the body with `self.socket.udp.poll_send_ready(cx)` (what it
+    /// was before this commit). `first_waker` then stays at 0 wakes while
+    /// `second_waker` is woken.
+    #[tokio::test]
+    async fn every_io_poller_on_one_socket_is_woken_when_it_becomes_writable() {
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = PorchSocket::new(std_socket).unwrap();
+
+        let mut first = Arc::clone(&socket).create_io_poller();
+        let mut second = Arc::clone(&socket).create_io_poller();
+        let first_waker = Arc::new(CountingWaker::default());
+        let second_waker = Arc::new(CountingWaker::default());
+
+        let _ = socket.udp.try_io(Interest::WRITABLE, || {
+            Err::<(), io::Error>(io::ErrorKind::WouldBlock.into())
+        });
+
+        let w1 = Waker::from(Arc::clone(&first_waker));
+        let w2 = Waker::from(Arc::clone(&second_waker));
+        assert!(
+            first
+                .as_mut()
+                .poll_writable(&mut Context::from_waker(&w1))
+                .is_pending()
+        );
+        assert!(
+            second
+                .as_mut()
+                .poll_writable(&mut Context::from_waker(&w2))
+                .is_pending()
+        );
+
+        for _ in 0..200 {
+            if first_waker.wakes() > 0 && second_waker.wakes() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(second_waker.wakes() > 0, "second poller never woken");
+        assert!(first_waker.wakes() > 0, "first poller never woken");
     }
 }
