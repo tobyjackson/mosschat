@@ -20,6 +20,7 @@ use crate::authed::{self, AuthedConnection};
 use crate::gate::wire::{self, Addr, Frame, decode_relay, encode_relay};
 use crate::gate::{ErrorCode, GateError, MemberList, RateLimiter, limits};
 use crate::lockext::LockExt;
+use crate::path::{RelayShaper, ShaperStats};
 
 /// Counters a test (or an operator) can read back from a running gate.
 #[derive(Debug, Default)]
@@ -28,9 +29,22 @@ pub struct ServerCounters {
     /// named session (section 1: "dropped and counted, never answered").
     pub relay_sender_mismatch: AtomicU64,
     /// `Relay` datagrams dropped because the sending half of the session
-    /// exceeded its per-direction datagram or byte rate (section 1: 2000
-    /// datagrams/s and the 2 GiB/hour cap, each way).
+    /// exhausted its per-direction volume budget, section 1's 2 GiB per
+    /// session per hour, which is the only byte ceiling the design still
+    /// names.
+    ///
+    /// It no longer counts the per-second datagram rate: that was a
+    /// policer, whose drops are invisible to the peer connection's
+    /// congestion control, and amended section 1 replaces it with the
+    /// shaper below (issue #19). Nothing else may be counted here, so the
+    /// name keeps naming something the design still has.
     pub relay_rate_limited: AtomicU64,
+    /// `Relay` datagrams dropped because the forwarding direction's shaper
+    /// queue was already at [`crate::path::GATE_RELAY_QUEUE_DEPTH`]
+    /// (section 1: the gate cannot push back on unreliable datagrams, so
+    /// it drops the newest and counts it, but only when full: 0 for a
+    /// shaping house, the abuse cap in the open otherwise).
+    pub relay_dropped_at_full: AtomicU64,
     /// Registration attempts refused because the slot table was already at
     /// capacity.
     pub registrations_refused_at_capacity: AtomicU64,
@@ -105,21 +119,24 @@ struct KnockState {
     deadline: Instant,
 }
 
-/// A per-direction budget on one live relay session: section 1's 2000
-/// datagrams/s and 2 GiB/hour caps, each way, tracked independently so one
-/// direction filling up never throttles the other.
+/// A per-direction volume budget on one live relay session: section 1's 2
+/// GiB per hour, each way, tracked independently so one direction filling
+/// up never throttles the other.
+///
+/// The per-second datagram half of this used to live here as a second
+/// token bucket, and it was a policer: it dropped, and the drops were
+/// invisible to the congestion control of the connection whose packets
+/// they were, which is issue #19's stall. Amended section 1 replaces it
+/// with [`RelayShaper`], which delays instead. What is left here is the
+/// volume ceiling, which is a real cap on a rented box's bill rather than
+/// a rate applied to a data path.
 struct RelayLimiter {
-    datagrams: RateLimiter,
     bytes: RateLimiter,
 }
 
 impl RelayLimiter {
     fn new() -> Self {
         Self {
-            datagrams: RateLimiter::per_second(
-                limits::RELAY_DATAGRAMS_PER_SECOND,
-                limits::RELAY_DATAGRAMS_PER_SECOND,
-            ),
             #[allow(clippy::cast_precision_loss)]
             bytes: RateLimiter::capacity_per_hour(limits::RELAY_BYTES_PER_HOUR as f64),
         }
@@ -144,6 +161,27 @@ struct SessionState {
     a_to_b: StdMutex<RelayLimiter>,
     /// Charged against a datagram sent by `key_b`, forwarded to `key_a`.
     b_to_a: StdMutex<RelayLimiter>,
+    /// Section 1's shaper, one queue per direction, drained by its own
+    /// task at 10 percent over the house rate.
+    a_to_b_shaper: RelayShaper,
+    /// The `key_b` to `key_a` direction's queue.
+    b_to_a_shaper: RelayShaper,
+}
+
+impl SessionState {
+    /// Ends both directions, so each drain task's next `drain` returns
+    /// `None` and the task exits.
+    fn close_shapers(&self) {
+        self.a_to_b_shaper.close();
+        self.b_to_a_shaper.close();
+    }
+
+    /// This session's two directions folded into one summary (section 7).
+    fn shaper_stats(&self) -> ShaperStats {
+        self.a_to_b_shaper
+            .stats()
+            .merged(self.b_to_a_shaper.stats())
+    }
 }
 
 struct ServerState {
@@ -225,6 +263,7 @@ fn teardown_registration(
         let mut sessions = state.sessions.lock_or_recover();
         for id in session_ids {
             if let Some(session_state) = sessions.remove(&id) {
+                session_state.close_shapers();
                 let other_key = if session_state.key_a == peer_key {
                     session_state.key_b
                 } else {
@@ -364,6 +403,20 @@ impl GateServer {
     #[must_use]
     pub fn counters(&self) -> &ServerCounters {
         &self.state.counters
+    }
+
+    /// Every live session's shaper counters folded into one summary
+    /// (section 7's `relay_queued`, `relay_shaped_delay_us` and
+    /// `relay_dropped_at_full`, as this gate sees them).
+    #[must_use]
+    pub fn relay_shaper_stats(&self) -> ShaperStats {
+        self.state
+            .sessions
+            .lock_or_recover()
+            .values()
+            .fold(ShaperStats::default(), |acc, session| {
+                acc.merged(session.shaper_stats())
+            })
     }
 
     /// The number of currently live registrations (distinct keys), for
@@ -1077,6 +1130,8 @@ fn handle_knock_answer(
     while sessions.contains_key(&session_id) {
         session_id = rand::rng().random();
     }
+    let a_to_b_shaper = RelayShaper::gate();
+    let b_to_a_shaper = RelayShaper::gate();
     sessions.insert(
         session_id,
         SessionState {
@@ -1086,9 +1141,17 @@ fn handle_knock_answer(
             opened_at: Instant::now(),
             a_to_b: StdMutex::new(RelayLimiter::new()),
             b_to_a: StdMutex::new(RelayLimiter::new()),
+            a_to_b_shaper: a_to_b_shaper.clone(),
+            b_to_a_shaper: b_to_a_shaper.clone(),
         },
     );
     drop(sessions);
+
+    // One drain task per direction, started with the session and ended
+    // with it (`SessionState::close_shapers` on teardown, and a lost
+    // destination connection).
+    spawn_relay_drain(state, session_id, knock.target, a_to_b_shaper);
+    spawn_relay_drain(state, session_id, knock.requester, b_to_a_shaper);
 
     requester.sessions.lock_or_recover().insert(session_id);
     target.sessions.lock_or_recover().insert(session_id);
@@ -1117,52 +1180,131 @@ fn handle_knock_answer(
     );
 }
 
+/// Forwards one `Relay` datagram to the other half of its session, through
+/// that direction's shaper queue (section 1).
+///
+/// Three checks before anything is queued, in order: the session exists,
+/// the sending connection's TLS-proven key is one of its two, and the
+/// direction still has volume budget. A datagram failing any of them is
+/// dropped and counted, never answered, since an error frame would be an
+/// oracle for live sessions.
 fn forward_relay(state: &Arc<ServerState>, session: u32, sender_key: [u8; 32], payload: &[u8]) {
     #[allow(clippy::cast_precision_loss)]
     let payload_len = payload.len() as f64;
-    let other_key = {
+    enum Verdict {
+        Queue(RelayShaper),
+        OverVolume,
+        NotOurs,
+    }
+    let verdict = {
         let sessions = state.sessions.lock_or_recover();
-        let Some(session_state) = sessions.get(&session) else {
-            state
-                .counters
-                .relay_sender_mismatch
-                .fetch_add(1, Ordering::Relaxed);
-            return;
-        };
-        let (other_key, limiter) = if session_state.key_a == sender_key {
-            (session_state.key_b, &session_state.a_to_b)
-        } else if session_state.key_b == sender_key {
-            (session_state.key_a, &session_state.b_to_a)
-        } else {
-            state
-                .counters
-                .relay_sender_mismatch
-                .fetch_add(1, Ordering::Relaxed);
-            return;
-        };
-        let mut limiter = limiter.lock_or_recover();
-        let allowed = limiter.datagrams.try_take() && limiter.bytes.try_take_n(payload_len);
-        if allowed { Some(other_key) } else { None }
+        let direction = sessions.get(&session).and_then(|session_state| {
+            if session_state.key_a == sender_key {
+                Some((&session_state.a_to_b, &session_state.a_to_b_shaper))
+            } else if session_state.key_b == sender_key {
+                Some((&session_state.b_to_a, &session_state.b_to_a_shaper))
+            } else {
+                None
+            }
+        });
+        match direction {
+            None => Verdict::NotOurs,
+            Some((limiter, shaper)) => {
+                if limiter.lock_or_recover().bytes.try_take_n(payload_len) {
+                    Verdict::Queue(shaper.clone())
+                } else {
+                    Verdict::OverVolume
+                }
+            }
+        }
     };
-    let Some(other_key) = other_key else {
+    let shaper = match verdict {
+        Verdict::NotOurs => {
+            state
+                .counters
+                .relay_sender_mismatch
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        Verdict::OverVolume => {
+            state
+                .counters
+                .relay_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        Verdict::Queue(shaper) => shaper,
+    };
+    let Ok(encoded) = encode_relay(session, payload) else {
         state
             .counters
-            .relay_rate_limited
+            .relay_oversized_dropped
             .fetch_add(1, Ordering::Relaxed);
         return;
     };
-    let other = {
-        let registrations = state.registrations.lock_or_recover();
-        registrations
-            .get(&other_key)
-            .and_then(|list| list.last().cloned())
-    };
-    let Some(other) = other else {
-        return;
-    };
-    if let Ok(encoded) = encode_relay(session, payload) {
-        let _ = other.connection.send_datagram(encoded.into());
+    // Section 1: unable to push back on unreliable datagrams, the gate
+    // drops the newest and counts it, but only when full. 0 for a shaping
+    // house; the abuse cap in the open otherwise.
+    if !shaper.enqueue_or_drop(encoded) {
+        state
+            .counters
+            .relay_dropped_at_full
+            .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Runs one direction of one session's shaper queue: waits for the rate to
+/// release a batch, then writes it onto `destination_key`'s registration.
+///
+/// `send_datagram_wait` rather than `send_datagram`, because the latter
+/// silently discards the *oldest* queued datagram when the destination
+/// connection's own datagram buffer is full
+/// (`quinn/src/connection.rs:436`), which is an invisible loss of exactly
+/// the kind issue #19 is about. Waiting instead makes this queue and its
+/// `relay_dropped_at_full` the one place a relayed datagram can be delayed
+/// or dropped.
+///
+/// Exit paths, since no task may run without one: the session ending
+/// (`close_shapers`, so `drain` returns `None`), the session no longer
+/// being in the table, and the destination having no live registration
+/// left.
+fn spawn_relay_drain(
+    state: &Arc<ServerState>,
+    session: u32,
+    destination_key: [u8; 32],
+    shaper: RelayShaper,
+) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        loop {
+            let Some(payloads) = shaper.drain().await else {
+                return;
+            };
+            if !state.sessions.lock_or_recover().contains_key(&session) {
+                return;
+            }
+            let destination = {
+                let registrations = state.registrations.lock_or_recover();
+                registrations
+                    .get(&destination_key)
+                    .and_then(|list| list.last().cloned())
+            };
+            let Some(destination) = destination else {
+                return;
+            };
+            for payload in payloads {
+                if destination
+                    .connection
+                    .send_datagram_wait(payload.into())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    });
 }
 
 async fn send_error_and_close(

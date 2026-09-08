@@ -13,13 +13,16 @@
 //! 3's citation).
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::task::Waker;
+use std::time::{Duration, Instant};
 
 use std::time::Instant as ProtoInstant;
+
+use tokio::sync::Notify;
 
 use crate::lockext::LockExt;
 
@@ -73,6 +76,17 @@ struct PathInner {
     /// after a fall-back and would stretch the very timers meant to catch
     /// it.
     srtt: Mutex<Option<Duration>>,
+    /// This peer's half of section 1's shaper: the queue every datagram
+    /// relayed *to* this peer waits in, drained at the house rate. It
+    /// lives here, beside the path, because section 1 puts it here ("per
+    /// session and in the path table beside its path, so a full one
+    /// refuses only its own session") and because the send path already
+    /// has this entry in hand when it decides relay or direct.
+    ///
+    /// A direct path bypasses it entirely: shaping exists to keep the
+    /// gate's own 24 deep queue from overflowing, and a direct path has no
+    /// gate in it.
+    egress: RelayShaper,
 }
 
 /// One peer's entry in the path table: its current path kind, that peer's
@@ -99,6 +113,7 @@ impl PathEntry {
                 kind: Mutex::new(PathKind::Relay),
                 epoch: Arc::new(AtomicU64::new(0)),
                 srtt: Mutex::new(None),
+                egress: RelayShaper::house(),
             }),
         }
     }
@@ -107,6 +122,14 @@ impl PathEntry {
     #[must_use]
     pub fn kind(&self) -> PathKind {
         *self.inner.kind.lock_or_recover()
+    }
+
+    /// This peer's shaped relay egress queue (section 1). Shared with
+    /// every clone of this entry, so the porch socket's send path, the
+    /// drain task and a diagnostics read are all one queue.
+    #[must_use]
+    pub fn egress(&self) -> &RelayShaper {
+        &self.inner.egress
     }
 
     /// The address this peer's traffic currently leaves to, or `None` while
@@ -212,6 +235,459 @@ impl PathEntry {
     }
 }
 
+// ---------------------------------------------------------------------
+// The relay shaper (section 1, "The relay is shaped, not policed", issue
+// #19)
+// ---------------------------------------------------------------------
+
+/// The house side queue depth: 100 datagrams, 50 ms of
+/// [`crate::gate::limits::RELAY_DATAGRAMS_PER_SECOND`] (section 1).
+///
+/// Deep enough for a congestion window, because this queue never drops: a
+/// full one refuses the transmit instead, which quinn sees as
+/// `poll_writable` staying `Pending` until the next drain rather than as
+/// loss.
+pub const HOUSE_RELAY_QUEUE_DEPTH: usize = 100;
+
+/// The gate side queue depth: 24 datagrams, 12 ms of the house rate
+/// (section 1). 28 KiB a direction, so 56 MiB with all 1024 sessions the
+/// gate's caps permit full at once, which is the gate-wide bound entire.
+pub const GATE_RELAY_QUEUE_DEPTH: usize = 24;
+
+/// The gate drains 10 percent over the house rate (section 1): two
+/// independently timed buckets never converge, and without headroom 0.26
+/// percent of mismatch fills 24 across a 9119 datagram run, while 10
+/// percent absorbs a thousand times a quartz clock's 100 ppm.
+pub const GATE_RELAY_RATE_HEADROOM: f64 = 1.1;
+
+/// The most datagrams one drain pass hands over at once on the house side.
+///
+/// Chosen, not measured, and it is the house's half of section 1's
+/// occupancy argument: the gate queue is 24 deep, so a house that has been
+/// starved of CPU for a while must not release its whole accrued budget in
+/// one go. Tokens accrue continuously and are never discarded by this cap,
+/// so the average rate is unaffected; a backlog leaves as several batches
+/// back to back with a yield between them instead of one burst.
+const HOUSE_DRAIN_BURST: usize = 8;
+
+/// The most unspent budget the house side accumulates while idle, in
+/// datagrams. Two batches, so a session that has just been idle can still
+/// answer promptly without handing the gate more than its 24 deep queue
+/// absorbs.
+const HOUSE_TOKEN_CAP: f64 = 16.0;
+
+/// How many recent shaped delays a shaper keeps for its p50. Chosen, not
+/// measured: enough that the median describes current behaviour rather
+/// than a long-finished burst, small enough to be a fixed 4 KiB per
+/// direction.
+const DELAY_SAMPLES: usize = 1024;
+
+/// The shaper counters section 7 records, as a plain value type.
+///
+/// Deliberately no dependency on `diag`: WO-1.4b's `diag::record` calls
+/// read this struct, so the shaper must not know what a diagnostics record
+/// is (and `diag.rs` is not this work order's to touch).
+///
+/// `relay_queued` counts every datagram that entered the queue, which is
+/// every relayed datagram: each one waits for its own token, so the
+/// population `relay_shaped_delay_us` describes and the population
+/// `relay_queued` counts are the same one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShaperStats {
+    /// Datagrams that entered this direction's queue.
+    pub relay_queued: u64,
+    /// The median time a datagram waited, over the last
+    /// [`DELAY_SAMPLES`] drained, in microseconds.
+    pub relay_shaped_delay_p50_us: u64,
+    /// The longest any datagram waited, in microseconds, over the life of
+    /// this direction.
+    pub relay_shaped_delay_max_us: u64,
+    /// Datagrams dropped because the queue was already full. Zero on the
+    /// house side by construction (it refuses rather than dropping); on
+    /// the gate side it is the abuse cap in the open, and 0 for a shaping
+    /// house.
+    pub relay_dropped_at_full: u64,
+    /// Transmits refused with `WouldBlock` because the queue was full.
+    /// The last resort, since a `WouldBlock` out of `try_send` clears
+    /// write readiness endpoint-wide (`quinn/src/runtime.rs:54-59`);
+    /// `poll_writable` returning `Pending` until the next drain is the
+    /// intended back-pressure, so WO-1.3c asserts this stays 0.
+    pub relay_socket_backpressure: u64,
+}
+
+impl ShaperStats {
+    /// Folds `other` into `self` for a whole-endpoint summary: counts add,
+    /// the maximum delay is the larger of the two, and the reported p50 is
+    /// the larger of the two per-direction medians (a median of medians
+    /// would be arithmetic on a statistic that does not support it).
+    #[must_use]
+    pub fn merged(self, other: Self) -> Self {
+        Self {
+            relay_queued: self.relay_queued.saturating_add(other.relay_queued),
+            relay_shaped_delay_p50_us: self
+                .relay_shaped_delay_p50_us
+                .max(other.relay_shaped_delay_p50_us),
+            relay_shaped_delay_max_us: self
+                .relay_shaped_delay_max_us
+                .max(other.relay_shaped_delay_max_us),
+            relay_dropped_at_full: self
+                .relay_dropped_at_full
+                .saturating_add(other.relay_dropped_at_full),
+            relay_socket_backpressure: self
+                .relay_socket_backpressure
+                .saturating_add(other.relay_socket_backpressure),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ShaperState {
+    items: VecDeque<(Instant, Vec<u8>)>,
+    tokens: f64,
+    last_refill: Instant,
+    delays_us: VecDeque<u64>,
+    /// Wakers of `poll_writable` callers parked on a full queue, woken as
+    /// soon as a drain pass has popped, before it has sent anything.
+    wakers: Vec<Waker>,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct ShaperInner {
+    depth: usize,
+    per_second: f64,
+    token_cap: f64,
+    burst: usize,
+    state: Mutex<ShaperState>,
+    arrivals: Notify,
+    queued: AtomicU64,
+    dropped_at_full: AtomicU64,
+    backpressure: AtomicU64,
+    delay_max_us: AtomicU64,
+}
+
+/// One direction of one relay session's queue, drained at a fixed rate
+/// (section 1: "the relay is shaped, not policed").
+///
+/// A policer's drops are invisible to the peer connection's congestion
+/// control, so a bulk sender bursts and stalls; that is issue #19's stall.
+/// A queue drained at the rate instead delays rather than discards, and it
+/// is per session and per direction so a full one refuses only its own
+/// session.
+///
+/// Cloning shares the queue rather than copying it, exactly as
+/// [`PathEntry`] does: the sender, the drain task and the diagnostics
+/// reader are all looking at one thing.
+#[derive(Debug, Clone)]
+pub struct RelayShaper {
+    inner: Arc<ShaperInner>,
+}
+
+impl RelayShaper {
+    /// The house side of one session's egress: [`HOUSE_RELAY_QUEUE_DEPTH`]
+    /// datagrams drained at [`crate::gate::limits::RELAY_DATAGRAMS_PER_SECOND`],
+    /// refusing rather than dropping when full.
+    #[must_use]
+    pub fn house() -> Self {
+        Self::new(
+            HOUSE_RELAY_QUEUE_DEPTH,
+            f64::from(crate::gate::limits::RELAY_DATAGRAMS_PER_SECOND),
+            HOUSE_DRAIN_BURST,
+            HOUSE_TOKEN_CAP,
+        )
+    }
+
+    /// The gate side of one session's direction: [`GATE_RELAY_QUEUE_DEPTH`]
+    /// datagrams drained at [`GATE_RELAY_RATE_HEADROOM`] times the house
+    /// rate, dropping the newest and counting it when full, since the gate
+    /// cannot push back on unreliable datagrams.
+    #[must_use]
+    pub fn gate() -> Self {
+        let per_second =
+            f64::from(crate::gate::limits::RELAY_DATAGRAMS_PER_SECOND) * GATE_RELAY_RATE_HEADROOM;
+        Self::new(
+            GATE_RELAY_QUEUE_DEPTH,
+            per_second,
+            GATE_RELAY_QUEUE_DEPTH,
+            #[allow(clippy::cast_precision_loss)]
+            {
+                GATE_RELAY_QUEUE_DEPTH as f64
+            },
+        )
+    }
+
+    fn new(depth: usize, per_second: f64, burst: usize, token_cap: f64) -> Self {
+        Self {
+            inner: Arc::new(ShaperInner {
+                depth,
+                per_second,
+                token_cap,
+                burst,
+                state: Mutex::new(ShaperState {
+                    items: VecDeque::new(),
+                    // No budget at creation, so a queue's drain time is
+                    // exactly its depth over its rate, which is the
+                    // arithmetic section 1 states (100 datagrams, 50 ms;
+                    // 24 datagrams, 12 ms). Budget accrues while idle up
+                    // to `token_cap`, so the first datagram of a quiet
+                    // session waits one token time (half a millisecond at
+                    // the house rate) and no longer.
+                    tokens: 0.0,
+                    last_refill: Instant::now(),
+                    delays_us: VecDeque::new(),
+                    wakers: Vec::new(),
+                    closed: false,
+                }),
+                arrivals: Notify::new(),
+                queued: AtomicU64::new(0),
+                dropped_at_full: AtomicU64::new(0),
+                backpressure: AtomicU64::new(0),
+                delay_max_us: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// This direction's queue depth.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.inner.depth
+    }
+
+    /// How many datagrams are queued right now.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.state.lock_or_recover().items.len()
+    }
+
+    /// Whether the queue is currently empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Queues one whole transmit, all of its segments or none of them,
+    /// returning `false` if the queue has no room for all of them.
+    ///
+    /// All or nothing because a partial enqueue would be loss: quinn
+    /// retries a refused transmit whole (`quinn/src/connection.rs:1041-1052`
+    /// buffers it and re-polls), so a half-queued one would go out twice.
+    /// A refusal counts [`ShaperStats::relay_socket_backpressure`] once,
+    /// however many segments it carried.
+    pub fn try_enqueue_all(&self, payloads: Vec<Vec<u8>>) -> bool {
+        if payloads.is_empty() {
+            return true;
+        }
+        let now = Instant::now();
+        let mut state = self.inner.state.lock_or_recover();
+        if state.closed {
+            return false;
+        }
+        if state.items.len().saturating_add(payloads.len()) > self.inner.depth {
+            drop(state);
+            self.inner.backpressure.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let count = payloads.len() as u64;
+        for payload in payloads {
+            state.items.push_back((now, payload));
+        }
+        drop(state);
+        self.inner.queued.fetch_add(count, Ordering::Relaxed);
+        self.inner.arrivals.notify_one();
+        true
+    }
+
+    /// Queues one datagram, dropping this newest arrival and counting it in
+    /// [`ShaperStats::relay_dropped_at_full`] if the queue is already full.
+    ///
+    /// The gate's policy, and only the gate's: it forwards unreliable
+    /// datagrams and has nothing to push back on, so section 1 has it drop
+    /// the newest and count it, but only when full. The *newest* rather
+    /// than the oldest so that a fast sender cannot always win the queue,
+    /// and counted so the drop is never invisible, which is the whole of
+    /// issue #19.
+    ///
+    /// Returns `false` if the datagram was dropped.
+    pub fn enqueue_or_drop(&self, payload: Vec<u8>) -> bool {
+        let now = Instant::now();
+        let mut state = self.inner.state.lock_or_recover();
+        if state.closed {
+            // Not a drop at full: the session this direction belonged to
+            // has ended, and counting that as an overflow would put a
+            // number in a diagnostics record that names the wrong cause.
+            return false;
+        }
+        if state.items.len() >= self.inner.depth {
+            drop(state);
+            self.inner.dropped_at_full.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        state.items.push_back((now, payload));
+        drop(state);
+        self.inner.queued.fetch_add(1, Ordering::Relaxed);
+        self.inner.arrivals.notify_one();
+        true
+    }
+
+    /// Whether there is room for `wanted` more datagrams, registering
+    /// `waker` to be woken by the next drain pass if there is not.
+    ///
+    /// `wanted` is a whole transmit's worth of segments rather than one
+    /// datagram, because [`RelayShaper::try_enqueue_all`] takes a transmit
+    /// whole or not at all: reporting room for one and then refusing eight
+    /// is how a `WouldBlock` reaches quinn despite the `Pending` this
+    /// exists to give it.
+    ///
+    /// This is the back-pressure section 1 asks for: a full queue must
+    /// reach quinn as `poll_writable` staying `Pending` until the next
+    /// drain, not as a `WouldBlock` out of `try_send`, which clears write
+    /// readiness endpoint-wide (`quinn/src/runtime.rs:54-59`) and would
+    /// spin the retry loop at `quinn/src/connection.rs:1031-1052`.
+    ///
+    /// The waker is registered *before* the second look at the queue, so a
+    /// drain landing in between wakes it rather than being missed.
+    pub fn poll_room(&self, wanted: usize, waker: &Waker) -> bool {
+        let mut state = self.inner.state.lock_or_recover();
+        let room =
+            |state: &ShaperState| state.items.len().saturating_add(wanted) <= self.inner.depth;
+        if state.closed || room(&state) {
+            return true;
+        }
+        if !state.wakers.iter().any(|w| w.will_wake(waker)) {
+            state.wakers.push(waker.clone());
+        }
+        room(&state)
+    }
+
+    /// Waits until this direction's rate allows one or more queued
+    /// datagrams out, and hands them over in order.
+    ///
+    /// Returns `None` once [`RelayShaper::close`] has been called, which is
+    /// the drain task's exit path (no task without one).
+    ///
+    /// **Tokens accrue, batches are capped.** A drain pass hands over at
+    /// most `burst` datagrams even when more budget has accrued, so a task
+    /// that was starved of CPU catches up as several batches back to back
+    /// rather than as one burst the next queue along cannot absorb. No
+    /// budget is discarded by that cap, so the average rate is exactly the
+    /// configured one.
+    pub async fn drain(&self) -> Option<Vec<Vec<u8>>> {
+        loop {
+            enum Next {
+                Ready(Vec<Vec<u8>>, Vec<Waker>),
+                Sleep(Duration),
+                Idle,
+                Closed,
+            }
+            let next = {
+                let mut state = self.inner.state.lock_or_recover();
+                if state.closed {
+                    Next::Closed
+                } else {
+                    self.refill(&mut state);
+                    if state.items.is_empty() {
+                        Next::Idle
+                    } else if state.tokens >= 1.0 {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let budget = state.tokens.floor() as usize;
+                        let take = budget.min(state.items.len()).min(self.inner.burst).max(1);
+                        #[allow(clippy::cast_precision_loss)]
+                        {
+                            state.tokens -= take as f64;
+                        }
+                        let now = Instant::now();
+                        let mut payloads = Vec::with_capacity(take);
+                        for _ in 0..take {
+                            let Some((queued_at, payload)) = state.items.pop_front() else {
+                                break;
+                            };
+                            let waited = now
+                                .saturating_duration_since(queued_at)
+                                .as_micros()
+                                .min(u128::from(u64::MAX));
+                            #[allow(clippy::cast_possible_truncation)]
+                            let waited = waited as u64;
+                            state.delays_us.push_back(waited);
+                            while state.delays_us.len() > DELAY_SAMPLES {
+                                state.delays_us.pop_front();
+                            }
+                            self.inner.delay_max_us.fetch_max(waited, Ordering::Relaxed);
+                            payloads.push(payload);
+                        }
+                        let wakers = std::mem::take(&mut state.wakers);
+                        Next::Ready(payloads, wakers)
+                    } else {
+                        let deficit = 1.0 - state.tokens;
+                        Next::Sleep(Duration::from_secs_f64(deficit / self.inner.per_second))
+                    }
+                }
+            };
+            match next {
+                Next::Closed => return None,
+                // Popping is what frees room, so the parked `poll_writable`
+                // callers are woken here rather than after the send: a
+                // waiter that had to wait for the send would be waiting on
+                // the very connection whose driver it is.
+                Next::Ready(payloads, wakers) => {
+                    for waker in wakers {
+                        waker.wake();
+                    }
+                    return Some(payloads);
+                }
+                Next::Sleep(delay) => tokio::time::sleep(delay).await,
+                Next::Idle => self.inner.arrivals.notified().await,
+            }
+        }
+    }
+
+    fn refill(&self, state: &mut ShaperState) {
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(state.last_refill)
+            .as_secs_f64();
+        state.last_refill = now;
+        state.tokens = (state.tokens + elapsed * self.inner.per_second).min(self.inner.token_cap);
+    }
+
+    /// Ends this direction, which is the gate's session teardown and
+    /// nothing else: the route that would feed this queue is removed in
+    /// the same operation, so no sender is left holding a queue that
+    /// refuses. The drain task's next [`RelayShaper::drain`]
+    /// returns `None` and exits, anything still queued is discarded, and
+    /// every parked waker is woken so no `poll_writable` caller is left
+    /// waiting on a queue nobody will drain again.
+    pub fn close(&self) {
+        let wakers = {
+            let mut state = self.inner.state.lock_or_recover();
+            state.closed = true;
+            state.items.clear();
+            std::mem::take(&mut state.wakers)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+        self.inner.arrivals.notify_one();
+    }
+
+    /// This direction's counters, as section 7 records them.
+    #[must_use]
+    pub fn stats(&self) -> ShaperStats {
+        let p50 = {
+            let state = self.inner.state.lock_or_recover();
+            let mut samples: Vec<u64> = state.delays_us.iter().copied().collect();
+            samples.sort_unstable();
+            samples.get(samples.len() / 2).copied().unwrap_or(0)
+        };
+        ShaperStats {
+            relay_queued: self.inner.queued.load(Ordering::Relaxed),
+            relay_shaped_delay_p50_us: p50,
+            relay_shaped_delay_max_us: self.inner.delay_max_us.load(Ordering::Relaxed),
+            relay_dropped_at_full: self.inner.dropped_at_full.load(Ordering::Relaxed),
+            relay_socket_backpressure: self.inner.backpressure.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// A per peer table of [`PathEntry`] values, indexed both by the peer's
 /// ed25519 public key (how the doorbell names a peer) and by that peer's
 /// synthetic address (how the porch socket's send path names it, section
@@ -231,11 +707,35 @@ impl PathTable {
 
     /// Inserts a fresh relay-path entry for `peer`, reachable by its key
     /// and by `synthetic`, returning it.
+    ///
+    /// An entry already held under `synthetic` (from
+    /// [`PathTable::ensure_by_synthetic`], which the relay session
+    /// registration makes before the peer key is known) is adopted rather
+    /// than replaced, so the shaper queue that registration started a drain
+    /// task for stays the one the send path fills.
     pub fn insert_relay(&mut self, peer: [u8; 32], synthetic: SocketAddr) -> PathEntry {
-        let entry = PathEntry::new_relay();
+        let entry = self
+            .by_synthetic
+            .get(&synthetic)
+            .cloned()
+            .unwrap_or_else(PathEntry::new_relay);
         self.by_peer.insert(peer, entry.clone());
         self.by_synthetic.insert(synthetic, entry.clone());
         entry
+    }
+
+    /// The entry for `synthetic`, inserting a fresh relayed one if there is
+    /// none.
+    ///
+    /// A relay session is registered against a synthetic address before the
+    /// peer key that address was derived from reaches the path table, and
+    /// the session's shaper queue has to exist from the first datagram, so
+    /// this is how registration reaches it.
+    pub fn ensure_by_synthetic(&mut self, synthetic: SocketAddr) -> PathEntry {
+        self.by_synthetic
+            .entry(synthetic)
+            .or_insert_with(PathEntry::new_relay)
+            .clone()
     }
 
     /// The entry for `peer`, if any.
@@ -263,6 +763,17 @@ impl PathTable {
         self.by_synthetic.iter().find_map(|(synthetic, entry)| {
             (entry.direct_addr() == Some(direct)).then_some(*synthetic)
         })
+    }
+
+    /// Every peer's shaper counters folded into one summary, which is what
+    /// a diagnostics record for this endpoint reports (section 7).
+    #[must_use]
+    pub fn shaper_stats(&self) -> ShaperStats {
+        self.by_synthetic
+            .values()
+            .fold(ShaperStats::default(), |acc, entry| {
+                acc.merged(entry.egress().stats())
+            })
     }
 
     /// Every direct address currently in use, for tests and diagnostics.
@@ -413,6 +924,164 @@ impl Controller for EpochResettingController {
 )]
 mod tests {
     use super::*;
+
+    /// Section 1's arithmetic on the house queue, measured: 100 datagrams
+    /// at 2000 a second is 50 ms, and a full queue refuses rather than
+    /// dropping, counting the refusal in `relay_socket_backpressure`.
+    ///
+    /// The floor is the real assertion, and it cannot be beaten: a shaper
+    /// that hands 100 datagrams over in less than 45 ms is not shaping at
+    /// the rate. The ceiling is deliberately loose, since a loaded runner
+    /// can only add scheduling delay, never remove it.
+    ///
+    /// Deliberate break to fail this test: in `RelayShaper::drain`, replace
+    /// the `Next::Sleep` arm's duration with `Duration::ZERO`. The queue
+    /// then empties in about a millisecond and the 45 ms floor fails.
+    #[tokio::test]
+    async fn a_full_house_queue_drains_at_the_house_rate() {
+        let shaper = RelayShaper::house();
+        assert_eq!(shaper.depth(), HOUSE_RELAY_QUEUE_DEPTH);
+        for index in 0..HOUSE_RELAY_QUEUE_DEPTH {
+            let payload = vec![u8::try_from(index % 256).unwrap_or(0)];
+            assert!(shaper.try_enqueue_all(vec![payload]), "queue {index}");
+        }
+        assert!(
+            !shaper.try_enqueue_all(vec![vec![0xFF]]),
+            "a full house queue refuses the transmit"
+        );
+        assert_eq!(shaper.stats().relay_socket_backpressure, 1);
+        assert_eq!(
+            shaper.stats().relay_dropped_at_full,
+            0,
+            "the house queue refuses, it never drops"
+        );
+
+        let started = Instant::now();
+        let mut drained: Vec<Vec<u8>> = Vec::new();
+        while drained.len() < HOUSE_RELAY_QUEUE_DEPTH {
+            let Some(batch) = shaper.drain().await else {
+                panic!("the shaper closed mid drain");
+            };
+            drained.extend(batch);
+        }
+        let elapsed = started.elapsed();
+
+        let expected: Vec<Vec<u8>> = (0..HOUSE_RELAY_QUEUE_DEPTH)
+            .map(|index| vec![u8::try_from(index % 256).unwrap_or(0)])
+            .collect();
+        assert_eq!(drained, expected, "in order, byte for byte");
+        assert!(
+            elapsed >= Duration::from_millis(45),
+            "100 datagrams at 2000 a second is 50 ms, not {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_millis(200),
+            "the queue took {elapsed:?} to drain, far past 50 ms"
+        );
+        let stats = shaper.stats();
+        assert_eq!(
+            stats.relay_queued, HOUSE_RELAY_QUEUE_DEPTH as u64,
+            "every datagram queued"
+        );
+        assert!(
+            stats.relay_shaped_delay_max_us >= 40_000,
+            "the last datagram out of a full queue waited nearly the whole 50 ms, not {}us",
+            stats.relay_shaped_delay_max_us
+        );
+    }
+
+    /// Section 1 on the gate queue: 24 deep, and unable to push back on
+    /// unreliable datagrams the gate drops the *newest* arrival and counts
+    /// it, the 24 already queued leaving in order.
+    ///
+    /// Deliberate break to fail this test: in
+    /// `RelayShaper::enqueue_or_drop`, change the full-queue branch to
+    /// `state.items.pop_front();` before the push (drop the oldest
+    /// instead). `relay_dropped_at_full` then stays 0 and the queue's
+    /// front becomes datagram 8 rather than datagram 0.
+    #[tokio::test]
+    async fn a_datagram_arriving_on_a_full_gate_queue_is_dropped_and_counted() {
+        let shaper = RelayShaper::gate();
+        assert_eq!(shaper.depth(), GATE_RELAY_QUEUE_DEPTH);
+        for index in 0..GATE_RELAY_QUEUE_DEPTH {
+            let payload = vec![u8::try_from(index % 256).unwrap_or(0)];
+            assert!(shaper.enqueue_or_drop(payload), "queue {index}");
+        }
+        let overflow = 8;
+        for _ in 0..overflow {
+            assert!(
+                !shaper.enqueue_or_drop(vec![0xFF]),
+                "past the depth the newest is dropped"
+            );
+        }
+        assert_eq!(shaper.stats().relay_dropped_at_full, overflow);
+        assert_eq!(shaper.len(), GATE_RELAY_QUEUE_DEPTH);
+
+        let mut drained: Vec<Vec<u8>> = Vec::new();
+        while drained.len() < GATE_RELAY_QUEUE_DEPTH {
+            let Some(batch) = shaper.drain().await else {
+                panic!("the shaper closed mid drain");
+            };
+            drained.extend(batch);
+        }
+        let expected: Vec<Vec<u8>> = (0..GATE_RELAY_QUEUE_DEPTH)
+            .map(|index| vec![u8::try_from(index % 256).unwrap_or(0)])
+            .collect();
+        assert_eq!(
+            drained, expected,
+            "the rest leave in order, none of them displaced by the drops"
+        );
+    }
+
+    /// The back-pressure path of section 1: a full house queue parks the
+    /// caller's waker rather than refusing, and the next drain pass wakes
+    /// it as soon as it has *popped*, before it has sent anything.
+    ///
+    /// Deliberate break to fail this test: delete the
+    /// `std::mem::take(&mut state.wakers)` from `RelayShaper::drain` and
+    /// return an empty waker list. The waker is then never woken and the
+    /// wake count stays 0.
+    #[tokio::test]
+    async fn a_full_queue_parks_a_waker_and_the_next_drain_wakes_it() {
+        #[derive(Default)]
+        struct CountingWaker(AtomicU64);
+        impl std::task::Wake for CountingWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let counter = Arc::new(CountingWaker::default());
+        let waker = std::task::Waker::from(Arc::clone(&counter));
+
+        let shaper = RelayShaper::gate();
+        assert!(shaper.poll_room(1, &waker), "an empty queue has room");
+        for index in 0..GATE_RELAY_QUEUE_DEPTH {
+            assert!(shaper.enqueue_or_drop(vec![u8::try_from(index % 256).unwrap_or(0)]));
+        }
+        assert!(!shaper.poll_room(1, &waker), "a full queue has no room");
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+
+        let drained = shaper.drain().await.expect("a batch");
+        assert!(!drained.is_empty());
+        assert!(counter.0.load(Ordering::SeqCst) >= 1, "the pop wakes it");
+        assert!(shaper.poll_room(1, &waker), "popping made room");
+    }
+
+    /// A closed direction ends its drain task rather than leaving it parked
+    /// on a queue nobody will fill again (no task without an exit path).
+    #[tokio::test]
+    async fn closing_a_shaper_ends_its_drain() {
+        let shaper = RelayShaper::house();
+        shaper.close();
+        assert!(shaper.drain().await.is_none());
+        assert!(
+            !shaper.try_enqueue_all(vec![vec![1]]),
+            "a closed queue takes nothing more"
+        );
+    }
 
     #[test]
     fn epoch_bump_rebuilds_the_inner_controller_on_the_next_call() {
