@@ -34,15 +34,27 @@ gate yet). All 12 rows exited 0, which is NOT a pass:
   gate_dial ok, then reason "internal", failed_step null, mapping
   unknown, and still exit 0.
 
-Two defects follow, tracked with Konrad's fix:
+Two defects follow, fixed in PR 69:
 
-1. The doctor exits 0 when the gate client fails after a successful dial
-   without recording the failing step (`run_doctor_steps`, the `Err(_)`
-   branch after `connect_with_recorder`). A doctor that could not
-   register must exit 1 and name the step.
-2. Registration fails under 50 ms delay and under 5 percent loss while
-   1 percent and 10/2 percent asymmetric loss pass. Cause under
-   investigation; the error text was discarded by that same branch.
+1. The doctor exited 0 when the gate client failed after a successful
+   dial without recording the failing step (`run_doctor_steps`, the
+   `Err(_)` branch after `connect_with_recorder`), and the client's
+   registration window swallowed the gate's refusal behind bare `?`.
+2. The failures were never netem. `exit_for` ends the doctor with
+   `process::exit`, so no destructor closed the gate connection and each
+   registration lived on until quinn's 30 s idle timeout; the gate's
+   per-key sub-cap is two live connections, so the third run on one
+   identity inside that window was refused `gate_at_capacity`. Rows 3 to
+   10 ran within four seconds on one identity and measured that cap;
+   rows 11 and 12 passed only because the blackout row's 60 s hold let
+   the old registrations expire. Konrad reproduced it on loopback with
+   no netem and no root.
+
+Even with both fixed, one identity cannot run twelve rows back to back:
+the design rate limits `Reflect` (2 per minute) and `Register` (4
+connection attempts per minute) per key. The runner now mints one
+identity per doctor run (14 seeds, every public key in the members file
+before the gatehouse starts) so a rerun measures netem and nothing else.
 
 The doctor finishes in about a second, so the blackout-60s and
 gatehouse-killed rows here measured a fresh attempt into a broken or
