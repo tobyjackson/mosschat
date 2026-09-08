@@ -157,10 +157,14 @@ pub mod limits {
     pub const FRAME_RATE_BURST: u32 = 64;
     /// `Reflect`: 2 per connection (amendment 3, 2026-09-08), a hard cap
     /// and not a rate: reconnecting resets it, and the per-key brake is
-    /// [`REGISTER_ATTEMPTS_PER_MINUTE`], which bounds one key at 8
-    /// reflections a minute. Per key, as this was, it was stricter than the
-    /// connection rate it sits under, so a member allowed 4 connection
-    /// attempts a minute could reflect on only 2 of them.
+    /// [`SECONDARY_ATTEMPTS_PER_MINUTE`], the reflection port's own
+    /// connection limit, which bounds one key at 8 reflections a minute.
+    /// Not [`REGISTER_ATTEMPTS_PER_MINUTE`], which brakes nothing here: its
+    /// bucket lives on the primary port, and a key that never registers at
+    /// all can still reach the reflection port (Yseult's L1 on PR 73).
+    /// Per key, as this cap was, it was stricter than the connection rate
+    /// it sits under, so a member allowed 4 connection attempts a minute
+    /// could reflect on only 2 of them.
     pub const REFLECT_PER_CONNECTION: u32 = 2;
     /// The secondary (reflection) port's own connection attempt limit, 4
     /// per key per minute (amendment 3, 2026-09-08): a separate bucket from

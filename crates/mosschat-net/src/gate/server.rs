@@ -577,15 +577,16 @@ async fn handle_secondary_connection(
         return Ok(());
     }
 
-    let observed = authed.connection().remote_address();
     // Amendment 3 (2026-09-08): the `Reflect` cap is per connection, so its
     // whole state is this counter, which lives exactly as long as the
     // connection it bounds and needs no map, no key and no sweep. It was a
     // per-key token bucket, which made it stricter than the connection rate
     // it sits under: a member allowed 4 connection attempts a minute could
     // reflect on only 2 of them, so `mosschat doctor` run twice in a minute
-    // failed the second time. The per-key brake is `Register`'s 4 attempts
-    // a minute, which bounds this at 8 reflections a minute for one key.
+    // failed the second time. The per-key brake is this port's own
+    // `SECONDARY_ATTEMPTS_PER_MINUTE` below, which bounds one key at 8
+    // reflections a minute; not `Register`'s, whose bucket is on the
+    // primary port and gates nothing here.
     let mut reflections_served = 0u32;
     // One `Reflect` per connection is the intended use, and the house
     // closes as soon as it has its answer; the loop is what makes the cap
@@ -631,9 +632,16 @@ async fn handle_secondary_connection(
             return Ok(());
         }
         reflections_served += 1;
+        // Sampled per answer, not once for the connection (Yseult's I1 on
+        // PR 73): `remote_address` follows a completed migration, and frame
+        // 4's `observed` is defined as the source address the gate saw, so
+        // a connection that migrates between its two reflections must get
+        // the address behind the second one. It is what section 7's mapping
+        // inference compares. Before amendment 3 every answer came from a
+        // fresh connection, so a single sample was always current.
         let reply = Frame::Reflected {
             v: 1,
-            observed: Addr::from_socket_addr(observed),
+            observed: Addr::from_socket_addr(authed.connection().remote_address()),
         };
         wire::write_frame(&mut send, &reply).await?;
         send.finish().ok();
