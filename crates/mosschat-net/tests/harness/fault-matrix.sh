@@ -301,6 +301,15 @@ kill_and_verify() {
     return 0
 }
 
+# Refuses to sign anything whose /proc cmdline does not actually mention
+# "gatehouse" (issue #50 defense-in-depth): a stale or reused pid in the
+# pidfile must never get signalled just because it happens to still be
+# alive under that number.
+pid_is_gatehouse() {
+    local pid="$1"
+    [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q gatehouse
+}
+
 cleanup() {
     local ec=$?
     if [ -n "$CMD_PID" ] && kill -0 "$CMD_PID" 2>/dev/null; then
@@ -374,6 +383,12 @@ while IFS= read -r row; do
             echo "wait <row command pid>"
         else
             if [ "$start_delay" = "0" ]; then
+                # ACTIVE_SPEC set before apply, not after (issue #54): a
+                # hang or interrupt during apply_netem_targets itself, or
+                # in the gap before the old unconditional assignment
+                # further down, would otherwise leave the trap's cleanup
+                # with no spec recorded to reset.
+                ACTIVE_SPEC="$spec"
                 apply_netem_targets "$spec"
                 row_header "$outfile" "$id" "$desc" "$pass_criterion" "$spec"
             else
@@ -412,7 +427,8 @@ while IFS= read -r row; do
         if [ "$DRY_RUN" -eq 1 ]; then
             echo "timeout --kill-after=5 ${ROW_TIMEOUT} ${CMD[*]} > $outfile 2>&1 </dev/null   # backgrounded, pid recorded"
             echo "sleep $kdelay"
-            echo "pid=\$(cat $pidfile)   # gatehouse's own pidfile, written when Toby started it; see README.md"
+            echo "pid=\$(cat $pidfile)   # gatehouse's own pidfile, written from inside itself; see README.md"
+            echo "grep -q gatehouse /proc/\$pid/cmdline || refuse to signal   # pre-kill check, issue #50"
             echo "kill -TERM \$pid; wait up to 2s; kill -KILL \$pid if still alive; verify by kill -0 \$pid"
             echo "wait <row command pid>"
         else
@@ -425,14 +441,27 @@ while IFS= read -r row; do
             CMD_PID=$!
             sleep "$kdelay"
             gate_pid="$(cat "$pidfile")"
+            if ! pid_is_gatehouse "$gate_pid"; then
+                echo "fault-matrix.sh: pid $gate_pid from $pidfile is not a gatehouse process (checked /proc/$gate_pid/cmdline); refusing to signal it" >&2
+                exit 2
+            fi
+            kg_rc=0
             {
                 echo "# killing gatehouse by its recorded pid ($gate_pid) from $pidfile"
-                kill_and_verify "$gate_pid" "gatehouse"
+                kill_and_verify "$gate_pid" "gatehouse" || kg_rc=$?
+                if pid_is_gatehouse "$gate_pid" 2>/dev/null; then
+                    echo "gatehouse (pid $gate_pid): WARNING still present in /proc after kill_and_verify" >&2
+                    kg_rc=1
+                fi
             } >>"$outfile" 2>&1
+            # kill_and_verify returning 1 is a per-row failure, not a
+            # reason to abort the whole matrix under set -e (issue #55);
+            # it is already logged above, so just fold it into rc below.
             set +e
             wait "$CMD_PID"
             rc=$?
             set -e
+            [ "$kg_rc" -ne 0 ] && [ "$rc" -eq 0 ] && rc=$kg_rc
             CMD_PID=""
         fi
     else

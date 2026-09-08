@@ -76,6 +76,14 @@ would get two different NAT mappings under either mode and prove
 nothing (this was wrong in an earlier version of this harness; caught in
 PR 48 review).
 
+Run all three lines back to back, with no reading, pausing, or copy-paste
+delay between them (issue #52): each `socat` probe's conntrack entry is
+an unreplied UDP mapping, which the kernel expires on its own short
+timeout (`net.netfilter.nf_conntrack_udp_timeout`, 30s by default), so
+if the `conntrack -L` capture is delayed past that window the first
+probe's line may already be gone, and the comparison below is then
+between one live mapping and nothing, not between two.
+
 ```
 printf 'x' | sudo ip netns exec house-a socat -T 2 - UDP-DATAGRAM:203.0.113.1:443,bind=10.1.0.2:55555
 printf 'x' | sudo ip netns exec house-a socat -T 2 - UDP-DATAGRAM:203.0.113.1:444,bind=10.1.0.2:55555
@@ -125,50 +133,72 @@ on both `listen` and `dial` (`crates/mosschat-net/examples/spike.rs`),
 before it does anything network-facing, so a short-lived `listen` is
 enough to read a fixed identity's public key off.
 
+Every in-namespace step below runs the prebuilt
+`./target/debug/examples/spike` binary, never `cargo run` (issue #51):
+`cargo run` inside `ip netns exec` has to resolve, lock and possibly
+recompile through cargo's own machinery, which reaches outside
+`203.0.113.0/24` and has no route from inside these namespaces, so it
+hangs or fails; the plain prebuilt binary is what actually has the
+namespace's network access. Build it once with the `cargo build`
+command in Prerequisites above before running any of these.
+
 ```
 mkdir -p crates/mosschat-net/tests/harness/.run
 HOUSE_A_SEED=$(openssl rand -hex 32)
 HOUSE_B_SEED=$(openssl rand -hex 32)
 COMMUNITY=$(openssl rand -hex 32)
 
-sudo ip netns exec house-a env CARGO_BUILD_JOBS=3 cargo run -p mosschat-net --example spike -- \
-  listen --identity "$HOUSE_A_SEED" --bind 10.1.0.2:7777 >/tmp/spike-a-id.log 2>&1 &
-SPIKE_A_PID=$!
+sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/spike-a.pid; exec ip netns exec house-a ./target/debug/examples/spike listen --identity $HOUSE_A_SEED --bind 10.1.0.2:7777" >/tmp/spike-a-id.log 2>&1 &
 sleep 2
 HOUSE_A_PUB=$(grep -m1 'spike: identity' /tmp/spike-a-id.log | awk '{print $3}')
-kill -TERM "$SPIKE_A_PID" 2>/dev/null; wait "$SPIKE_A_PID" 2>/dev/null
+SPIKE_A_PID=$(cat crates/mosschat-net/tests/harness/.run/spike-a.pid)
+if tr '\0' ' ' </proc/$SPIKE_A_PID/cmdline 2>/dev/null | grep -q spike; then
+  kill -TERM "$SPIKE_A_PID" 2>/dev/null
+fi
+wait
 
-sudo ip netns exec house-b env CARGO_BUILD_JOBS=3 cargo run -p mosschat-net --example spike -- \
-  listen --identity "$HOUSE_B_SEED" --bind 10.2.0.2:7777 >/tmp/spike-b-id.log 2>&1 &
-SPIKE_B_PID=$!
+sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/spike-b.pid; exec ip netns exec house-b ./target/debug/examples/spike listen --identity $HOUSE_B_SEED --bind 10.2.0.2:7777" >/tmp/spike-b-id.log 2>&1 &
 sleep 2
 HOUSE_B_PUB=$(grep -m1 'spike: identity' /tmp/spike-b-id.log | awk '{print $3}')
-kill -TERM "$SPIKE_B_PID" 2>/dev/null; wait "$SPIKE_B_PID" 2>/dev/null
+SPIKE_B_PID=$(cat crates/mosschat-net/tests/harness/.run/spike-b.pid)
+if tr '\0' ' ' </proc/$SPIKE_B_PID/cmdline 2>/dev/null | grep -q spike; then
+  kill -TERM "$SPIKE_B_PID" 2>/dev/null
+fi
+wait
 
 printf '%s\n%s\n' "$HOUSE_A_PUB" "$HOUSE_B_PUB" > crates/mosschat-net/tests/harness/.run/members.txt
 echo "community: $COMMUNITY"
 cat crates/mosschat-net/tests/harness/.run/members.txt
 ```
 
-Each `kill -TERM` above stops that one `spike listen` by the exact pid
-this shell just started (`$!`), the same pattern the scripts use; there
-is no `pkill` anywhere in this harness. Save `$HOUSE_A_SEED` and
+Each `kill -TERM` above stops that one `spike listen` by the pid its own
+pidfile records, written from inside the process itself (same
+`sh -c 'echo $$ ...; exec ...'` pattern as the gatehouse below, issue
+#50's fix applied here too: `$!` right after `sudo ... &` can name
+sudo's own pid instead), and only after confirming `/proc/<pid>/cmdline`
+still says `spike` -- there is no `pkill` anywhere in this harness. Save
+`$HOUSE_A_SEED` and
 `$HOUSE_B_SEED` somewhere if you want either house's identity to be
 reproducible across runs; they are not written to disk by this snippet
 except as public keys inside `members.txt`, and `.run/` is gitignored.
 
-Now start the gatehouse inside the `internet` namespace, backgrounded so
-its pid can be recorded to a pidfile, then `wait` so the terminal still
-blocks and shows its output (`fault-matrix.sh`'s `gatehouse-killed` row
-reads this exact pidfile to know what to signal, never a name match):
+Now start the gatehouse inside the `internet` namespace, in the
+foreground so the terminal still blocks and shows its output
+(`fault-matrix.sh`'s `gatehouse-killed` row reads the pidfile below to
+know what to signal, never a name match). `$!` right after `sudo ... &`
+is **not** used here (issue #50): `sudo` does not always exec its child
+in place, so `$!` can name sudo's own pid rather than the gatehouse's, a
+SIGKILL escalation then kills sudo while the gatehouse keeps running,
+and `kill -0` on that stale pid reports success. Instead the pidfile is
+written from *inside* the process that becomes the gatehouse, by its own
+`$$`, right before `exec` replaces that shell with `ip netns exec`,
+which itself execs into the gatehouse binary in place on Linux (same
+reasoning as `netns-nat.sh`'s NAT-mode comment) -- so the pid written is
+never anyone's monitor or wrapper, it is the pid the gatehouse actually
+runs under, start to finish:
 
 ```
-sudo ip netns exec internet ./target/debug/mosschat gatehouse \
-  --bind 203.0.113.1:443 --secondary-bind 203.0.113.1:444 \
-  --community "$COMMUNITY" \
-  --members crates/mosschat-net/tests/harness/.run/members.txt &
-echo $! > crates/mosschat-net/tests/harness/.run/gatehouse.pid
-wait
+sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/gatehouse.pid; exec ip netns exec internet ./target/debug/mosschat gatehouse --bind 203.0.113.1:443 --secondary-bind 203.0.113.1:444 --community $COMMUNITY --members crates/mosschat-net/tests/harness/.run/members.txt"
 ```
 
 Leave that terminal running. If you get either flag wrong, the
@@ -179,14 +209,14 @@ In a second terminal, listen inside house-b for the connection
 fault-matrix.sh (or a manual dial) will drive:
 
 ```
-sudo ip netns exec house-b env CARGO_BUILD_JOBS=3 cargo run -p mosschat-net --example spike -- listen --bind 10.2.0.2:7777 --advertise 10.2.0.2:7777
+sudo ip netns exec house-b ./target/debug/examples/spike listen --bind 10.2.0.2:7777 --advertise 10.2.0.2:7777
 ```
 
 It prints a ticket starting `moss1...`. Copy it. In a third terminal,
 dial from house-a:
 
 ```
-sudo ip netns exec house-a env CARGO_BUILD_JOBS=3 cargo run -p mosschat-net --example spike -- dial <the ticket from house-b>
+sudo ip netns exec house-a ./target/debug/examples/spike dial <the ticket from house-b>
 ```
 
 This is a direct connection between the two houses' namespaces, not
@@ -205,7 +235,7 @@ each row measures how that connection behaves under the row's condition:
 
 ```
 sudo bash crates/mosschat-net/tests/harness/fault-matrix.sh -- \
-  ip netns exec house-a env CARGO_BUILD_JOBS=3 cargo run -p mosschat-net --example spike -- dial <ticket>
+  ip netns exec house-a ./target/debug/examples/spike dial <ticket>
 ```
 
 A ticket is single-use per spike's own design (the listener answers one
