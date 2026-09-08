@@ -1490,9 +1490,7 @@ pub async fn run_doorbell(
             // this did, called a 400 ms path dead after 1.5 s of packets
             // section 4 does not consider lost at all.
             let srtt = path.as_ref().and_then(crate::path::PathEntry::srtt);
-            if let Some(sent) = live_unanswered_since
-                && now.duration_since(sent) >= crate::live::probe_loss_deadline(srtt)
-            {
+            if live_unanswered_since.is_some_and(|sent| live_probe_lost(sent, now, srtt)) {
                 live_unanswered_since = None;
                 live_outstanding = None;
                 live_misses = live_misses.saturating_add(1);
@@ -1624,6 +1622,17 @@ pub async fn run_doorbell(
             _ = peer.closed() => return Ok(outcome),
         }
     }
+}
+
+/// Whether a live-path probe sent at `sent` counts as lost by `now`,
+/// section 4's `max(4 * srtt, 500 ms)` (Konrad's should 3).
+///
+/// A function rather than an expression inside the monitor loop so the
+/// rule is testable without a connection: the loop it lives in needs two
+/// houses, a gate and a real path before it can be exercised at all, and
+/// the thing that was wrong there was one comparison.
+fn live_probe_lost(sent: Instant, now: Instant, srtt: Option<Duration>) -> bool {
+    now.duration_since(sent) >= crate::live::probe_loss_deadline(srtt)
 }
 
 /// Holds an attempt's live state for as long as `run_doorbell` runs: the
@@ -2294,6 +2303,41 @@ mod tests {
             Some(CandidateSource::Discovery),
             "vouched and stored in its IPv4 form, so one address has one verdict"
         );
+    }
+
+    /// Konrad's should 3: the live monitor's loss deadline is section 4's
+    /// `max(4 * srtt, 500 ms)` and not a flat probe interval. A 400 ms
+    /// path is what separates them: at 500 ms its probe is not lost, and
+    /// counting a miss there called such a path dead after 1.5 seconds of
+    /// packets section 4 does not consider lost at all.
+    ///
+    /// Deliberate break to fail this test: in `live_probe_lost`, replace
+    /// `crate::live::probe_loss_deadline(srtt)` with
+    /// `LIVE_PROBE_INTERVAL`. The 400 ms path's probe is then lost at 500
+    /// ms and the second assertion fails.
+    #[test]
+    fn a_live_probe_is_lost_on_section_fours_deadline_not_on_the_probe_interval() {
+        let sent = Instant::now();
+        let slow = Some(Duration::from_millis(400));
+        // A fast path takes the 500 ms floor.
+        assert!(!live_probe_lost(
+            sent,
+            sent + Duration::from_millis(499),
+            None
+        ));
+        assert!(live_probe_lost(sent, sent + LIVE_PROBE_INTERVAL, None));
+        // A 400 ms path waits 4 * srtt, which is 1.6 s.
+        assert!(!live_probe_lost(sent, sent + LIVE_PROBE_INTERVAL, slow));
+        assert!(!live_probe_lost(
+            sent,
+            sent + Duration::from_millis(1599),
+            slow
+        ));
+        assert!(live_probe_lost(
+            sent,
+            sent + Duration::from_millis(1600),
+            slow
+        ));
     }
 
     /// Yseult's High 2: discovery gets its own bounded slot count and

@@ -1558,9 +1558,15 @@ mod tests {
     /// five silent seconds is a failure, so the test can fail.
     ///
     /// Deliberate break to fail this test: in `DiscoverySocket::bind_v4`,
-    /// delete the `set_multicast_loop_v4(true)` call. The join and the
-    /// send both still succeed and nothing is delivered, so on Linux this
-    /// fails with "no multicast datagram was delivered".
+    /// delete the `join_multicast_v4` call. The bind and the send both
+    /// still succeed and nothing is delivered, so where
+    /// [`multicast_must_work`] holds the wait asserts rather than skipping.
+    ///
+    /// Not `set_multicast_loop_v4`, which the review proposed: `IP_MULTICAST_LOOP`
+    /// defaults to enabled on both platforms here, so deleting that call
+    /// leaves delivery working and no assertion fails. The explicit call
+    /// states the requirement rather than creating it; the membership is
+    /// what the delivery actually rests on.
     #[tokio::test]
     async fn two_houses_on_loopback_multicast_discover_each_other() {
         let (alice, alice_key) = house(1);
