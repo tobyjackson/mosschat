@@ -279,8 +279,27 @@ impl GateServer {
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
         server_config.transport_config(Arc::new(transport));
 
-        let primary = quinn::Endpoint::server(server_config.clone(), config.primary_bind)?;
-        let secondary = quinn::Endpoint::server(server_config, config.secondary_bind)?;
+        // `grease_quic_bit(false)` for the same reason the house sets it
+        // (see `client.rs`): the gate's own packets travel over the house's
+        // porch socket, past a probe filter that reads the first byte, so
+        // the gate must not clear the fixed bit either. `Endpoint::new`
+        // rather than `Endpoint::server` only because the latter takes no
+        // `EndpointConfig`.
+        let mut endpoint_config = quinn::EndpointConfig::default();
+        endpoint_config.grease_quic_bit(false);
+        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+        let primary = quinn::Endpoint::new(
+            endpoint_config.clone(),
+            Some(server_config.clone()),
+            std::net::UdpSocket::bind(config.primary_bind)?,
+            Arc::clone(&runtime),
+        )?;
+        let secondary = quinn::Endpoint::new(
+            endpoint_config,
+            Some(server_config),
+            std::net::UdpSocket::bind(config.secondary_bind)?,
+            runtime,
+        )?;
         let primary_addr = primary.local_addr()?;
         let secondary_addr = secondary.local_addr()?;
 

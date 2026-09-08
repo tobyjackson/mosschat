@@ -1,9 +1,18 @@
-//! The porch socket (`docs/dev/gatehouse-design.md` section 3), WO-1.3a's
-//! slice: one real UDP socket, wrapped as a `quinn::AsyncUdpSocket`, that
-//! also relays a peer connection's datagrams through an already-registered
-//! gate session rather than sending them on the wire directly. No probes
-//! (WO-1.3b), so `may_fragment` is the only override this WO needs on the
-//! send/receive path, plus the relay indirection itself.
+//! The porch socket (`docs/dev/gatehouse-design.md` section 3): one real
+//! UDP socket, wrapped as a `quinn::AsyncUdpSocket`, that relays a peer
+//! connection's datagrams through an already-registered gate session,
+//! sends them straight to a proved direct path once the doorbell has found
+//! one, and carries the doorbell's own probes on the same socket.
+//!
+//! **Probes share this socket, they do not get their own** (section 3, and
+//! it is a decision rather than a convenience): a NAT mapping is per
+//! socket, so a hole punched on a second socket is punched on a public port
+//! that is not QUIC's. Telling the two apart on receive is the first byte:
+//! every QUIC header carries the fixed bit `0x40`, every endpoint here sets
+//! `grease_quic_bit(false)` so quinn rejects a first byte with it clear,
+//! and a probe's `0x2A` has it clear. The split is **by segment, not by
+//! buffer**, because UDP GRO can coalesce a probe behind QUIC into one
+//! buffer with a `stride` (see [`PorchSocket::demultiplex`]).
 //!
 //! **`may_fragment` must return `false`.** Its `true` default becomes
 //! `allow_mtud = !socket.may_fragment()` in `Endpoint::new_with_abstract_socket`
@@ -37,6 +46,8 @@ use tokio::io::Interest;
 use crate::gate::limits::INBOUND_RELAY_QUEUE_CAP;
 use crate::gate::wire::{decode_relay, encode_relay};
 use crate::lockext::LockExt;
+use crate::path::{PathEntry, PathTable};
+use crate::punch::{PROBE_LEN, is_probe};
 
 /// Builds the stable synthetic address for `peer_key` (section 3): `fd`, 5
 /// bytes randomised per process (`process_salt`), 10 bytes of
@@ -74,7 +85,18 @@ pub struct PorchSocket {
     /// addresses (section 3).
     state: UdpSocketState,
     relay: Mutex<RelayRoutes>,
+    /// The per peer path table of section 3, indexed by synthetic address
+    /// on the send path. A peer with a direct path leaves on the wire; a
+    /// peer without one is relayed. quinn sees neither: it always sends to
+    /// the synthetic address and always receives from it.
+    paths: Mutex<PathTable>,
     inbound_synthetic: Mutex<VecDeque<(SocketAddr, Vec<u8>)>>,
+    /// Probe segments lifted out of the inbound stream by their first byte
+    /// before quinn ever sees them (section 3, "telling probes from
+    /// QUIC"), with the real source address they arrived from, which is the
+    /// address the doorbell scores.
+    inbound_probes: Mutex<VecDeque<(SocketAddr, [u8; PROBE_LEN])>>,
+    probe_waker: Mutex<Option<Waker>>,
     waker: Mutex<Option<Waker>>,
     /// Count of inbound relayed datagrams dropped because
     /// [`crate::gate::limits::INBOUND_RELAY_QUEUE_CAP`] was already full
@@ -120,7 +142,10 @@ impl PorchSocket {
                 by_synthetic: HashMap::new(),
                 by_session: HashMap::new(),
             }),
+            paths: Mutex::new(PathTable::new()),
             inbound_synthetic: Mutex::new(VecDeque::new()),
+            inbound_probes: Mutex::new(VecDeque::new()),
+            probe_waker: Mutex::new(None),
             waker: Mutex::new(None),
             inbound_relay_dropped: AtomicU64::new(0),
             poll_recv_prefer_socket: std::sync::atomic::AtomicBool::new(false),
@@ -205,6 +230,206 @@ impl PorchSocket {
         if let Some(waker) = self.waker.lock_or_recover().take() {
             waker.wake();
         }
+    }
+
+    /// Registers `peer` in the path table on the relay path, reachable by
+    /// its key and by `synthetic`, and returns the shared entry the
+    /// doorbell upgrades and falls back on.
+    ///
+    /// Section 2 step 2: every peer starts relayed, so this is called when
+    /// the relay session is registered, not when a path is proved.
+    pub fn insert_relay_path(&self, peer: [u8; 32], synthetic: SocketAddr) -> PathEntry {
+        self.paths.lock_or_recover().insert_relay(peer, synthetic)
+    }
+
+    /// The path entry for `peer`, if it has one.
+    #[must_use]
+    pub fn path_for(&self, peer: &[u8; 32]) -> Option<PathEntry> {
+        self.paths.lock_or_recover().get(peer).cloned()
+    }
+
+    /// Sends one already-encoded probe straight to `to` on the real socket,
+    /// bypassing the relay and the path table both.
+    ///
+    /// A probe is how a candidate is proved, so it must go to the candidate
+    /// itself even while this peer's traffic is still relayed; and it rides
+    /// this socket rather than a second one because a NAT mapping is per
+    /// socket, so anything punched on another socket is punched on a public
+    /// port that is not QUIC's (section 3).
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the underlying send returns, including
+    /// [`io::ErrorKind::WouldBlock`] if the socket is not writable; a probe
+    /// is cheap and repeated every 100 ms, so a caller may simply drop it.
+    pub fn send_probe(&self, to: SocketAddr, probe: &[u8; PROBE_LEN]) -> io::Result<()> {
+        let transmit = Transmit {
+            destination: to,
+            ecn: None,
+            contents: probe,
+            segment_size: None,
+            src_ip: None,
+        };
+        self.udp.try_io(Interest::WRITABLE, || {
+            self.state.send((&self.udp).into(), &transmit)
+        })
+    }
+
+    /// Takes the next probe lifted out of the inbound stream, if one is
+    /// waiting, with the real source address it arrived from.
+    #[must_use]
+    pub fn try_recv_probe(&self) -> Option<(SocketAddr, [u8; PROBE_LEN])> {
+        self.inbound_probes.lock_or_recover().pop_front()
+    }
+
+    /// Waits for the next inbound probe.
+    ///
+    /// One waiter at a time: the doorbell is a single task per house, and a
+    /// second waiter would silently displace the first, which is the very
+    /// shape issue #19 was.
+    pub async fn recv_probe(&self) -> (SocketAddr, [u8; PROBE_LEN]) {
+        std::future::poll_fn(|cx| {
+            if let Some(probe) = self.try_recv_probe() {
+                return Poll::Ready(probe);
+            }
+            *self.probe_waker.lock_or_recover() = Some(cx.waker().clone());
+            match self.try_recv_probe() {
+                Some(probe) => Poll::Ready(probe),
+                None => Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    /// Rewrites one received buffer in place, dropping every probe segment
+    /// into the probe queue and repacking what is left.
+    ///
+    /// Section 3 requires the split to be **by segment, not by buffer**:
+    /// quinn-udp opportunistically enables UDP GRO, and `RecvMeta::stride`
+    /// documents that one buffer may hold several datagrams with the last
+    /// shorter, so a probe can arrive coalesced behind QUIC. Returns the
+    /// number of bytes of QUIC left in the buffer, which is zero if the
+    /// whole buffer was probes.
+    fn filter_probes(&self, buf: &mut [u8], meta: &RecvMeta) -> usize {
+        let stride = if meta.stride == 0 {
+            meta.len
+        } else {
+            meta.stride
+        };
+        let len = meta.len.min(buf.len());
+        let mut read = 0usize;
+        let mut write = 0usize;
+        let mut probes = Vec::new();
+        while read < len {
+            let end = read.saturating_add(stride).min(len);
+            let Some(segment) = buf.get(read..end) else {
+                break;
+            };
+            if is_probe(segment) {
+                let mut probe = [0u8; PROBE_LEN];
+                if let Some(source) = segment.get(..PROBE_LEN) {
+                    probe.copy_from_slice(source);
+                    probes.push(probe);
+                }
+            } else {
+                let segment_len = end.saturating_sub(read);
+                if write != read {
+                    buf.copy_within(read..end, write);
+                }
+                write = write.saturating_add(segment_len);
+            }
+            read = end;
+        }
+        if !probes.is_empty() {
+            let mut queue = self.inbound_probes.lock_or_recover();
+            for probe in probes {
+                queue.push_back((meta.addr, probe));
+            }
+            drop(queue);
+            if let Some(waker) = self.probe_waker.lock_or_recover().take() {
+                waker.wake();
+            }
+        }
+        write
+    }
+
+    /// The synthetic address a real source address must be presented to
+    /// quinn as, or `None` if quinn may see it unchanged.
+    ///
+    /// **Half of section 3's rule, deliberately, with the other half named
+    /// rather than guessed.** The rewrite is here: an inbound packet from a
+    /// peer's proved direct path is presented as that peer's stable
+    /// synthetic address, which is the indirection that lets an upgrade
+    /// happen without quinn migrating, and without a **client**
+    /// connection hitting `panic!("packets from unknown remote should be
+    /// dropped by clients")`
+    /// (`quinn-proto/src/connection/mod.rs:3016-3018`).
+    ///
+    /// The other half, "direct packets from an address in no peer's
+    /// candidate table are dropped", is **not** implemented here and must
+    /// not be approximated: this layer is told about the gate connection
+    /// and the path table and nothing else, so a legitimate real source it
+    /// has never heard of, the gate's *secondary* reflection port among
+    /// them, would be dropped with it. Dropping needs the candidate table
+    /// the doorbell holds, and the flag WO-4.1 needs for an outstanding
+    /// invite, neither of which reaches the socket yet. Until then quinn's
+    /// own connection-ID routing is what keeps a stranger's packet from
+    /// reaching a connection, which is weaker than the design asks for and
+    /// is recorded as such.
+    fn synthetic_source_for(&self, addr: SocketAddr) -> Option<SocketAddr> {
+        let paths = self.paths.lock_or_recover();
+        paths
+            .direct_addrs()
+            .into_iter()
+            .find(|(direct, _)| *direct == addr)
+            .map(|(_, synthetic)| synthetic)
+    }
+
+    /// Splits one batch of received buffers into what quinn may see and
+    /// what it may not: probe segments go to the probe queue, QUIC segments
+    /// stay, and a source address in no peer's path table is dropped.
+    ///
+    /// Returns how many of the `count` buffers still carry QUIC bytes. A
+    /// buffer emptied here keeps its slot with `len` zero rather than being
+    /// compacted out, because quinn reads exactly `buf[0..meta.len]` and
+    /// then loops `while !data.is_empty()`
+    /// (`quinn/src/endpoint.rs:795-799`), so a zero-length entry costs one
+    /// skipped iteration and nothing else, while shuffling the slots would
+    /// have to move the buffers to match.
+    fn demultiplex(
+        &self,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+        count: usize,
+    ) -> usize {
+        let mut carrying = 0usize;
+        let limit = count.min(bufs.len()).min(meta.len());
+        for index in 0..limit {
+            let Some(original) = meta.get(index).copied() else {
+                break;
+            };
+            let Some(buf) = bufs.get_mut(index) else {
+                break;
+            };
+            let kept = self.filter_probes(buf, &original);
+            let synthetic = if kept == 0 {
+                None
+            } else {
+                self.synthetic_source_for(original.addr)
+            };
+            let Some(slot) = meta.get_mut(index) else {
+                break;
+            };
+            slot.len = kept;
+            if kept == 0 {
+                continue;
+            }
+            if let Some(synthetic) = synthetic {
+                slot.addr = synthetic;
+            }
+            carrying = carrying.saturating_add(1);
+        }
+        carrying
     }
 
     /// Fills up to `budget` leading slots of `bufs`/`meta` from the inbound
@@ -315,6 +540,29 @@ impl AsyncUdpSocket for PorchSocket {
     }
 
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+        // Section 2 step 6: once a candidate has proved itself, this peer's
+        // traffic leaves on the wire to it. The batch passes through
+        // untouched, GSO intact, with only the destination rewritten from
+        // the synthetic address quinn addressed it to; splitting it the way
+        // the relay must would throw away the one advantage a direct path
+        // has.
+        let direct = self
+            .paths
+            .lock_or_recover()
+            .get_by_synthetic(&transmit.destination)
+            .and_then(crate::path::PathEntry::direct_addr);
+        if let Some(direct) = direct {
+            let rewritten = Transmit {
+                destination: direct,
+                ecn: transmit.ecn,
+                contents: transmit.contents,
+                segment_size: transmit.segment_size,
+                src_ip: transmit.src_ip,
+            };
+            return self.udp.try_io(Interest::WRITABLE, || {
+                self.state.send((&self.udp).into(), &rewritten)
+            });
+        }
         let session = {
             let routes = self.relay.lock_or_recover();
             routes.by_synthetic.get(&transmit.destination).copied()
@@ -424,7 +672,21 @@ impl AsyncUdpSocket for PorchSocket {
                             .recv((&self.udp).into(), remaining_bufs, remaining_meta)
                     });
                     match result {
-                        Ok(n) => break Some(Ok(n)),
+                        Ok(n) => {
+                            let carrying = self.demultiplex(remaining_bufs, remaining_meta, n);
+                            // Section 3: "if a whole batch was probes it
+                            // loops and re-polls rather than returning
+                            // `Ok(0)`, which quinn's driver would treat as
+                            // progress". Only when this call has nothing
+                            // else to hand back, for the same reason the
+                            // `WouldBlock` arm below is guarded: once the
+                            // queue has served something, looping here
+                            // would discard it by never returning.
+                            if carrying == 0 && filled == 0 {
+                                continue;
+                            }
+                            break Some(Ok(n));
+                        }
                         // `poll_recv_ready` can report ready and then have
                         // the non-blocking read turn up `WouldBlock` anyway
                         // (a spurious or already-consumed readiness event);
@@ -652,5 +914,261 @@ mod tests {
         }
         assert!(second_waker.wakes() > 0, "second poller never woken");
         assert!(first_waker.wakes() > 0, "first poller never woken");
+    }
+
+    // ------------------------------------------------------------------
+    // WO-1.3b, the doorbell's half of the porch socket (section 3). Nested
+    // under `punch` so `cargo test -p mosschat-net punch::` catches these
+    // alongside `punch.rs`'s own tests, which is the work order's verify
+    // line: these cases are the doorbell's, not WO-1.3a's.
+    // ------------------------------------------------------------------
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+    mod punch {
+        use super::super::*;
+        use crate::punch::{PROBE_LEN, PROBE_PING, Probe};
+        use std::time::Duration;
+
+        const PROBE_KEY: [u8; 32] = [11u8; 32];
+        const ATTEMPT: [u8; 16] = [12u8; 16];
+
+        fn a_probe() -> [u8; PROBE_LEN] {
+            Probe {
+                kind: PROBE_PING,
+                attempt: ATTEMPT,
+                tx: [1u8; 8],
+                observed: crate::gate::wire::Addr::default(),
+            }
+            .encode(&PROBE_KEY)
+        }
+
+        /// Waits until the real socket is writable, through the same
+        /// `UdpPoller` quinn uses, because `try_io` reports `WouldBlock`
+        /// until the reactor has first observed writability.
+        async fn wait_writable(socket: &Arc<PorchSocket>) {
+            let mut poller = Arc::clone(socket).create_io_poller();
+            std::future::poll_fn(|cx| poller.as_mut().poll_writable(cx))
+                .await
+                .unwrap();
+        }
+
+        fn porch() -> Arc<PorchSocket> {
+            let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            std_socket.set_nonblocking(true).unwrap();
+            PorchSocket::new(std_socket).unwrap()
+        }
+
+        /// Section 3: "The filter lives in the porch socket's `poll_recv`
+        /// and must split by segment, not by buffer". One GRO batch
+        /// carrying a QUIC packet and a probe delivers the QUIC packet to
+        /// quinn, unaltered and re-addressed to the peer's synthetic
+        /// address, and the probe to the doorbell, with the real source
+        /// address the doorbell scores.
+        ///
+        /// Deliberate break to fail this test: in
+        /// `PorchSocket::filter_probes`, replace the `while read < len`
+        /// segment walk with a single `is_probe(&buf[..len])` check on the
+        /// whole buffer. The coalesced probe is then never seen, the QUIC
+        /// packet's length stays 1281, and `try_recv_probe` returns `None`.
+        #[tokio::test]
+        async fn probe_and_quic_in_one_gro_batch_each_reach_their_own_consumer() {
+            let socket = porch();
+            let synthetic = synthetic_addr([1, 2, 3, 4, 5], &[9u8; 32]);
+            let direct: SocketAddr = "203.0.113.4:4433".parse().unwrap();
+            let entry = socket.insert_relay_path([9u8; 32], synthetic);
+            entry.upgrade_to(direct);
+            // A gate must be attachable-looking for `classify_source` to
+            // reach its drop arm at all; with no gate attached every source
+            // is kept, so the rewrite is what this asserts.
+            let stride = 1200usize;
+            let quic: Vec<u8> = (0..stride).map(|i| (i % 251) as u8).collect();
+            let probe = a_probe();
+
+            let mut storage = vec![0u8; stride + PROBE_LEN];
+            storage[..stride].copy_from_slice(&quic);
+            storage[stride..].copy_from_slice(&probe);
+            let mut bufs = [IoSliceMut::new(&mut storage)];
+            let mut meta = [RecvMeta {
+                addr: direct,
+                len: stride + PROBE_LEN,
+                stride,
+                ecn: None,
+                dst_ip: None,
+            }];
+
+            assert_eq!(socket.demultiplex(&mut bufs, &mut meta, 1), 1);
+            assert_eq!(meta[0].len, stride, "the probe segment is removed");
+            assert_eq!(
+                meta[0].addr, synthetic,
+                "quinn sees the synthetic address, never the real one"
+            );
+            assert_eq!(
+                &bufs[0][..stride],
+                &quic[..],
+                "the QUIC packet is unaltered"
+            );
+            assert_eq!(socket.try_recv_probe(), Some((direct, probe)));
+            assert_eq!(socket.try_recv_probe(), None);
+        }
+
+        /// The probe can equally arrive first, which makes the stride 81:
+        /// GRO coalesces same-size datagrams with only the last shorter.
+        /// And a batch that was nothing but probes leaves quinn nothing,
+        /// which is what makes `poll_recv` loop and re-poll rather than
+        /// return `Ok(0)`.
+        #[tokio::test]
+        async fn a_batch_of_only_probes_leaves_quinn_nothing_to_read() {
+            let socket = porch();
+            let probe = a_probe();
+            let source: SocketAddr = "203.0.113.8:4433".parse().unwrap();
+            let mut storage = [0u8; PROBE_LEN * 3];
+            for slot in 0..3 {
+                storage[slot * PROBE_LEN..(slot + 1) * PROBE_LEN].copy_from_slice(&probe);
+            }
+            let mut bufs = [IoSliceMut::new(&mut storage)];
+            let mut meta = [RecvMeta {
+                addr: source,
+                len: PROBE_LEN * 3,
+                stride: PROBE_LEN,
+                ecn: None,
+                dst_ip: None,
+            }];
+            assert_eq!(socket.demultiplex(&mut bufs, &mut meta, 1), 0);
+            assert_eq!(meta[0].len, 0);
+            for _ in 0..3 {
+                assert_eq!(socket.try_recv_probe(), Some((source, probe)));
+            }
+            assert_eq!(socket.try_recv_probe(), None);
+        }
+
+        /// A probe still reaches the doorbell when it arrives before the
+        /// QUIC packet in the same buffer, and the surviving QUIC segment
+        /// is moved to the front rather than left where it lay.
+        #[tokio::test]
+        async fn a_leading_probe_is_removed_and_what_follows_is_repacked() {
+            let socket = porch();
+            let probe = a_probe();
+            let source: SocketAddr = "203.0.113.8:4433".parse().unwrap();
+            let quic = [0xC3u8; PROBE_LEN];
+            let mut storage = [0u8; PROBE_LEN * 2];
+            storage[..PROBE_LEN].copy_from_slice(&probe);
+            storage[PROBE_LEN..].copy_from_slice(&quic);
+            let mut bufs = [IoSliceMut::new(&mut storage)];
+            let mut meta = [RecvMeta {
+                addr: source,
+                len: PROBE_LEN * 2,
+                stride: PROBE_LEN,
+                ecn: None,
+                dst_ip: None,
+            }];
+            assert_eq!(socket.demultiplex(&mut bufs, &mut meta, 1), 1);
+            assert_eq!(meta[0].len, PROBE_LEN);
+            assert_eq!(&bufs[0][..PROBE_LEN], &quic);
+            assert_eq!(socket.try_recv_probe(), Some((source, probe)));
+        }
+
+        /// Section 2 step 6 and step 7 at the socket: once a candidate has
+        /// proved itself the peer's traffic leaves on the wire to it, with
+        /// the GSO batch passed through untouched; once that path is
+        /// killed it goes back to the relay, and the end to end connection
+        /// is not touched by either move.
+        ///
+        /// Deliberate break to fail this test: in `PorchSocket::try_send`,
+        /// delete the `if let Some(direct) = direct` block, so an upgraded
+        /// peer keeps being relayed. The direct receiver then reads
+        /// nothing and the first `recv_from` times out.
+        #[tokio::test]
+        async fn a_proved_candidate_takes_traffic_off_the_relay_and_a_kill_puts_it_back() {
+            let socket = porch();
+            let synthetic = synthetic_addr([1, 2, 3, 4, 5], &[9u8; 32]);
+            let entry = socket.insert_relay_path([9u8; 32], synthetic);
+            socket.register_relay_session(77, synthetic);
+
+            // The "peer", a plain UDP socket standing in for the far side
+            // of a proved direct path.
+            let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer_addr = peer.local_addr().unwrap();
+
+            // Relayed: with no gate attached there is nowhere to relay to,
+            // which is exactly the observable difference from a direct
+            // path and needs no gate to assert.
+            let payload = [0x42u8; 300];
+            let transmit = Transmit {
+                destination: synthetic,
+                ecn: None,
+                contents: &payload,
+                segment_size: None,
+                src_ip: None,
+            };
+            assert!(
+                socket.try_send(&transmit).is_err(),
+                "a relayed peer with no gate attached has nowhere to send"
+            );
+
+            assert!(entry.upgrade_to(peer_addr));
+            assert_eq!(entry.epoch().load(Ordering::SeqCst), 1);
+            wait_writable(&socket).await;
+            socket.try_send(&transmit).unwrap();
+            let mut buf = [0u8; 1500];
+            let (n, from) = tokio::time::timeout(Duration::from_secs(5), peer.recv_from(&mut buf))
+                .await
+                .expect("the direct path must carry the packet")
+                .unwrap();
+            assert_eq!(&buf[..n], &payload);
+            assert_eq!(from, socket.local_addr().unwrap());
+
+            assert_eq!(entry.fall_back_to_relay(), Some(peer_addr));
+            assert_eq!(entry.epoch().load(Ordering::SeqCst), 2);
+            assert!(
+                socket.try_send(&transmit).is_err(),
+                "a killed path puts this peer back on the relay"
+            );
+            // The relay session was never deregistered by either move: the
+            // end to end connection rides the same session it always did.
+            assert_eq!(
+                socket.relay.lock_or_recover().by_synthetic.get(&synthetic),
+                Some(&77)
+            );
+        }
+
+        /// A direct path passes a GSO batch through untouched, which is the
+        /// advantage a direct path has and the reason the relay's splitting
+        /// rule is not applied to it.
+        #[tokio::test]
+        async fn a_direct_path_passes_a_gso_batch_through_untouched() {
+            let socket = porch();
+            let synthetic = synthetic_addr([1, 2, 3, 4, 5], &[9u8; 32]);
+            let entry = socket.insert_relay_path([9u8; 32], synthetic);
+            let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            entry.upgrade_to(peer.local_addr().unwrap());
+
+            let segment = 400usize;
+            let contents: Vec<u8> = (0..segment * 3).map(|i| (i % 251) as u8).collect();
+            wait_writable(&socket).await;
+            socket
+                .try_send(&Transmit {
+                    destination: synthetic,
+                    ecn: None,
+                    contents: &contents,
+                    segment_size: Some(segment),
+                    src_ip: None,
+                })
+                .unwrap();
+
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 2000];
+            while seen.len() < segment * 3 {
+                let n = tokio::time::timeout(Duration::from_secs(5), peer.recv(&mut buf))
+                    .await
+                    .expect("every segment must arrive")
+                    .unwrap();
+                seen.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(seen, contents);
+        }
     }
 }

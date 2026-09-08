@@ -419,7 +419,19 @@ impl GateClient {
         let porch = PorchSocket::new(std_socket)?;
         let runtime: Arc<dyn quinn::Runtime> =
             Arc::new(quinn::TokioRuntime).clone() as Arc<dyn quinn::Runtime>;
-        let endpoint_config = quinn::EndpointConfig::default();
+        // Section 3, "telling probes from QUIC": every QUIC header must
+        // carry the fixed bit 0x40, but quinn enforces it on receive only
+        // when greasing is off (`quinn-proto/src/packet.rs:585-586` from
+        // `quinn-proto/src/endpoint.rs:158-161`) and greasing defaults to
+        // on (`quinn-proto/src/config/mod.rs:63`), letting a peer clear the
+        // bit at random. With it on, an 81 byte short-header packet whose
+        // greased first byte happened to be 0x2A would be eaten by the
+        // porch socket's probe filter, which is exactly half (a) of section
+        // 3's reversing condition. Off, our own peers never clear it and
+        // quinn rejects any first byte with it clear, so 0x2A is
+        // unambiguous in both directions.
+        let mut endpoint_config = quinn::EndpointConfig::default();
+        endpoint_config.grease_quic_bit(false);
         let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
             endpoint_config,
             Some(server_config),

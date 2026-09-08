@@ -13,10 +13,15 @@
 //! 3's citation).
 
 use std::any::Any;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use std::time::Instant as ProtoInstant;
+
+use crate::lockext::LockExt;
 
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics, CubicConfig};
 
@@ -41,61 +46,180 @@ pub fn peer_transport_config(epoch: Arc<AtomicU64>) -> Arc<quinn::TransportConfi
     Arc::new(transport)
 }
 
-/// The kind of path a peer is currently using. WO-1.3a only ever produces
-/// [`PathKind::Relay`]; WO-1.3b adds [`PathKind::Direct`] and the switching
-/// logic that bumps a peer's epoch when it changes.
+/// The kind of path a peer is currently using.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
     /// Traffic for this peer rides `Relay` datagrams through the gate.
     Relay,
+    /// Traffic for this peer leaves on the wire to this address, a
+    /// candidate that proved itself by section 2 step 6's three consecutive
+    /// answers.
+    Direct(SocketAddr),
 }
 
-/// One peer's entry in the path table: its current path kind and the
-/// congestion-reset epoch shared with that peer's [`EpochControllerFactory`].
+/// The mutable half of one peer's path, shared by every clone of its
+/// [`PathEntry`] so the porch socket's send path and the doorbell's upgrade
+/// decision are looking at the same value rather than at two copies that
+/// drift.
+#[derive(Debug)]
+struct PathInner {
+    kind: Mutex<PathKind>,
+    epoch: Arc<AtomicU64>,
+    /// This path's own smoothed round trip time, an EWMA over probe pong
+    /// round trips, **reset to `None` on every switch** so the first sample
+    /// on the new path seeds it afresh (section 3, "RTT, out of quinn's
+    /// hands"). Section 4's `8 * srtt` and `4 * srtt` read this and never
+    /// `quinn::Connection::rtt()`, which stays stale for several samples
+    /// after a fall-back and would stretch the very timers meant to catch
+    /// it.
+    srtt: Mutex<Option<Duration>>,
+}
+
+/// One peer's entry in the path table: its current path kind, that peer's
+/// own smoothed RTT, and the congestion-reset epoch shared with its
+/// [`EpochControllerFactory`].
+///
+/// Cloning shares the state rather than copying it, so an entry handed to
+/// the doorbell and the copy the table holds are one thing.
 #[derive(Debug, Clone)]
 pub struct PathEntry {
-    kind: PathKind,
-    epoch: Arc<AtomicU64>,
+    inner: Arc<PathInner>,
 }
 
 impl PathEntry {
     /// Builds a fresh entry starting on the relay path, epoch zero.
+    ///
+    /// Every peer starts here: section 2 step 2 has traffic flowing through
+    /// the relay from the first packet, and an upgrade is something that
+    /// happens to a connection already carrying data.
     #[must_use]
     pub fn new_relay() -> Self {
         Self {
-            kind: PathKind::Relay,
-            epoch: Arc::new(AtomicU64::new(0)),
+            inner: Arc::new(PathInner {
+                kind: Mutex::new(PathKind::Relay),
+                epoch: Arc::new(AtomicU64::new(0)),
+                srtt: Mutex::new(None),
+            }),
         }
     }
 
     /// The current path kind.
     #[must_use]
     pub fn kind(&self) -> PathKind {
-        self.kind
+        *self.inner.kind.lock_or_recover()
+    }
+
+    /// The address this peer's traffic currently leaves to, or `None` while
+    /// it is relayed. This is the one question the porch socket's send path
+    /// asks, on every transmit.
+    #[must_use]
+    pub fn direct_addr(&self) -> Option<SocketAddr> {
+        match self.kind() {
+            PathKind::Relay => None,
+            PathKind::Direct(addr) => Some(addr),
+        }
     }
 
     /// The epoch counter, shared with this peer's congestion controller
-    /// factory so a future path switch (WO-1.3b) can force a fresh
-    /// controller by incrementing it.
+    /// factory so a path switch forces a fresh controller by incrementing
+    /// it.
     #[must_use]
     pub fn epoch(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.epoch)
+        Arc::clone(&self.inner.epoch)
     }
 
     /// Bumps the epoch, forcing the next congestion controller call to
-    /// rebuild from scratch. Unused by WO-1.3a (one path kind only) but
-    /// exercised directly by this module's tests, since WO-1.3b's real path
-    /// switch is out of scope here.
+    /// rebuild from scratch.
     pub fn bump_epoch(&self) {
-        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.inner.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Section 2 step 6: a candidate proved itself, so move this peer's
+    /// outbound traffic to `addr`.
+    ///
+    /// **What a switch must reset, and why it is done here rather than left
+    /// to quinn** (section 3): quinn rebuilds the congestion controller,
+    /// pacer, RTT estimator and MTU discovery per path in `PathData::new`,
+    /// but our peer connection never migrates, because it only ever sees
+    /// one synthetic address, so it would otherwise carry one path's state
+    /// across two paths that share nothing. `Connection::path_changed`
+    /// exists in quinn-proto for exactly this and is not re-exported by
+    /// quinn 0.11.11, so the three are handled separately: congestion and
+    /// pacing by the epoch bumped here, RTT by the `srtt` cleared here, and
+    /// MTU by not having one to reset, every peer connection being pinned
+    /// at QUIC's 1200 byte floor with discovery off (see
+    /// [`peer_transport_config`]) precisely so that the number that is safe
+    /// on a LAN is the number that is safe on the relay.
+    ///
+    /// Returns `false` if this peer was already direct to `addr`, in which
+    /// case nothing is reset: re-upgrading to the path already in use would
+    /// throw away a healthy congestion window for nothing.
+    pub fn upgrade_to(&self, addr: SocketAddr) -> bool {
+        {
+            let mut kind = self.inner.kind.lock_or_recover();
+            if *kind == PathKind::Direct(addr) {
+                return false;
+            }
+            *kind = PathKind::Direct(addr);
+        }
+        *self.inner.srtt.lock_or_recover() = None;
+        self.bump_epoch();
+        true
+    }
+
+    /// Section 2 step 7: the direct path failed, so revert this peer to the
+    /// relay session, resetting the same three things
+    /// [`PathEntry::upgrade_to`] resets and for the same reason.
+    ///
+    /// **The end to end QUIC connection is kept**, which is section 3's
+    /// whole premise: it never learns the path moved, the porch stream
+    /// stays open, and neither the dial nor the peer handshake reruns.
+    ///
+    /// Returns the address that was dropped, or `None` if this peer was
+    /// already relayed.
+    pub fn fall_back_to_relay(&self) -> Option<SocketAddr> {
+        let previous = {
+            let mut kind = self.inner.kind.lock_or_recover();
+            match *kind {
+                PathKind::Relay => return None,
+                PathKind::Direct(addr) => {
+                    *kind = PathKind::Relay;
+                    addr
+                }
+            }
+        };
+        *self.inner.srtt.lock_or_recover() = None;
+        self.bump_epoch();
+        Some(previous)
+    }
+
+    /// Folds one round trip sample into this path's smoothed RTT, seeded by
+    /// the first sample rather than by zero, with the same 1/8 weighting
+    /// QUIC's own estimator uses.
+    pub fn record_rtt(&self, sample: Duration) {
+        let mut srtt = self.inner.srtt.lock_or_recover();
+        *srtt = Some(match *srtt {
+            None => sample,
+            Some(previous) => (previous * 7 + sample) / 8,
+        });
+    }
+
+    /// This path's smoothed RTT, `None` until the first sample after the
+    /// most recent switch.
+    #[must_use]
+    pub fn srtt(&self) -> Option<Duration> {
+        *self.inner.srtt.lock_or_recover()
     }
 }
 
-/// A per peer table of [`PathEntry`] values, keyed by the peer's ed25519
-/// public key.
+/// A per peer table of [`PathEntry`] values, indexed both by the peer's
+/// ed25519 public key (how the doorbell names a peer) and by that peer's
+/// synthetic address (how the porch socket's send path names it, section
+/// 3). Both indexes hold the same shared entry, never two copies.
 #[derive(Debug, Default)]
 pub struct PathTable {
-    entries: std::collections::HashMap<[u8; 32], PathEntry>,
+    by_peer: HashMap<[u8; 32], PathEntry>,
+    by_synthetic: HashMap<SocketAddr, PathEntry>,
 }
 
 impl PathTable {
@@ -105,17 +229,35 @@ impl PathTable {
         Self::default()
     }
 
-    /// Inserts a fresh relay-path entry for `peer`, returning it.
-    pub fn insert_relay(&mut self, peer: [u8; 32]) -> PathEntry {
+    /// Inserts a fresh relay-path entry for `peer`, reachable by its key
+    /// and by `synthetic`, returning it.
+    pub fn insert_relay(&mut self, peer: [u8; 32], synthetic: SocketAddr) -> PathEntry {
         let entry = PathEntry::new_relay();
-        self.entries.insert(peer, entry.clone());
+        self.by_peer.insert(peer, entry.clone());
+        self.by_synthetic.insert(synthetic, entry.clone());
         entry
     }
 
     /// The entry for `peer`, if any.
     #[must_use]
     pub fn get(&self, peer: &[u8; 32]) -> Option<&PathEntry> {
-        self.entries.get(peer)
+        self.by_peer.get(peer)
+    }
+
+    /// The entry whose synthetic address is `synthetic`, if any.
+    #[must_use]
+    pub fn get_by_synthetic(&self, synthetic: &SocketAddr) -> Option<&PathEntry> {
+        self.by_synthetic.get(synthetic)
+    }
+
+    /// Every direct address currently in use, which is the set of remote
+    /// addresses the porch socket accepts inbound direct packets from.
+    #[must_use]
+    pub fn direct_addrs(&self) -> Vec<(SocketAddr, SocketAddr)> {
+        self.by_synthetic
+            .iter()
+            .filter_map(|(synthetic, entry)| entry.direct_addr().map(|direct| (direct, *synthetic)))
+            .collect()
     }
 }
 
@@ -278,14 +420,80 @@ mod tests {
         assert_eq!(controller.window(), initial);
     }
 
+    fn synthetic() -> SocketAddr {
+        "[fd00::1]:1".parse().unwrap()
+    }
+
     #[test]
     fn path_table_insert_and_bump() {
         let mut table = PathTable::new();
         let peer = [1u8; 32];
-        let entry = table.insert_relay(peer);
+        let entry = table.insert_relay(peer, synthetic());
         assert_eq!(entry.kind(), PathKind::Relay);
         assert_eq!(table.get(&peer).unwrap().epoch().load(Ordering::SeqCst), 0);
         entry.bump_epoch();
         assert_eq!(table.get(&peer).unwrap().epoch().load(Ordering::SeqCst), 1);
+    }
+
+    /// Section 2 steps 6 and 7 on the table: an upgrade and a fall-back
+    /// each bump the congestion epoch exactly once and each clear the
+    /// smoothed RTT, so slow start restarts and section 4's timers reseed
+    /// from the new path's own first sample rather than the old path's
+    /// average.
+    ///
+    /// Deliberate break to fail this test: delete the `self.bump_epoch()`
+    /// line from `PathEntry::fall_back_to_relay`. The epoch then stays at 1
+    /// after the fall-back instead of reaching 2.
+    #[test]
+    fn upgrade_and_fall_back_reset_congestion_and_rtt() {
+        let mut table = PathTable::new();
+        let peer = [2u8; 32];
+        let entry = table.insert_relay(peer, synthetic());
+        let direct: SocketAddr = "203.0.113.7:4433".parse().unwrap();
+
+        entry.record_rtt(Duration::from_millis(40));
+        assert_eq!(entry.srtt(), Some(Duration::from_millis(40)));
+
+        assert!(entry.upgrade_to(direct));
+        assert_eq!(entry.kind(), PathKind::Direct(direct));
+        assert_eq!(entry.direct_addr(), Some(direct));
+        assert_eq!(entry.srtt(), None, "srtt must reseed on the new path");
+        assert_eq!(entry.epoch().load(Ordering::SeqCst), 1);
+
+        // Re-upgrading to the path already in use resets nothing: throwing
+        // away a healthy congestion window for no change of path would be
+        // a cost with no purchase.
+        assert!(!entry.upgrade_to(direct));
+        assert_eq!(entry.epoch().load(Ordering::SeqCst), 1);
+
+        entry.record_rtt(Duration::from_millis(4));
+        assert_eq!(entry.srtt(), Some(Duration::from_millis(4)));
+
+        assert_eq!(entry.fall_back_to_relay(), Some(direct));
+        assert_eq!(entry.kind(), PathKind::Relay);
+        assert_eq!(entry.srtt(), None);
+        assert_eq!(entry.epoch().load(Ordering::SeqCst), 2);
+        assert_eq!(entry.fall_back_to_relay(), None);
+        assert_eq!(entry.epoch().load(Ordering::SeqCst), 2);
+
+        // Both indexes name the one shared entry, not two copies.
+        assert_eq!(
+            table.get(&peer).unwrap().kind(),
+            table.get_by_synthetic(&synthetic()).unwrap().kind()
+        );
+    }
+
+    #[test]
+    fn direct_addrs_lists_only_upgraded_peers() {
+        let mut table = PathTable::new();
+        let relayed = table.insert_relay([3u8; 32], "[fd00::3]:1".parse().unwrap());
+        let upgraded = table.insert_relay([4u8; 32], "[fd00::4]:1".parse().unwrap());
+        let direct: SocketAddr = "203.0.113.9:4433".parse().unwrap();
+        upgraded.upgrade_to(direct);
+        assert_eq!(relayed.direct_addr(), None);
+        assert_eq!(
+            table.direct_addrs(),
+            vec![(direct, "[fd00::4]:1".parse().unwrap())]
+        );
     }
 }
