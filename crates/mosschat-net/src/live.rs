@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use crate::diag::{self, Recorder, Step, StepOutcome};
 use crate::gate::GateError;
 use crate::punch::{CandidateSource, PorchFrame, write_porch_frame};
 
@@ -221,6 +222,10 @@ pub struct PeerLiveness {
     last_answer: Instant,
     stale_since: Option<Instant>,
     last_seen: Option<LastSeen>,
+    /// This peer's attempt record (section 7), if the house is keeping
+    /// one. Every transition this type makes is one of section 7's steps,
+    /// and nothing else here reads it.
+    recorder: Option<Recorder>,
 }
 
 impl PeerLiveness {
@@ -238,7 +243,17 @@ impl PeerLiveness {
             last_answer: now,
             stale_since: None,
             last_seen: None,
+            recorder: None,
         }
+    }
+
+    /// Records this peer's liveness transitions into `recorder`: section
+    /// 4's stale and dead both write section 7's `path_lost` step, and a
+    /// goodbye writes `closed`.
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Option<Recorder>) -> Self {
+        self.recorder = recorder;
+        self
     }
 
     /// Seeds the smoothed round trip from the winning probe's, so the
@@ -368,6 +383,15 @@ impl PeerLiveness {
                 if self.misses >= PROBES_TO_STALE {
                     self.state = Liveness::Stale;
                     self.stale_since = Some(now);
+                    diag::record(
+                        self.recorder.as_ref(),
+                        Step::PathLost,
+                        StepOutcome::Fail,
+                        format!(
+                            "stale: {PROBES_TO_STALE} consecutive probes unanswered, \
+                             traffic moved to the relay"
+                        ),
+                    );
                     return Some(LivenessChange::WentStale);
                 }
                 None
@@ -380,6 +404,12 @@ impl PeerLiveness {
                         at: self.last_answer,
                         reason: LastSeenReason::Timeout,
                     });
+                    diag::record(
+                        self.recorder.as_ref(),
+                        Step::PathLost,
+                        StepOutcome::Fail,
+                        "dead: the stale grace elapsed with no answer, the path is dropped",
+                    );
                     return Some(LivenessChange::WentDead);
                 }
                 None
@@ -404,6 +434,15 @@ impl PeerLiveness {
             at: now,
             reason: LastSeenReason::Goodbye,
         });
+        // Frame 19, the clean exit: section 7's `closed` step and its
+        // `peer_goodbye` reason, distinct in the record from the timeout
+        // above exactly as D8 asks it to be in each friend's last seen.
+        diag::record(
+            self.recorder.as_ref(),
+            Step::Closed,
+            StepOutcome::Ok,
+            "the peer said goodbye",
+        );
         Some(LivenessChange::WentDead)
     }
 }
@@ -612,7 +651,30 @@ impl AddressCache {
     /// rediscovery rather than a retry, which would spend the same timeout
     /// twice (research lesson 6).
     pub fn on_dial_failed(&mut self, peer: &[u8; 32], addr: SocketAddr) -> AfterDialFailure {
+        self.on_dial_failed_recorded(peer, addr, None)
+    }
+
+    /// [`AddressCache::on_dial_failed`], recording it into an attempt's
+    /// diagnostics record.
+    ///
+    /// Section 7's step enum names no rediscovery step, so this is written
+    /// as `path_lost` with the rediscovery in its detail: the cached
+    /// address a path would have used is gone, which is what that step
+    /// says, and inventing a sixteenth step would put a value in the log
+    /// that no reader of section 7 could parse.
+    pub fn on_dial_failed_recorded(
+        &mut self,
+        peer: &[u8; 32],
+        addr: SocketAddr,
+        recorder: Option<&Recorder>,
+    ) -> AfterDialFailure {
         let addr = crate::sock::unmap_v4(addr);
+        diag::record(
+            recorder,
+            Step::PathLost,
+            StepOutcome::Fail,
+            format!("dial to the cached address {addr} failed, rediscovering"),
+        );
         if let Some(held) = self.entries.get_mut(peer) {
             held.retain(|entry| entry.addr != addr);
             if held.is_empty() {
@@ -642,6 +704,99 @@ mod tests {
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9)),
             port,
         )
+    }
+
+    /// A recorder writing nowhere, for asserting what a transition records
+    /// without touching a file.
+    fn test_recorder() -> Recorder {
+        Recorder::new(crate::diag::PeerFingerprint::default(), None)
+    }
+
+    fn recorded_steps(recorder: &Recorder) -> Vec<(String, String)> {
+        recorder
+            .snapshot(crate::diag::Reason::Ok)
+            .steps
+            .into_iter()
+            .map(|entry| (entry.step.as_str().to_string(), entry.detail))
+            .collect()
+    }
+
+    /// WO-1.4b: section 4's two silent endings both reach the record as
+    /// section 7's `path_lost` step, so a peer that stopped answering is
+    /// visible in the log rather than only in the path table.
+    ///
+    /// Deliberate break to fail this test: delete the `diag::record` call
+    /// in `PeerLiveness::poll`'s `Liveness::Live` arm. The state machine
+    /// still goes stale and then dead; the record loses the step that says
+    /// the path was lost, and `doctor` reports an attempt with no failure.
+    #[test]
+    fn stale_and_dead_are_both_recorded_as_path_lost() {
+        let recorder = test_recorder();
+        let start = Instant::now();
+        let mut liveness = PeerLiveness::new(start).with_recorder(Some(recorder.clone()));
+        liveness.set_activity(Activity::Visit);
+
+        let mut now = start;
+        for _ in 0..PROBES_TO_STALE {
+            assert!(liveness.due_probe(now));
+            now += probe_loss_deadline(None);
+            liveness.poll(now);
+        }
+        assert_eq!(liveness.state(), Liveness::Stale);
+        now += dead_grace(None);
+        assert_eq!(liveness.poll(now), Some(LivenessChange::WentDead));
+
+        let steps = recorded_steps(&recorder);
+        assert_eq!(steps.len(), 2, "{steps:?}");
+        assert_eq!(steps[0].0, "path_lost");
+        assert!(steps[0].1.contains("stale"), "{steps:?}");
+        assert_eq!(steps[1].0, "path_lost");
+        assert!(steps[1].1.contains("dead"), "{steps:?}");
+        assert_eq!(
+            recorder.failed_step(),
+            Some(crate::diag::Step::PathLost),
+            "the first failing step is the one doctor names"
+        );
+    }
+
+    /// A goodbye is the other ending, and D8 keeps the two apart: frame 19
+    /// records section 7's `closed`, not `path_lost`.
+    #[test]
+    fn a_goodbye_is_recorded_as_closed_and_not_as_a_path_loss() {
+        let recorder = test_recorder();
+        let now = Instant::now();
+        let mut liveness = PeerLiveness::new(now).with_recorder(Some(recorder.clone()));
+        assert_eq!(
+            apply_porch_frame(&mut liveness, &PorchFrame::Goodbye { v: 1, reason: 0 }, now),
+            Some(LivenessChange::WentDead)
+        );
+        let steps = recorded_steps(&recorder);
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert_eq!(steps[0].0, "closed");
+        assert_eq!(
+            recorder.failed_step(),
+            None,
+            "a clean exit is not a failed step"
+        );
+    }
+
+    /// Section 4's failed dial: the cached address goes, rediscovery
+    /// follows, and the record says which address it was.
+    #[test]
+    fn a_failed_dial_records_the_rediscovery_it_triggers() {
+        let recorder = test_recorder();
+        let mut cache = AddressCache::new();
+        let now = Instant::now();
+        cache.remember(peer(), addr(4433), CandidateSource::PeerReported, now);
+        assert_eq!(
+            cache.on_dial_failed_recorded(&peer(), addr(4433), Some(&recorder)),
+            AfterDialFailure::Rediscover
+        );
+        assert!(!cache.holds(&peer(), addr(4433)));
+        let steps = recorded_steps(&recorder);
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert_eq!(steps[0].0, "path_lost");
+        assert!(steps[0].1.contains("rediscovering"), "{steps:?}");
     }
 
     /// Section 4's keepalive is a function of the measured RTT with a floor
