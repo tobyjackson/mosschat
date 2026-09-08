@@ -703,9 +703,9 @@ mod tests {
     /// bad signature is dropped and counted.
     ///
     /// Deliberate break to fail this test: in `Announce::decode`, move the
-    /// `verify(...)` call above the `is_friend` check. The stranger's
-    /// forged announce then fails as `BadSignature` instead of
-    /// `NotAFriend` and the first assertion fails.
+    /// `is_friend` check below the `verify(...)` call. A stranger whose
+    /// signature is also bad then comes back as `BadSignature` instead of
+    /// `NotAFriend`, which is what the second assertion pins.
     #[test]
     fn a_stranger_is_dropped_before_the_signature_and_a_bad_one_is_counted() {
         let (friend, friend_key) = house(1);
@@ -724,6 +724,18 @@ mod tests {
         assert_eq!(
             Announce::decode(&strangers, &COMMUNITY, is_friend),
             Err(AnnounceError::NotAFriend)
+        );
+
+        // The same stranger with a signature that does not verify either:
+        // still `NotAFriend`, which is the assertion that pins the *order*
+        // of the two checks rather than merely their presence. Reversed,
+        // this one comes back as `BadSignature`.
+        let mut strangers_forged = strangers;
+        strangers_forged[143] ^= 0x01;
+        assert_eq!(
+            Announce::decode(&strangers_forged, &COMMUNITY, is_friend),
+            Err(AnnounceError::NotAFriend),
+            "a stranger is dropped before the signature is checked"
         );
 
         // A friend's key with somebody else's signature.
