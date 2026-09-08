@@ -112,7 +112,9 @@ pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub fn keepalive_interval(srtt: Option<Duration>) -> Duration {
     match srtt {
         None => KEEPALIVE_FLOOR,
-        Some(srtt) => (srtt * KEEPALIVE_SRTT_MULTIPLIER).clamp(KEEPALIVE_FLOOR, KEEPALIVE_CEILING),
+        Some(srtt) => srtt
+            .saturating_mul(KEEPALIVE_SRTT_MULTIPLIER)
+            .clamp(KEEPALIVE_FLOOR, KEEPALIVE_CEILING),
     }
 }
 
@@ -121,7 +123,9 @@ pub fn keepalive_interval(srtt: Option<Duration>) -> Duration {
 pub fn probe_loss_deadline(srtt: Option<Duration>) -> Duration {
     match srtt {
         None => PROBE_LOSS_FLOOR,
-        Some(srtt) => (srtt * LOSS_SRTT_MULTIPLIER).max(PROBE_LOSS_FLOOR),
+        Some(srtt) => srtt
+            .saturating_mul(LOSS_SRTT_MULTIPLIER)
+            .max(PROBE_LOSS_FLOOR),
     }
 }
 
@@ -130,7 +134,9 @@ pub fn probe_loss_deadline(srtt: Option<Duration>) -> Duration {
 pub fn dead_grace(srtt: Option<Duration>) -> Duration {
     match srtt {
         None => DEAD_GRACE_BASE,
-        Some(srtt) => srtt.saturating_mul(LOSS_SRTT_MULTIPLIER) + DEAD_GRACE_BASE,
+        Some(srtt) => srtt
+            .saturating_mul(LOSS_SRTT_MULTIPLIER)
+            .saturating_add(DEAD_GRACE_BASE),
     }
 }
 
@@ -327,9 +333,15 @@ impl PeerLiveness {
         }
         // The same 1/8 weighting QUIC's own estimator uses, seeded by the
         // first sample rather than by zero.
+        // Saturating throughout (Konrad's nit 8): an absurd sample from a
+        // suspended process must widen a timer, never abort the house.
         self.srtt = Some(match self.srtt {
             None => rtt,
-            Some(previous) => (previous * 7 + rtt) / 8,
+            Some(previous) => previous
+                .saturating_mul(7)
+                .saturating_add(rtt)
+                .checked_div(8)
+                .unwrap_or(rtt),
         });
         self.outstanding = None;
         self.misses = 0;
@@ -473,6 +485,16 @@ impl CachedAddress {
     }
 }
 
+/// How many addresses one peer may hold in the cache (Yseult's Low 5).
+///
+/// 8, because a machine with more than a couple of addresses per family on
+/// the networks it shares with one friend is already unusual, and because
+/// without a cap the only bound on this map is the receive rate times the
+/// TTL: a LAN stranger driving discovery could grow one peer's list for
+/// five minutes. Past it the oldest sighting goes, so a live address is
+/// never pushed out by one that stopped answering first.
+pub const CACHED_ADDRESSES_PER_PEER: usize = 8;
+
 /// The addresses this house holds for its friends between attempts, with
 /// section 4's expiry: unanswered for its TTL and it is gone, and a failed
 /// dial expires it at once.
@@ -509,6 +531,20 @@ impl AddressCache {
             source,
             last_answer: now,
         });
+        // Bounded per peer, oldest sighting first (Yseult's Low 5).
+        while held.len() > CACHED_ADDRESSES_PER_PEER {
+            let oldest = held
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_answer)
+                .map(|(index, _)| index);
+            match oldest {
+                Some(index) if index < held.len() => {
+                    held.remove(index);
+                }
+                _ => break,
+            }
+        }
     }
 
     /// Records that `addr` answered, which is what stops it expiring.

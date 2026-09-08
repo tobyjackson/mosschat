@@ -14,6 +14,17 @@
 //! ([`DiscoverySocket`]), and the handoff that makes a heard announce a
 //! discovery-sourced candidate ([`Discovery`]).
 //!
+//! **The 8 replay bytes are 4 of timestamp and 4 of randomness** (Yseult's
+//! High 1). Section 6 writes bytes 72..80 as "8 random bytes against
+//! replay", and a random nonce alone cannot do that job: with no time in
+//! the frame there is no bound on how long a seen-nonce set must be kept,
+//! so a captured announce stays a bearer token forever and each replay
+//! refreshes the attacker's address while the friend's own announce is
+//! dropped by the 10 second per-key gap. So those 8 bytes are 4 bytes of
+//! Unix seconds and 4 of randomness, the frame stays the stated 144 bytes,
+//! and an announce is accepted only inside [`ANNOUNCE_REPLAY_WINDOW`] and
+//! only once ([`ReplayGuard`]).
+//!
 //! **Every signature check goes through `mosschat_core::identity::verify`**,
 //! which is `verify_strict` and rejects the low-order keys plain `verify`
 //! accepts. An announce carries a peer-chosen key, so nothing weaker is
@@ -67,6 +78,27 @@ pub const ANNOUNCE_PER_KEY_GAP: Duration = Duration::from_secs(10);
 /// costs measurable CPU.
 pub const ANNOUNCE_PACKETS_PER_SECOND: u32 = 50;
 
+/// How far an announce's own timestamp may be from this house's clock
+/// before it is refused (Yseult's High 1).
+///
+/// 60 s is two [`ANNOUNCE_INTERVAL`]s, so a friend's announce is still
+/// accepted across the clock skew two unsynchronised machines on one LAN
+/// ordinarily carry, and a capture is worthless a minute later. It bounds
+/// [`ReplayGuard`] as well: nothing older than this needs remembering,
+/// because the window refuses it without looking.
+pub const ANNOUNCE_REPLAY_WINDOW: Duration = Duration::from_secs(60);
+
+/// How many (key, timestamp, nonce) triples [`ReplayGuard`] remembers.
+///
+/// The bound is the window times the admitted rate: at
+/// [`ANNOUNCE_PACKETS_PER_SECOND`] for the whole
+/// [`ANNOUNCE_REPLAY_WINDOW`] that is 3000, so 4096 covers a window
+/// saturated from the first byte and still fixes the set at 4096 * 40
+/// bytes. Past it the oldest is forgotten, which is safe in exactly the
+/// way the window makes it safe: a triple old enough to be evicted is old
+/// enough to be refused on its timestamp.
+pub const ANNOUNCE_SEEN_REMEMBERED: usize = 4096;
+
 /// How many keys the per-key dedupe remembers before it forgets the oldest.
 ///
 /// Chosen, not measured: [`ANNOUNCE_PACKETS_PER_SECOND`] distinct keys for
@@ -109,6 +141,22 @@ pub enum AnnounceError {
     /// [`ANNOUNCE_PACKETS_PER_SECOND`].
     #[error("announce rate limited")]
     RateLimited,
+    /// The announce's own timestamp is further than
+    /// [`ANNOUNCE_REPLAY_WINDOW`] from this house's clock, in either
+    /// direction: a capture from an hour ago, or one from a machine whose
+    /// clock is wrong enough that its announces cannot be replay-checked.
+    #[error("announce outside the replay window")]
+    OutsideWindow,
+    /// This exact (key, timestamp, nonce) triple has been accepted before:
+    /// a replay of a genuine, correctly signed announce.
+    #[error("announce replayed")]
+    Replayed,
+    /// The datagram's source address is not one a house on this network
+    /// could have announced from (Yseult's Medium 3). Discovery vouches
+    /// for a private-range address on the strength of having heard it
+    /// here, so the address it vouches for has to be a local one.
+    #[error("announce from a source that is not on this network")]
+    SourceNotLocal,
 }
 
 /// One announce: a public key and a port, plus the community id so a
@@ -123,16 +171,31 @@ pub struct Announce {
     /// The QUIC port that house listens on, which the receiver pairs with
     /// the source address the kernel wrote.
     pub port: u16,
-    /// 8 random bytes drawn per announce, against replay.
-    pub nonce: [u8; 8],
+    /// When this announce was made, in seconds since the Unix epoch,
+    /// inside the signature.
+    ///
+    /// `u32` seconds runs out in 2106 and is what fits beside the nonce in
+    /// the frame's stated 144 bytes. It is a replay bound and never a
+    /// trust decision: nothing here believes a peer about the time, it is
+    /// only refused for being too far from ours either way.
+    pub sent_unix: u32,
+    /// 4 random bytes drawn per announce, so two announces made in the
+    /// same second are still distinguishable in [`ReplayGuard`]. Four
+    /// bytes because four is what is left beside the timestamp: a
+    /// collision costs one dropped announce and the next one is 30 seconds
+    /// away.
+    pub nonce: [u8; 4],
 }
 
 impl Announce {
     /// Encodes and signs this announce, section 6's fixed 144 byte layout:
     /// byte 0 [`ANNOUNCE_DISCRIMINATOR`], 1..4 `"MSD"`, 4 version `0x01`,
     /// 5 type, 6..38 community id, 38..70 announcing public key, 70..72
-    /// QUIC port big-endian, 72..80 the nonce, 80..144 the ed25519
-    /// signature over [`ANNOUNCE_SIGNING_CONTEXT`] followed by bytes 0..80.
+    /// QUIC port big-endian, 72..76 the Unix second it was made, 76..80 4
+    /// random bytes, 80..144 the ed25519 signature over
+    /// [`ANNOUNCE_SIGNING_CONTEXT`] followed by bytes 0..80. The timestamp
+    /// and the nonce are both inside the signature, so neither can be
+    /// edited to make a capture look fresh.
     ///
     /// `signer` must hold the key in `self.key`; nothing here checks that,
     /// because a house signing an announce for a key it does not hold
@@ -150,7 +213,8 @@ impl Announce {
             out[6..38].copy_from_slice(&self.community);
             out[38..70].copy_from_slice(&self.key);
             out[70..72].copy_from_slice(&self.port.to_be_bytes());
-            out[72..80].copy_from_slice(&self.nonce);
+            out[72..76].copy_from_slice(&self.sent_unix.to_be_bytes());
+            out[76..80].copy_from_slice(&self.nonce);
             let mut signed = Vec::with_capacity(ANNOUNCE_SIGNING_CONTEXT.len() + 80);
             signed.extend_from_slice(ANNOUNCE_SIGNING_CONTEXT);
             signed.extend_from_slice(&out[..80]);
@@ -159,8 +223,8 @@ impl Announce {
         out
     }
 
-    /// Decodes and verifies an announce, in section 6's stated order:
-    /// shape, then community, then "is this a friend", then the signature.
+    /// Reads an announce's fields **without checking its signature**:
+    /// shape, then community, then "is this a friend".
     ///
     /// `is_friend` runs before any verification because an announce whose
     /// key is not already a friend on file is dropped before the signature
@@ -168,10 +232,19 @@ impl Announce {
     /// on the LAN could spend this house's CPU on ed25519 by sending
     /// noise to a multicast group.
     ///
+    /// Parsing and verifying are separable so that the checks that cost
+    /// nothing can all run first (Konrad's should 4): the per-key gap and
+    /// the "is this us" check read the key at bytes 38..70, and a replayed
+    /// friend announce inside the gap is dropped for a hash lookup rather
+    /// than a scalar multiplication. Nothing this returns has been proved
+    /// yet, which is why it is `pub(crate)` and why every caller in this
+    /// module reaches [`Announce::verify_signature`] before it uses a
+    /// field for anything.
+    ///
     /// # Errors
     ///
     /// Returns the [`AnnounceError`] naming which of those checks failed.
-    pub fn decode(
+    pub(crate) fn parse_unverified(
         bytes: &[u8],
         community: &[u8; 32],
         is_friend: impl Fn(&[u8; 32]) -> bool,
@@ -201,24 +274,122 @@ impl Announce {
                 return Err(AnnounceError::NotAFriend);
             }
             let port = u16::from_be_bytes([bytes[70], bytes[71]]);
-            let mut nonce = [0u8; 8];
-            nonce.copy_from_slice(&bytes[72..80]);
-            let mut sig = [0u8; 64];
-            sig.copy_from_slice(&bytes[80..144]);
-
-            let mut signed = Vec::with_capacity(ANNOUNCE_SIGNING_CONTEXT.len() + 80);
-            signed.extend_from_slice(ANNOUNCE_SIGNING_CONTEXT);
-            signed.extend_from_slice(&bytes[..80]);
-            verify(&key, &signed, &sig).map_err(|_| AnnounceError::BadSignature)?;
-
+            let sent_unix = u32::from_be_bytes([bytes[72], bytes[73], bytes[74], bytes[75]]);
+            let mut nonce = [0u8; 4];
+            nonce.copy_from_slice(&bytes[76..80]);
             Ok(Self {
                 community: announced_community,
                 key,
                 port,
+                sent_unix,
                 nonce,
             })
         }
     }
+
+    /// Checks the signature over [`ANNOUNCE_SIGNING_CONTEXT`] and bytes
+    /// 0..80, through `mosschat_core::identity::verify` (`verify_strict`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnnounceError::BadSignature`] if it does not verify, and
+    /// [`AnnounceError::Malformed`] if `bytes` is not [`ANNOUNCE_LEN`]
+    /// long, which cannot happen for anything
+    /// [`Announce::parse_unverified`] returned but is checked rather than
+    /// assumed.
+    pub(crate) fn verify_signature(&self, bytes: &[u8]) -> Result<(), AnnounceError> {
+        if bytes.len() != ANNOUNCE_LEN {
+            return Err(AnnounceError::Malformed);
+        }
+        #[allow(clippy::indexing_slicing)]
+        {
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(&bytes[80..144]);
+            let mut signed = Vec::with_capacity(ANNOUNCE_SIGNING_CONTEXT.len() + 80);
+            signed.extend_from_slice(ANNOUNCE_SIGNING_CONTEXT);
+            signed.extend_from_slice(&bytes[..80]);
+            verify(&self.key, &signed, &sig).map_err(|_| AnnounceError::BadSignature)
+        }
+    }
+
+    /// Parses and verifies one announce: [`Announce::parse_unverified`]
+    /// followed by [`Announce::verify_signature`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`AnnounceError`] naming which check failed.
+    pub fn decode(
+        bytes: &[u8],
+        community: &[u8; 32],
+        is_friend: impl Fn(&[u8; 32]) -> bool,
+    ) -> Result<Self, AnnounceError> {
+        let announce = Self::parse_unverified(bytes, community, is_friend)?;
+        announce.verify_signature(bytes)?;
+        Ok(announce)
+    }
+}
+
+/// The replay guard of Yseult's High 1: an announce is accepted once,
+/// inside [`ANNOUNCE_REPLAY_WINDOW`] of this house's own clock, and never
+/// again.
+///
+/// The same shape as section 1's caps and as
+/// [`crate::punch::PongLimiter`]'s answered-tx memory: a set for the
+/// question and a queue for the eviction order, so the memory a stranger
+/// can make this house spend is fixed before the first packet.
+#[derive(Debug, Default)]
+pub struct ReplayGuard {
+    seen: std::collections::HashSet<([u8; 32], u32, [u8; 4])>,
+    order: std::collections::VecDeque<([u8; 32], u32, [u8; 4])>,
+}
+
+impl ReplayGuard {
+    /// An empty guard.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether this announce is fresh: inside the window and not seen
+    /// before.
+    ///
+    /// `now_unix` is this house's own clock in seconds since the Unix
+    /// epoch, passed in rather than read here for the same reason every
+    /// other clock in this crate is passed in.
+    ///
+    /// # Errors
+    ///
+    /// [`AnnounceError::OutsideWindow`] or [`AnnounceError::Replayed`].
+    pub fn admit(&mut self, announce: &Announce, now_unix: u64) -> Result<(), AnnounceError> {
+        let sent = u64::from(announce.sent_unix);
+        let skew = now_unix.abs_diff(sent);
+        if skew > ANNOUNCE_REPLAY_WINDOW.as_secs() {
+            return Err(AnnounceError::OutsideWindow);
+        }
+        let triple = (announce.key, announce.sent_unix, announce.nonce);
+        if !self.seen.insert(triple) {
+            return Err(AnnounceError::Replayed);
+        }
+        self.order.push_back(triple);
+        while self.order.len() > ANNOUNCE_SEEN_REMEMBERED {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// This house's clock in seconds since the Unix epoch, saturating at zero
+/// for a clock set before 1970.
+///
+/// The one place in this module that reads a clock, so a test drives
+/// [`ReplayGuard`] and [`Discovery::on_datagram`] with a number it chose.
+#[must_use]
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// Section 6's send schedule: one announce at start, then one every
@@ -334,6 +505,15 @@ pub struct DiscoveryCounters {
     pub rate_limited: u64,
     /// This house's own announces, heard back through multicast loopback.
     pub ourselves: u64,
+    /// Correctly signed announces refused for being outside
+    /// [`ANNOUNCE_REPLAY_WINDOW`] (Yseult's High 1).
+    pub outside_window: u64,
+    /// Correctly signed announces refused for having been accepted before:
+    /// a replay of a genuine announce.
+    pub replayed: u64,
+    /// Announces refused for arriving from a source address no house on
+    /// this network could have announced from (Yseult's Medium 3).
+    pub source_not_local: u64,
 }
 
 /// Whether hearing this announce calls for the one unicast reply section 6
@@ -383,8 +563,12 @@ pub struct Discovery {
     quic_port: u16,
     announcer: Announcer,
     limiter: ReceiveLimiter,
+    replay: ReplayGuard,
     cache: AddressCache,
     counters: DiscoveryCounters,
+    /// Whether a loopback source address may be vouched for. False
+    /// everywhere but in a test that injects one on purpose.
+    allow_loopback_source: bool,
 }
 
 impl Discovery {
@@ -397,9 +581,23 @@ impl Discovery {
             quic_port,
             announcer: Announcer::new(now),
             limiter: ReceiveLimiter::new(now),
+            replay: ReplayGuard::new(),
             cache: AddressCache::new(),
             counters: DiscoveryCounters::default(),
+            allow_loopback_source: false,
         }
+    }
+
+    /// Accepts announces from a loopback source, which production never
+    /// does (Yseult's Medium 3).
+    ///
+    /// `#[cfg(test)]`, so it is not a switch a house can be talked into:
+    /// the only caller that can exist is a test that injects loopback
+    /// deliberately, and no configuration, environment variable or peer
+    /// input reaches it.
+    #[cfg(test)]
+    pub(crate) fn allow_loopback_source(&mut self) {
+        self.allow_loopback_source = true;
     }
 
     /// The counters section 6 asks for.
@@ -413,81 +611,93 @@ impl Discovery {
         self.announcer.due(now)
     }
 
-    /// Builds this house's announce, signed by `signer`, with `nonce` as
-    /// its 8 replay bytes.
+    /// Builds this house's announce, signed by `signer`, made at
+    /// `sent_unix` with `nonce` as its 4 random bytes.
     ///
-    /// `nonce` is a parameter rather than a call into `rand` for the same
-    /// reason [`crate::punch::Attempt::due_probes`] takes its tx ids that
-    /// way: it makes the whole frame reproducible in a test.
+    /// Both are parameters rather than calls into `rand` and the system
+    /// clock for the same reason [`crate::punch::Attempt::due_probes`]
+    /// takes its tx ids that way: it makes the whole frame reproducible in
+    /// a test. A house passes [`unix_now`] and 4 fresh random bytes.
     #[must_use]
-    pub fn announce(&self, signer: &impl Signer, nonce: [u8; 8]) -> [u8; ANNOUNCE_LEN] {
+    pub fn announce(
+        &self,
+        signer: &impl Signer,
+        sent_unix: u32,
+        nonce: [u8; 4],
+    ) -> [u8; ANNOUNCE_LEN] {
         Announce {
             community: self.community,
             key: self.own_key,
             port: self.quic_port,
+            sent_unix,
             nonce,
         }
         .encode(signer)
     }
 
-    /// Handles one received datagram: the packet ceiling, then the frame,
-    /// then the per-key gap, then the handoff.
+    /// Handles one received datagram, cheapest check first all the way
+    /// down: the packet ceiling, then the frame's shape and community,
+    /// then "is this key a friend", then the per-key gap, then the
+    /// signature, then the replay window, then the source address, then
+    /// the handoff.
+    ///
+    /// **The signature is the expensive check and it is late on purpose**
+    /// (Konrad's should 4, research lesson 2). Everything above it is a
+    /// comparison or a hash lookup, so a captured announce replayed at the
+    /// 50 packet per second ceiling costs no scalar multiplication at all:
+    /// the per-key gap catches it first. Everything below it needs the
+    /// signature to have passed, because a replay window fed unverified
+    /// timestamps would let anyone poison [`ReplayGuard`] against a
+    /// friend's real announce.
     ///
     /// The address remembered is `from`'s IP with the **announced** port,
     /// never `from`'s port: the announce left a socket bound to
     /// [`DISCOVERY_PORT`] and the QUIC listener is somewhere else entirely.
     /// The IP is the kernel's and is the only part of this that no sender
     /// can choose.
+    ///
+    /// `now_unix` is this house's clock in seconds since the Unix epoch
+    /// ([`unix_now`]), used for the replay window and nothing else.
     pub fn on_datagram(
         &mut self,
         bytes: &[u8],
         from: SocketAddr,
         now: Instant,
+        now_unix: u64,
         is_friend: impl Fn(&[u8; 32]) -> bool,
     ) -> Heard {
         if !self.limiter.admit_packet(now) {
-            self.counters.rate_limited = self.counters.rate_limited.saturating_add(1);
-            return Heard::Dropped(AnnounceError::RateLimited);
+            return self.drop_with(AnnounceError::RateLimited);
         }
         let own_key = self.own_key;
-        let announce = match Announce::decode(bytes, &self.community, |key| {
+        let announce = match Announce::parse_unverified(bytes, &self.community, |key| {
             *key == own_key || is_friend(key)
         }) {
             Ok(announce) => announce,
-            Err(error) => {
-                match error {
-                    AnnounceError::Malformed => {
-                        self.counters.malformed = self.counters.malformed.saturating_add(1);
-                    }
-                    AnnounceError::OtherCommunity => {
-                        self.counters.other_community =
-                            self.counters.other_community.saturating_add(1);
-                    }
-                    AnnounceError::NotAFriend => {
-                        self.counters.not_a_friend = self.counters.not_a_friend.saturating_add(1);
-                    }
-                    AnnounceError::BadSignature => {
-                        self.counters.bad_signature = self.counters.bad_signature.saturating_add(1);
-                    }
-                    AnnounceError::Ourselves | AnnounceError::RateLimited => {}
-                }
-                return Heard::Dropped(error);
-            }
+            Err(error) => return self.drop_with(error),
         };
         if announce.key == self.own_key {
-            self.counters.ourselves = self.counters.ourselves.saturating_add(1);
-            return Heard::Dropped(AnnounceError::Ourselves);
+            return self.drop_with(AnnounceError::Ourselves);
         }
         if !self.limiter.admit_key(announce.key, now) {
-            self.counters.rate_limited = self.counters.rate_limited.saturating_add(1);
-            return Heard::Dropped(AnnounceError::RateLimited);
+            return self.drop_with(AnnounceError::RateLimited);
         }
-
-        let held_before = !self.cache.addresses(&announce.key).is_empty();
+        if let Err(error) = announce.verify_signature(bytes) {
+            return self.drop_with(error);
+        }
+        // Only now is anything in `announce` this house's to believe.
+        if let Err(error) = self.replay.admit(&announce, now_unix) {
+            return self.drop_with(error);
+        }
         // The kernel's address with the announced port, unmapped so a
         // dual-stack socket's `::ffff:a.b.c.d` and a plain IPv4 socket's
         // `a.b.c.d` are one candidate and not two (issue #37).
         let addr = crate::sock::unmap_v4(SocketAddr::new(from.ip(), announce.port));
+        if !self.source_is_local(addr.ip()) {
+            return self.drop_with(AnnounceError::SourceNotLocal);
+        }
+
+        let held_before = !self.cache.addresses(&announce.key).is_empty();
         self.cache
             .remember(announce.key, addr, CandidateSource::Discovery, now);
         self.counters.accepted = self.counters.accepted.saturating_add(1);
@@ -506,6 +716,63 @@ impl Discovery {
             },
             reply,
         )
+    }
+
+    /// Whether an announce arriving from `ip` may be vouched for
+    /// (Yseult's Medium 3).
+    ///
+    /// Discovery's whole claim is "this house heard that peer *here*", and
+    /// #37's relaxation spends that claim on admitting a private-range
+    /// address a peer's own word could not. So the address has to be one a
+    /// house on this network could hold: a private range, a link-local
+    /// address or a ULA, and never loopback, never a multicast or
+    /// unspecified address, and never a globally routable one, which needs
+    /// no relaxation and would turn a unicast packet aimed at port 49911
+    /// from off-LAN into a vouched candidate. `bind_v4` binds `0.0.0.0`,
+    /// and nothing in the socket API says a datagram arrived through the
+    /// group, so this is the check that stands in for that.
+    ///
+    /// Loopback is refused because `is_probeable` permits it: without this
+    /// a spoofed or unicast announce aims 37 probes per candidate at the
+    /// receiving machine itself, which is the scan primitive #37's
+    /// relaxation exists to bound. A test that wants it says so through
+    /// `allow_loopback_source`, which does not exist outside `cfg(test)`.
+    fn source_is_local(&self, ip: IpAddr) -> bool {
+        if ip.is_loopback() {
+            return self.allow_loopback_source;
+        }
+        match ip {
+            IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+            IpAddr::V6(v6) => {
+                let segments = v6.segments();
+                let link_local = segments
+                    .first()
+                    .is_some_and(|first| first & 0xffc0 == 0xfe80);
+                let unique_local = v6
+                    .octets()
+                    .first()
+                    .is_some_and(|first| first & 0xfe == 0xfc);
+                link_local || unique_local
+            }
+        }
+    }
+
+    /// Counts one refusal and returns it, so every drop in `on_datagram`
+    /// is one line and no path can forget its counter.
+    fn drop_with(&mut self, error: AnnounceError) -> Heard {
+        let counter = match error {
+            AnnounceError::Malformed => &mut self.counters.malformed,
+            AnnounceError::OtherCommunity => &mut self.counters.other_community,
+            AnnounceError::NotAFriend => &mut self.counters.not_a_friend,
+            AnnounceError::BadSignature => &mut self.counters.bad_signature,
+            AnnounceError::Ourselves => &mut self.counters.ourselves,
+            AnnounceError::RateLimited => &mut self.counters.rate_limited,
+            AnnounceError::OutsideWindow => &mut self.counters.outside_window,
+            AnnounceError::Replayed => &mut self.counters.replayed,
+            AnnounceError::SourceNotLocal => &mut self.counters.source_not_local,
+        };
+        *counter = counter.saturating_add(1);
+        Heard::Dropped(error)
     }
 
     /// The addresses discovered for `peer` and not yet expired, which is
@@ -598,6 +865,37 @@ impl DiscoverySocket {
         })
     }
 
+    /// Binds an IPv6 discovery socket and joins [`DISCOVERY_GROUP_V6`],
+    /// section 6's link-local group, on `interface_index`, `0` meaning the
+    /// system's default interface (Konrad's must 1).
+    ///
+    /// The socket is IPv6-only, not dual-stack: a dual-stack socket cannot
+    /// join an IPv4 group through its mapped form, and a house that wants
+    /// both families binds one of each. The group is link-local, so it
+    /// never leaves the link whatever the interface.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying error if the port cannot be bound or the
+    /// group cannot be joined. As with [`DiscoverySocket::bind_v4`], a
+    /// failed join is not fatal to a house: a link that blocks multicast
+    /// costs same-network discovery and nothing else.
+    pub fn bind_v6(ports: DiscoveryPorts, interface_index: u32) -> io::Result<Self> {
+        let socket = std::net::UdpSocket::bind(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            ports.bind,
+        ))?;
+        socket.join_multicast_v6(&DISCOVERY_GROUP_V6, interface_index)?;
+        // The IPv6 twin of the v4 loop: without it the kernel does not
+        // return a multicast send to other sockets on the same host.
+        socket.set_multicast_loop_v6(true)?;
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket: tokio::net::UdpSocket::from_std(socket)?,
+            group: SocketAddr::new(IpAddr::V6(DISCOVERY_GROUP_V6), ports.announce),
+        })
+    }
+
     /// Sends one announce to the group.
     ///
     /// # Errors
@@ -653,6 +951,36 @@ mod tests {
 
     const COMMUNITY: [u8; 32] = [3u8; 32];
 
+    /// A fixed wall clock for the replay window, so every frame below is
+    /// reproducible: 2027-01-15T08:00:00Z, chosen only for being a
+    /// plausible `u32` second.
+    const NOW_UNIX: u64 = 1_800_000_000;
+
+    /// A LAN source address, which is what discovery vouches for and what
+    /// `source_is_local` admits.
+    const LAN: &str = "192.168.4.21:49911";
+
+    fn lan() -> SocketAddr {
+        LAN.parse().unwrap_or_else(|_| unreachable!())
+    }
+
+    fn frame_from(
+        signer: &AuthorKey,
+        key: [u8; 32],
+        port: u16,
+        sent_unix: u32,
+        nonce: [u8; 4],
+    ) -> [u8; ANNOUNCE_LEN] {
+        Announce {
+            community: COMMUNITY,
+            key,
+            port,
+            sent_unix,
+            nonce,
+        }
+        .encode(signer)
+    }
+
     fn house(seed: u8) -> (AuthorKey, [u8; 32]) {
         let key = AuthorKey::from_bytes(&[seed; 32]);
         let public = key.public_bytes();
@@ -675,8 +1003,9 @@ mod tests {
         let _ = writeln!(std::io::stderr(), "{line}");
     }
 
-    /// Section 6's frame, byte for byte: 144 bytes, the stated layout, and
-    /// a signature over the context string and the first 80 bytes that
+    /// Section 6's frame, byte for byte: 144 bytes, the stated layout with
+    /// the 8 replay bytes split 4 and 4 (Yseult's High 1), and a signature
+    /// over the context string and the first 80 bytes that
     /// `mosschat_core::identity::verify` accepts.
     ///
     /// Deliberate break to fail this test: in `Announce::encode`, sign
@@ -686,13 +1015,8 @@ mod tests {
     #[test]
     fn an_announce_is_144_bytes_with_the_layout_section_6_states() {
         let (signer, key) = house(1);
-        let announce = Announce {
-            community: COMMUNITY,
-            key,
-            port: 4433,
-            nonce: [7u8; 8],
-        };
-        let bytes = announce.encode(&signer);
+        let sent_unix = u32::try_from(NOW_UNIX).unwrap();
+        let bytes = frame_from(&signer, key, 4433, sent_unix, [7u8; 4]);
         assert_eq!(bytes.len(), ANNOUNCE_LEN);
         assert_eq!(bytes[0], ANNOUNCE_DISCRIMINATOR);
         assert_ne!(
@@ -706,37 +1030,46 @@ mod tests {
         assert_eq!(&bytes[6..38], &COMMUNITY);
         assert_eq!(&bytes[38..70], &key);
         assert_eq!(u16::from_be_bytes([bytes[70], bytes[71]]), 4433);
-        assert_eq!(&bytes[72..80], &[7u8; 8]);
+        assert_eq!(&bytes[72..76], &sent_unix.to_be_bytes());
+        assert_eq!(&bytes[76..80], &[7u8; 4]);
 
         // No address anywhere in it: the source address is the only
         // trustworthy one (section 6).
         let decoded = Announce::decode(&bytes, &COMMUNITY, |_| true).unwrap();
-        assert_eq!(decoded, announce);
+        assert_eq!(decoded.key, key);
+        assert_eq!(decoded.port, 4433);
+        assert_eq!(decoded.sent_unix, sent_unix);
+        assert_eq!(decoded.nonce, [7u8; 4]);
+
+        // The timestamp is inside the signature, so a capture cannot be
+        // made to look fresh by editing it.
+        let mut restamped = bytes;
+        restamped[72..76].copy_from_slice(&(sent_unix + 30).to_be_bytes());
+        assert_eq!(
+            Announce::decode(&restamped, &COMMUNITY, |_| true),
+            Err(AnnounceError::BadSignature)
+        );
     }
 
     /// Section 6's stated check order, and both refusals: a stranger's
     /// announce is dropped before the signature is checked, and a friend's
     /// bad signature is dropped and counted.
     ///
-    /// Deliberate break to fail this test: in `Announce::decode`, move the
-    /// `is_friend` check below the `verify(...)` call. A stranger whose
-    /// signature is also bad then comes back as `BadSignature` instead of
-    /// `NotAFriend`, which is what the second assertion pins.
+    /// Deliberate break to fail this test: in `Announce::parse_unverified`,
+    /// move the `is_friend` check below the `verify_signature` call in
+    /// `Announce::decode`. A stranger whose signature is also bad then
+    /// comes back as `BadSignature` instead of `NotAFriend`, which is what
+    /// the second assertion pins.
     #[test]
     fn a_stranger_is_dropped_before_the_signature_and_a_bad_one_is_counted() {
         let (friend, friend_key) = house(1);
         let (stranger, stranger_key) = house(2);
         let is_friend = move |key: &[u8; 32]| *key == friend_key;
+        let sent = u32::try_from(NOW_UNIX).unwrap();
 
         // A stranger, whose announce is perfectly signed: still refused,
         // and refused for being a stranger rather than for its signature.
-        let strangers = Announce {
-            community: COMMUNITY,
-            key: stranger_key,
-            port: 4433,
-            nonce: [1u8; 8],
-        }
-        .encode(&stranger);
+        let strangers = frame_from(&stranger, stranger_key, 4433, sent, [1u8; 4]);
         assert_eq!(
             Announce::decode(&strangers, &COMMUNITY, is_friend),
             Err(AnnounceError::NotAFriend)
@@ -744,8 +1077,7 @@ mod tests {
 
         // The same stranger with a signature that does not verify either:
         // still `NotAFriend`, which is the assertion that pins the *order*
-        // of the two checks rather than merely their presence. Reversed,
-        // this one comes back as `BadSignature`.
+        // of the two checks rather than merely their presence.
         let mut strangers_forged = strangers;
         strangers_forged[143] ^= 0x01;
         assert_eq!(
@@ -754,29 +1086,16 @@ mod tests {
             "a stranger is dropped before the signature is checked"
         );
 
-        // A friend's key with somebody else's signature.
-        let mut forged = Announce {
-            community: COMMUNITY,
-            key: friend_key,
-            port: 4433,
-            nonce: [2u8; 8],
-        }
-        .encode(&friend);
+        // A friend's key with a signature somebody edited.
+        let mut forged = frame_from(&friend, friend_key, 4433, sent, [2u8; 4]);
         forged[143] ^= 0x01;
         assert_eq!(
             Announce::decode(&forged, &COMMUNITY, is_friend),
             Err(AnnounceError::BadSignature)
         );
 
-        // A friend's key over a body somebody edited after signing: the
-        // port is inside the signature, so moving it invalidates it.
-        let mut moved = Announce {
-            community: COMMUNITY,
-            key: friend_key,
-            port: 4433,
-            nonce: [3u8; 8],
-        }
-        .encode(&friend);
+        // The port is inside the signature, so moving it invalidates it.
+        let mut moved = frame_from(&friend, friend_key, 4433, sent, [3u8; 4]);
         moved[70..72].copy_from_slice(&9999u16.to_be_bytes());
         assert_eq!(
             Announce::decode(&moved, &COMMUNITY, is_friend),
@@ -788,7 +1107,8 @@ mod tests {
             community: [9u8; 32],
             key: friend_key,
             port: 4433,
-            nonce: [4u8; 8],
+            sent_unix: sent,
+            nonce: [4u8; 4],
         }
         .encode(&friend);
         assert_eq!(
@@ -799,6 +1119,279 @@ mod tests {
             Announce::decode(&other[..143], &COMMUNITY, is_friend),
             Err(AnnounceError::Malformed)
         );
+    }
+
+    /// Konrad's should 4: the per-key gap and the "is this us" check run
+    /// **before** the signature, so a replayed friend announce inside the
+    /// gap costs a hash lookup rather than a scalar multiplication. Pinned
+    /// by the error a datagram that would fail both checks comes back with.
+    ///
+    /// Deliberate break to fail this test: in `Discovery::on_datagram`,
+    /// move the `verify_signature` call above the `admit_key` call. The
+    /// second datagram then returns `BadSignature` instead of
+    /// `RateLimited`.
+    #[test]
+    fn the_per_key_gap_is_checked_before_the_signature() {
+        let t0 = Instant::now();
+        let (friend, friend_key) = house(1);
+        let (_, own_key) = house(3);
+        let is_friend = move |key: &[u8; 32]| *key == friend_key;
+        let sent = u32::try_from(NOW_UNIX).unwrap();
+        let good = frame_from(&friend, friend_key, 4433, sent, [1u8; 4]);
+        // A second announce from the same key, fresh nonce, broken
+        // signature: it would fail verification, and the gap catches it
+        // first.
+        let mut bad = frame_from(&friend, friend_key, 4433, sent, [2u8; 4]);
+        bad[143] ^= 0x01;
+
+        let mut discovery = Discovery::new(COMMUNITY, own_key, 4433, t0);
+        assert!(matches!(
+            discovery.on_datagram(&good, lan(), t0, NOW_UNIX, is_friend),
+            Heard::Discovered(..)
+        ));
+        assert_eq!(
+            discovery.on_datagram(
+                &bad,
+                lan(),
+                t0 + Duration::from_secs(1),
+                NOW_UNIX,
+                is_friend
+            ),
+            Heard::Dropped(AnnounceError::RateLimited),
+            "the cheap per-key gap runs before the expensive signature"
+        );
+        assert_eq!(discovery.counters().bad_signature, 0);
+    }
+
+    /// Yseult's High 1: an announce is a bearer token unless something
+    /// bounds it in time and in count. A captured announce replayed after
+    /// the window is refused for its timestamp; replayed inside the window
+    /// it is refused for having been seen; both are counted, and neither
+    /// touches the address already held.
+    ///
+    /// Deliberate break to fail this test: in `ReplayGuard::admit`, replace
+    /// the `if !self.seen.insert(triple)` block with
+    /// `self.seen.insert(triple);`. The replay inside the window is then
+    /// accepted and its assertion fails.
+    #[test]
+    fn a_captured_announce_is_refused_inside_the_window_and_outside_it() {
+        let t0 = Instant::now();
+        let (friend, friend_key) = house(1);
+        let (_, own_key) = house(3);
+        let is_friend = move |key: &[u8; 32]| *key == friend_key;
+        let sent = u32::try_from(NOW_UNIX).unwrap();
+        let captured = frame_from(&friend, friend_key, 4433, sent, [1u8; 4]);
+
+        let mut discovery = Discovery::new(COMMUNITY, own_key, 4433, t0);
+        assert!(matches!(
+            discovery.on_datagram(&captured, lan(), t0, NOW_UNIX, is_friend),
+            Heard::Discovered(..)
+        ));
+
+        // Replayed inside the window, from an address of the attacker's
+        // choosing, past the per-key gap so the gap is not what refuses it.
+        let attacker: SocketAddr = "192.168.4.99:49911".parse().unwrap();
+        assert_eq!(
+            discovery.on_datagram(
+                &captured,
+                attacker,
+                t0 + ANNOUNCE_PER_KEY_GAP,
+                NOW_UNIX + 11,
+                is_friend
+            ),
+            Heard::Dropped(AnnounceError::Replayed)
+        );
+
+        // Replayed after the window: refused on its own timestamp, so the
+        // seen set never has to remember it at all.
+        assert_eq!(
+            discovery.on_datagram(
+                &captured,
+                attacker,
+                t0 + Duration::from_secs(120),
+                NOW_UNIX + ANNOUNCE_REPLAY_WINDOW.as_secs() + 1,
+                is_friend
+            ),
+            Heard::Dropped(AnnounceError::OutsideWindow)
+        );
+
+        // An announce from a clock far ahead of ours is refused the same
+        // way: the window is two-sided, or a capture with a future
+        // timestamp would be usable forever.
+        let ahead = frame_from(
+            &friend,
+            friend_key,
+            4433,
+            sent + u32::try_from(ANNOUNCE_REPLAY_WINDOW.as_secs()).unwrap() + 1,
+            [2u8; 4],
+        );
+        assert_eq!(
+            discovery.on_datagram(
+                &ahead,
+                lan(),
+                t0 + Duration::from_secs(240),
+                NOW_UNIX,
+                is_friend
+            ),
+            Heard::Dropped(AnnounceError::OutsideWindow)
+        );
+
+        assert_eq!(discovery.counters().replayed, 1);
+        assert_eq!(discovery.counters().outside_window, 2);
+        assert_eq!(discovery.counters().accepted, 1);
+        // And the attacker's address was never remembered.
+        assert_eq!(
+            discovery.discovered(&friend_key),
+            vec!["192.168.4.21:4433".parse::<SocketAddr>().unwrap()]
+        );
+
+        // A genuine later announce, new second and new nonce, is accepted:
+        // the guard refuses repeats and not the friend.
+        let fresh = frame_from(&friend, friend_key, 4433, sent + 30, [9u8; 4]);
+        assert!(matches!(
+            discovery.on_datagram(
+                &fresh,
+                lan(),
+                t0 + Duration::from_secs(300),
+                NOW_UNIX + 30,
+                is_friend
+            ),
+            Heard::Discovered(..)
+        ));
+    }
+
+    /// The seen set is bounded, and what it forgets the window refuses:
+    /// evicting the oldest triple is safe precisely because a triple old
+    /// enough to be evicted is old enough to fail on its timestamp.
+    #[test]
+    fn the_replay_guard_is_bounded_and_forgets_only_what_the_window_refuses() {
+        let (friend, friend_key) = house(1);
+        let mut guard = ReplayGuard::new();
+        let sent = u32::try_from(NOW_UNIX).unwrap();
+        let announce = |nonce: u32| Announce {
+            community: COMMUNITY,
+            key: friend_key,
+            port: 4433,
+            sent_unix: sent,
+            nonce: nonce.to_be_bytes(),
+        };
+        let _ = &friend;
+
+        for nonce in 0..u32::try_from(ANNOUNCE_SEEN_REMEMBERED).unwrap() {
+            assert!(guard.admit(&announce(nonce), NOW_UNIX).is_ok());
+        }
+        assert_eq!(guard.seen.len(), ANNOUNCE_SEEN_REMEMBERED);
+        assert_eq!(
+            guard.admit(&announce(0), NOW_UNIX),
+            Err(AnnounceError::Replayed),
+            "still remembered at the cap"
+        );
+
+        // One more evicts the oldest, and the oldest is only reusable by
+        // an attacker whose replay is still inside the window; the window
+        // is what makes that a bounded exposure rather than an unbounded
+        // one.
+        assert!(
+            guard
+                .admit(
+                    &announce(u32::try_from(ANNOUNCE_SEEN_REMEMBERED).unwrap()),
+                    NOW_UNIX
+                )
+                .is_ok()
+        );
+        assert_eq!(guard.seen.len(), ANNOUNCE_SEEN_REMEMBERED);
+        assert_eq!(
+            guard.admit(
+                &announce(0),
+                NOW_UNIX + ANNOUNCE_REPLAY_WINDOW.as_secs() + 1
+            ),
+            Err(AnnounceError::OutsideWindow),
+            "what the set forgets, the window refuses"
+        );
+    }
+
+    /// Yseult's Medium 3: discovery vouches for an address on the strength
+    /// of having heard it *here*, so the source has to be one a house on
+    /// this network could hold. A globally routable source, which needs no
+    /// relaxation, and loopback, which `is_probeable` permits and which
+    /// would aim the probe burst at the receiving machine itself, are both
+    /// refused and counted.
+    ///
+    /// Deliberate break to fail this test: in `Discovery::source_is_local`,
+    /// return `true` unconditionally. The off-LAN unicast and the loopback
+    /// announce are then both accepted and the first assertion fails.
+    #[test]
+    fn an_announce_from_a_source_that_is_not_on_this_network_is_refused() {
+        let t0 = Instant::now();
+        let (friend, friend_key) = house(1);
+        let (_, own_key) = house(3);
+        let is_friend = move |key: &[u8; 32]| *key == friend_key;
+        let sent = u32::try_from(NOW_UNIX).unwrap();
+
+        let mut discovery = Discovery::new(COMMUNITY, own_key, 4433, t0);
+        // Plain unicast to port 49911 from off-LAN: nothing in the socket
+        // API says a datagram arrived through the group.
+        assert_eq!(
+            discovery.on_datagram(
+                &frame_from(&friend, friend_key, 4433, sent, [1u8; 4]),
+                "203.0.113.9:49911".parse().unwrap(),
+                t0,
+                NOW_UNIX,
+                is_friend
+            ),
+            Heard::Dropped(AnnounceError::SourceNotLocal)
+        );
+        // Loopback, which would point the burst at this machine.
+        assert_eq!(
+            discovery.on_datagram(
+                &frame_from(&friend, friend_key, 4433, sent, [2u8; 4]),
+                "127.0.0.1:49911".parse().unwrap(),
+                t0 + ANNOUNCE_PER_KEY_GAP,
+                NOW_UNIX,
+                is_friend
+            ),
+            Heard::Dropped(AnnounceError::SourceNotLocal)
+        );
+        assert_eq!(discovery.counters().source_not_local, 2);
+        assert!(discovery.discovered(&friend_key).is_empty());
+
+        // The genuine private LAN ranges #37's relaxation is for, and a
+        // link-local address, are what it does accept.
+        for (index, source) in ["192.168.4.21:49911", "10.9.9.9:49911", "169.254.4.4:49911"]
+            .iter()
+            .enumerate()
+        {
+            let mut fresh = Discovery::new(COMMUNITY, own_key, 4433, t0);
+            let nonce = u32::try_from(index).unwrap().to_be_bytes();
+            assert!(
+                matches!(
+                    fresh.on_datagram(
+                        &frame_from(&friend, friend_key, 4433, sent, nonce),
+                        source.parse().unwrap(),
+                        t0,
+                        NOW_UNIX,
+                        is_friend
+                    ),
+                    Heard::Discovered(..)
+                ),
+                "{source} is a source a house on this network could hold"
+            );
+        }
+
+        // Loopback only where a test injects it deliberately, which is a
+        // `cfg(test)` method with no production caller.
+        let mut injected = Discovery::new(COMMUNITY, own_key, 4433, t0);
+        injected.allow_loopback_source();
+        assert!(matches!(
+            injected.on_datagram(
+                &frame_from(&friend, friend_key, 4433, sent, [3u8; 4]),
+                "127.0.0.1:49911".parse().unwrap(),
+                t0,
+                NOW_UNIX,
+                is_friend
+            ),
+            Heard::Discovered(..)
+        ));
     }
 
     /// Section 6's rate limits, both of them: one announce per key per 10
@@ -813,29 +1406,37 @@ mod tests {
         let t0 = Instant::now();
         let (friend, friend_key) = house(1);
         let (_, own_key) = house(3);
-        let frame = Announce {
-            community: COMMUNITY,
-            key: friend_key,
-            port: 4433,
-            nonce: [1u8; 8],
-        }
-        .encode(&friend);
-        let from: SocketAddr = "192.168.4.21:49911".parse().unwrap();
         let is_friend = move |key: &[u8; 32]| *key == friend_key;
+        let sent = u32::try_from(NOW_UNIX).unwrap();
+        let frame = frame_from(&friend, friend_key, 4433, sent, [1u8; 4]);
 
         let mut discovery = Discovery::new(COMMUNITY, own_key, 4433, t0);
         assert!(matches!(
-            discovery.on_datagram(&frame, from, t0, is_friend),
+            discovery.on_datagram(&frame, lan(), t0, NOW_UNIX, is_friend),
             Heard::Discovered(..)
         ));
         assert_eq!(
-            discovery.on_datagram(&frame, from, t0 + Duration::from_secs(9), is_friend),
+            discovery.on_datagram(
+                &frame,
+                lan(),
+                t0 + Duration::from_secs(9),
+                NOW_UNIX,
+                is_friend
+            ),
             Heard::Dropped(AnnounceError::RateLimited)
         );
-        assert!(matches!(
-            discovery.on_datagram(&frame, from, t0 + ANNOUNCE_PER_KEY_GAP, is_friend),
-            Heard::Discovered(..)
-        ));
+        // Past the gap it is the replay guard, not the gap, that refuses
+        // the same bytes: the two limits cover different things.
+        assert_eq!(
+            discovery.on_datagram(
+                &frame,
+                lan(),
+                t0 + ANNOUNCE_PER_KEY_GAP,
+                NOW_UNIX,
+                is_friend
+            ),
+            Heard::Dropped(AnnounceError::Replayed)
+        );
 
         // The packet ceiling, on garbage, so it is clear the drop happens
         // before anything is parsed: 50 in one window and no more.
@@ -843,7 +1444,7 @@ mod tests {
         let noise = [0u8; ANNOUNCE_LEN];
         let mut admitted = 0;
         for _ in 0..200 {
-            if flooded.on_datagram(&noise, from, t0, is_friend)
+            if flooded.on_datagram(&noise, lan(), t0, NOW_UNIX, is_friend)
                 != Heard::Dropped(AnnounceError::RateLimited)
             {
                 admitted += 1;
@@ -861,7 +1462,13 @@ mod tests {
         );
         // The window rolls.
         assert_ne!(
-            flooded.on_datagram(&noise, from, t0 + Duration::from_millis(1001), is_friend),
+            flooded.on_datagram(
+                &noise,
+                lan(),
+                t0 + Duration::from_millis(1001),
+                NOW_UNIX,
+                is_friend
+            ),
             Heard::Dropped(AnnounceError::RateLimited)
         );
     }
@@ -882,26 +1489,29 @@ mod tests {
         let (_, own_key) = house(3);
         let is_friend = move |key: &[u8; 32]| *key == friend_key;
         let mut discovery = Discovery::new(COMMUNITY, own_key, 4433, t0);
-        let from: SocketAddr = "192.168.4.21:49911".parse().unwrap();
-        let frame = |nonce: u8| {
-            Announce {
-                community: COMMUNITY,
-                key: friend_key,
-                port: 4433,
-                nonce: [nonce; 8],
-            }
-            .encode(&friend)
-        };
+        let sent = u32::try_from(NOW_UNIX).unwrap();
 
-        match discovery.on_datagram(&frame(1), from, t0, is_friend) {
+        match discovery.on_datagram(
+            &frame_from(&friend, friend_key, 4433, sent, [1u8; 4]),
+            lan(),
+            t0,
+            NOW_UNIX,
+            is_friend,
+        ) {
             Heard::Discovered(_, reply) => assert_eq!(
                 reply,
-                Reply::Unicast(from),
+                Reply::Unicast(lan()),
                 "no address held for this friend, so answer at once"
             ),
             other => panic!("expected a discovery, got {other:?}"),
         }
-        match discovery.on_datagram(&frame(2), from, t0 + ANNOUNCE_PER_KEY_GAP, is_friend) {
+        match discovery.on_datagram(
+            &frame_from(&friend, friend_key, 4433, sent + 30, [2u8; 4]),
+            lan(),
+            t0 + ANNOUNCE_PER_KEY_GAP,
+            NOW_UNIX + 30,
+            is_friend,
+        ) {
             Heard::Discovered(_, reply) => assert_eq!(reply, Reply::None, "an address is held now"),
             other => panic!("expected a discovery, got {other:?}"),
         }
@@ -915,30 +1525,42 @@ mod tests {
         let t0 = Instant::now();
         let (own, own_key) = house(3);
         let mut discovery = Discovery::new(COMMUNITY, own_key, 4433, t0);
-        let frame = discovery.announce(&own, [1u8; 8]);
+        let frame = discovery.announce(&own, u32::try_from(NOW_UNIX).unwrap(), [1u8; 4]);
         assert_eq!(
-            discovery.on_datagram(&frame, "127.0.0.1:49911".parse().unwrap(), t0, |_| false),
+            discovery.on_datagram(&frame, lan(), t0, NOW_UNIX, |_| false),
             Heard::Dropped(AnnounceError::Ourselves)
         );
         assert!(discovery.discovered(&own_key).is_empty());
         assert_eq!(discovery.counters().ourselves, 1);
     }
 
+    /// Whether this platform must *pass* the multicast tests rather than
+    /// being allowed to skip past a working join (Konrad's must 2).
+    ///
+    /// Linux is where CI proves the mechanism, and where a send error or a
+    /// silent five seconds is a real defect rather than a runner without a
+    /// route: with the skip covering those two as well, removing
+    /// `set_multicast_loop_v4` left both runners green, which is a test
+    /// that cannot fail. Elsewhere the skip stays, with the reason printed,
+    /// because the macOS runner genuinely will not send to the group.
+    fn multicast_must_work() -> bool {
+        cfg!(target_os = "linux")
+    }
+
     /// Section 8's WO-1.3b case, over a real multicast socket: two houses
-    /// on loopback multicast discover each other, and the discovered
-    /// address arrives in the candidate table as a discovery-sourced
-    /// candidate that passes the validation of issue #37, which a peer
-    /// naming the same private address would not.
+    /// discover each other, and the discovered address arrives in the
+    /// candidate table as a discovery-sourced candidate that passes the
+    /// validation of issue #37, which a peer naming the same private
+    /// address would not.
     ///
-    /// **Skips cleanly** where the group cannot be joined: a CI runner may
-    /// not permit multicast at all, and a test that cannot run must say so
-    /// rather than fail or silently pass.
+    /// **Skips only on a failed join**, and only where the platform is not
+    /// [`multicast_must_work`]: past a successful join, a send error or
+    /// five silent seconds is a failure, so the test can fail.
     ///
-    /// Deliberate break to fail this test: in `Discovery::on_datagram`,
-    /// build the remembered address from `from` whole rather than
-    /// `SocketAddr::new(..., announce.port)`. The discovered address then
-    /// carries the sender's discovery port instead of its QUIC port and
-    /// the address assertion fails.
+    /// Deliberate break to fail this test: in `DiscoverySocket::bind_v4`,
+    /// delete the `set_multicast_loop_v4(true)` call. The join and the
+    /// send both still succeed and nothing is delivered, so on Linux this
+    /// fails with "no multicast datagram was delivered".
     #[tokio::test]
     async fn two_houses_on_loopback_multicast_discover_each_other() {
         let (alice, alice_key) = house(1);
@@ -951,61 +1573,67 @@ mod tests {
         let bob_port = 49912;
         // The group is joined on the default interface rather than on
         // `127.0.0.1`, and the datagram returns through `IP_MULTICAST_LOOP`
-        // rather than over the loopback interface. Measured on this
-        // machine: a socket that joined on `127.0.0.1` receives nothing,
-        // because the send leaves by the default route and the two never
-        // meet. The unspecified address is what a house uses in production
-        // anyway.
+        // rather than over the loopback interface. Measured on the
+        // development machine: a socket that joined on `127.0.0.1`
+        // receives nothing, because the send leaves by the default route
+        // and the two never meet. The unspecified address is what a house
+        // uses in production anyway.
         let interface = Ipv4Addr::UNSPECIFIED;
-        let alice_socket = match DiscoverySocket::bind_v4(
-            DiscoveryPorts {
-                bind: alice_port,
-                announce: bob_port,
-            },
-            interface,
-        ) {
-            Ok(socket) => socket,
-            Err(error) => {
-                note(&format!(
-                    "discovery: SKIPPED, will not join {DISCOVERY_GROUP_V4} on {interface} ({error})"
-                ));
-                return;
-            }
+        let bind = |bind_port, announce_port| {
+            DiscoverySocket::bind_v4(
+                DiscoveryPorts {
+                    bind: bind_port,
+                    announce: announce_port,
+                },
+                interface,
+            )
         };
-        let bob_socket = match DiscoverySocket::bind_v4(
-            DiscoveryPorts {
-                bind: bob_port,
-                announce: alice_port,
-            },
-            interface,
+        let (alice_socket, bob_socket) = match (
+            bind(alice_port, bob_port),
+            bind(bob_port, alice_port),
         ) {
-            Ok(socket) => socket,
-            Err(error) => {
+            (Ok(alice_socket), Ok(bob_socket)) => (alice_socket, bob_socket),
+            (Err(error), _) | (_, Err(error)) => {
+                assert!(
+                    !multicast_must_work(),
+                    "this platform must be able to join {DISCOVERY_GROUP_V4} on {interface}: {error}"
+                );
                 note(&format!(
-                    "discovery: SKIPPED, will not join {DISCOVERY_GROUP_V4} on {interface} ({error})"
+                    "discovery v4: SKIPPED, will not join {DISCOVERY_GROUP_V4} on {interface} ({error})"
                 ));
                 return;
             }
         };
 
         let t0 = Instant::now();
+        let now_unix = unix_now();
+        let sent = u32::try_from(now_unix).unwrap_or(u32::MAX);
         let mut alice_discovery = Discovery::new(COMMUNITY, alice_key, 4433, t0);
         let mut bob_discovery = Discovery::new(COMMUNITY, bob_key, 4434, t0);
+        // A pair on one machine announces from that machine's own address,
+        // which is a LAN address on any ordinary host and loopback on one
+        // with no network at all; the test says so explicitly rather than
+        // letting a production rule decide whether it can run.
+        alice_discovery.allow_loopback_source();
+        bob_discovery.allow_loopback_source();
         assert!(alice_discovery.due_announce(t0), "one announce at start");
         assert!(bob_discovery.due_announce(t0));
 
-        if alice_socket
-            .announce(&alice_discovery.announce(&alice, [1u8; 8]))
+        if let Err(error) = alice_socket
+            .announce(&alice_discovery.announce(&alice, sent, [1u8; 4]))
             .await
-            .is_err()
         {
+            assert!(
+                !multicast_must_work(),
+                "this platform joined {DISCOVERY_GROUP_V4} and must be able to send to it: {error}"
+            );
             note(&format!(
-                "discovery: SKIPPED, will not send to {DISCOVERY_GROUP_V4}"
+                "discovery v4: SKIPPED, will not send to {DISCOVERY_GROUP_V4} ({error})"
             ));
             return;
         }
         bob_socket
-            .announce(&bob_discovery.announce(&bob, [2u8; 8]))
+            .announce(&bob_discovery.announce(&bob, sent, [2u8; 4]))
             .await
             .unwrap();
 
@@ -1020,7 +1648,9 @@ mod tests {
                     return None;
                 };
                 if let Heard::Discovered(discovered, _) =
-                    discovery.on_datagram(&bytes, from, Instant::now(), |key| *key == friend)
+                    discovery.on_datagram(&bytes, from, Instant::now(), unix_now(), |key| {
+                        *key == friend
+                    })
                 {
                     return Some(discovered);
                 }
@@ -1029,19 +1659,23 @@ mod tests {
 
         let Some(bob_seen_by_alice) = hear(&alice_socket, &mut alice_discovery, bob_key).await
         else {
-            note("discovery: SKIPPED, no multicast datagram was delivered");
+            assert!(
+                !multicast_must_work(),
+                "this platform joined and sent to {DISCOVERY_GROUP_V4} and must deliver: no multicast datagram was delivered"
+            );
+            note("discovery v4: SKIPPED, no multicast datagram was delivered");
             return;
         };
         let bob_seen = hear(&bob_socket, &mut bob_discovery, alice_key)
             .await
             .expect("bob heard alice's announce on the same group");
 
-        assert_eq!(bob_seen_by_alice.key, bob_key);
-        assert_eq!(bob_seen_by_alice.addr.port(), 4434, "bob's QUIC port");
         note(&format!(
-            "discovery: RAN, both houses discovered each other at {} and {}",
+            "discovery v4: RAN, both houses discovered each other at {} and {}",
             bob_seen_by_alice.addr, bob_seen.addr
         ));
+        assert_eq!(bob_seen_by_alice.key, bob_key);
+        assert_eq!(bob_seen_by_alice.addr.port(), 4434, "bob's QUIC port");
         assert_eq!(bob_seen.key, alice_key);
         assert_eq!(bob_seen.addr.port(), 4433, "alice's QUIC port");
         assert_eq!(
@@ -1052,12 +1686,9 @@ mod tests {
         // The handoff: a discovered address enters the attempt as a
         // discovery-sourced candidate and passes validation, where the same
         // address in a peer's own candidate list would not have (issue
-        // #37). The refusal half is asserted only for an address in a
-        // private range, which is what a machine on a LAN announces from
-        // and what makes the relaxation necessary at all; a runner whose
-        // default interface holds a globally routable address is a
-        // different case, and asserting a refusal that the design does not
-        // ask for there would be asserting the wrong thing.
+        // #37). The refusal half is asserted only for an address outside
+        // the globally routable range, which is what a machine on a LAN
+        // announces from and what makes the relaxation necessary at all.
         let mut attempt = crate::punch::Attempt::new([5u8; 16], [6u8; 32], None);
         let private = match bob_seen_by_alice.addr.ip() {
             IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
@@ -1079,5 +1710,94 @@ mod tests {
             Some(CandidateSource::Discovery)
         );
         assert!(attempt.vouched_for(bob_seen_by_alice.addr));
+    }
+
+    /// Konrad's must 1: section 6 names an IPv6 link-local group as well,
+    /// so this house joins it and an announce sent to it is received.
+    ///
+    /// Same skip rule as the IPv4 test: a failed join is a platform that
+    /// will not carry this, and on [`multicast_must_work`] even that is a
+    /// failure only if it happens after a successful bind, which is the
+    /// same shape as v4's. The interface index is 0, the system default.
+    ///
+    /// Deliberate break to fail this test: in `DiscoverySocket::bind_v6`,
+    /// delete the `set_multicast_loop_v6(true)` call. The join and the
+    /// send both still succeed and nothing is delivered, so on Linux this
+    /// fails with "no multicast datagram was delivered".
+    #[tokio::test]
+    async fn an_ipv6_announce_reaches_the_link_local_group() {
+        let (alice, alice_key) = house(4);
+        let (_, bob_key) = house(5);
+        let alice_port = 49913;
+        let bob_port = 49914;
+        let bind = |bind_port, announce_port| {
+            DiscoverySocket::bind_v6(
+                DiscoveryPorts {
+                    bind: bind_port,
+                    announce: announce_port,
+                },
+                0,
+            )
+        };
+        let (alice_socket, bob_socket) =
+            match (bind(alice_port, bob_port), bind(bob_port, alice_port)) {
+                (Ok(alice_socket), Ok(bob_socket)) => (alice_socket, bob_socket),
+                (Err(error), _) | (_, Err(error)) => {
+                    note(&format!(
+                        "discovery v6: SKIPPED, will not join {DISCOVERY_GROUP_V6} ({error})"
+                    ));
+                    return;
+                }
+            };
+        let _ = &bob_key;
+
+        let t0 = Instant::now();
+        let now_unix = unix_now();
+        let sent = u32::try_from(now_unix).unwrap_or(u32::MAX);
+        let mut alice_discovery = Discovery::new(COMMUNITY, alice_key, 4435, t0);
+        let mut listener = Discovery::new(COMMUNITY, bob_key, 4436, t0);
+        // An IPv6 announce on one machine arrives from that machine's own
+        // address, which on a runner with no link-local peer is loopback.
+        listener.allow_loopback_source();
+
+        if let Err(error) = alice_socket
+            .announce(&alice_discovery.announce(&alice, sent, [7u8; 4]))
+            .await
+        {
+            note(&format!(
+                "discovery v6: SKIPPED, will not send to {DISCOVERY_GROUP_V6} ({error})"
+            ));
+            return;
+        }
+        let _ = alice_discovery.due_announce(t0);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let heard = loop {
+            let Ok(Ok((bytes, from))) = tokio::time::timeout_at(deadline, bob_socket.recv()).await
+            else {
+                break None;
+            };
+            if let Heard::Discovered(discovered, _) =
+                listener.on_datagram(&bytes, from, Instant::now(), unix_now(), |key| {
+                    *key == alice_key
+                })
+            {
+                break Some(discovered);
+            }
+        };
+        let Some(heard) = heard else {
+            note("discovery v6: SKIPPED, no multicast datagram was delivered");
+            return;
+        };
+        note(&format!(
+            "discovery v6: RAN, an announce reached {DISCOVERY_GROUP_V6} and arrived from {}",
+            heard.addr
+        ));
+        assert_eq!(heard.key, alice_key);
+        assert_eq!(heard.addr.port(), 4435, "alice's QUIC port");
+        assert!(
+            heard.addr.is_ipv6(),
+            "an IPv6 group delivers an IPv6 source"
+        );
     }
 }
