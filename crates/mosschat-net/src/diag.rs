@@ -5,9 +5,11 @@
 //! succeeded, degraded or failed. Records are appended one JSON object per
 //! line to a file named for the UTC day, because a person reads this file
 //! and pastes it into an issue (section 7's own reason for JSON over CBOR).
-//! No dependency in this workspace formats dates or JSON, so both are
-//! hand-rolled here rather than adding one; see the `rfc3339` and `json`
-//! modules below.
+//! Dates are formatted with `time` and JSON with `serde_json`, both already
+//! present in this workspace's dependency graph before this crate named
+//! them directly (Konrad's review of PR #28: the earlier hand-rolled
+//! versions duplicated a compiled-in crate and, in the JSON parser's case,
+//! had no recursion depth cap).
 //!
 //! This module defines every enum from section 7 (`Step`, `Reason`,
 //! `Mapping`) so that WO-1.3b's `punch.rs`/`live.rs` and the `doctor`
@@ -322,27 +324,148 @@ impl PathChoice {
     }
 }
 
+/// Creates the directory at `dir` if it does not exist and sets it to mode
+/// `0700` on Unix (no-op on other platforms): both [`InstallSalt`] and
+/// [`DiagWriter`] write files here that must not be world- or group-
+/// readable, the salt because it defeats redaction if read by another
+/// account and the log because it carries IP addresses.
+fn ensure_private_dir(dir: &Path) -> Result<(), DiagError> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Opens `path` for exclusive private writing (create, truncate, write),
+/// mode `0600` on Unix, set both at creation and unconditionally
+/// afterwards so a file that already existed under a looser mode (from a
+/// build before this rule) is corrected rather than left as it was.
+fn create_private_file(path: &Path) -> Result<std::fs::File, DiagError> {
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_options.mode(0o600);
+    }
+    let file = open_options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+/// Opens `path` for private append (create if absent, never truncate),
+/// mode `0600` on Unix, same unconditional-correction rule as
+/// [`create_private_file`].
+fn open_private_append(path: &Path) -> Result<std::fs::File, DiagError> {
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_options.mode(0o600);
+    }
+    let file = open_options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+/// 16 random bytes generated once per install and stored beside the
+/// diagnostics log (section 7), used to salt every [`PeerFingerprint`] so
+/// the same peer's fingerprint cannot be correlated across two different
+/// installs.
+///
+/// The only ways to obtain one are [`InstallSalt::load_or_create`], which
+/// reads a persisted salt or generates and persists a fresh one with the OS
+/// CSPRNG, and, in this module's own tests, that same function against a
+/// temporary directory. There is no constructor taking caller-supplied
+/// bytes, so `b""` (Konrad's review, PR #28 finding 1) cannot compile: the
+/// type is a fixed 16 byte array, structurally incapable of holding zero
+/// bytes, and its value is never logged (no `Display`, no `Debug` deriving
+/// through to the bytes; `Debug` below prints only the type name).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct InstallSalt([u8; 16]);
+
+impl fmt::Debug for InstallSalt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("InstallSalt(..)")
+    }
+}
+
+impl InstallSalt {
+    /// The file name the salt is persisted under, beside the diagnostics
+    /// log files in the same directory.
+    const FILE_NAME: &'static str = "install_salt";
+
+    /// Loads the salt at `dir/install_salt` if it exists and is exactly 16
+    /// bytes; otherwise generates 16 bytes from the OS CSPRNG, persists
+    /// them there (mode `0600`, directory mode `0700`), and returns those.
+    ///
+    /// # Errors
+    /// Returns [`DiagError::Io`] if `dir` cannot be created or the salt
+    /// file cannot be read or written, or [`DiagError::Malformed`] if a
+    /// salt file exists but is not exactly 16 bytes.
+    pub fn load_or_create(dir: &Path) -> Result<Self, DiagError> {
+        ensure_private_dir(dir)?;
+        let path = dir.join(Self::FILE_NAME);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let array: [u8; 16] = bytes.try_into().map_err(|_| {
+                    DiagError::Malformed(format!(
+                        "install salt at {} is not exactly 16 bytes",
+                        path.display()
+                    ))
+                })?;
+                Ok(Self(array))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                use rand::RngExt;
+                let mut bytes = [0u8; 16];
+                rand::rng().fill(&mut bytes);
+                use std::io::Write;
+                create_private_file(&path)?.write_all(&bytes)?;
+                Ok(Self(bytes))
+            }
+            Err(e) => Err(DiagError::Io(e)),
+        }
+    }
+
+    /// The salt's raw bytes, for [`PeerFingerprint::from_key`] alone.
+    fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
 /// A public key, reduced to a short fingerprint fit to appear in a
 /// diagnostics record.
 ///
 /// Section 7's redaction rule is enforced structurally rather than by
 /// convention: this type is 4 bytes wide, so it cannot losslessly hold a 32
 /// byte ed25519 key, and its only constructor is [`PeerFingerprint::from_key`],
-/// which consumes a key and an install salt and returns only a keyed hash
-/// prefix; the key itself is never retained. There is no `From<[u8; 32]>` or
-/// other conversion that could place raw key bytes into a [`DiagRecord`].
+/// which consumes a key and an [`InstallSalt`] and returns only a keyed
+/// hash prefix; the key itself is never retained. There is no
+/// `From<[u8; 32]>` or other conversion that could place raw key bytes into
+/// a [`DiagRecord`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PeerFingerprint([u8; 4]);
 
 impl PeerFingerprint {
-    /// Computes the fingerprint of `key`, salted with `install_salt` (16
-    /// random bytes generated once and stored beside the log, per section
-    /// 7), as the first 4 bytes (8 hex characters) of
-    /// `BLAKE3(install_salt || key)`.
+    /// Computes the fingerprint of `key`, salted with `salt` (section 7),
+    /// as the first 4 bytes (8 hex characters) of `BLAKE3(salt || key)`.
     #[must_use]
-    pub fn from_key(install_salt: &[u8], key: &[u8; 32]) -> Self {
+    pub fn from_key(salt: &InstallSalt, key: &[u8; 32]) -> Self {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(install_salt);
+        hasher.update(salt.as_bytes());
         hasher.update(key);
         let hash = hasher.finalize();
         let mut out = [0u8; 4];
@@ -426,7 +549,8 @@ pub struct StepRecord {
     pub outcome: StepOutcome,
     /// Free text: an error message, a candidate count, a timing note. Never
     /// fed raw key material, ticket secrets or payload bytes; callers pass
-    /// only text meant to be read.
+    /// only text meant to be read. Truncated at [`MAX_FREE_TEXT_LEN`] bytes
+    /// when written ([`cap_text`], used by `to_json_line`).
     pub detail: String,
 }
 
@@ -469,9 +593,11 @@ pub struct DiagRecord {
     pub path_rtt_us: u32,
     /// Why the attempt ended the way it did.
     pub reason: Reason,
-    /// The running mosschat version.
+    /// The running mosschat version. Truncated at [`MAX_FREE_TEXT_LEN`]
+    /// bytes when written.
     pub version: String,
-    /// The running platform (`"linux"`, `"macos"`, `"windows"`).
+    /// The running platform (`"linux"`, `"macos"`, `"windows"`). Truncated
+    /// at [`MAX_FREE_TEXT_LEN`] bytes when written.
     pub platform: String,
 }
 
@@ -491,426 +617,95 @@ pub enum DiagError {
 // RFC 3339 timestamps
 // ---------------------------------------------------------------------
 
-/// UTC calendar math and RFC 3339 formatting, hand-rolled because no crate
-/// in this workspace formats dates (`docs/dev/lints.md`'s dependency
-/// discipline: nothing here is added without a named reason, and one whole
-/// crate for "print a UTC timestamp" is not proportionate).
+/// RFC 3339 UTC timestamps via `time` (Konrad's review of PR #28: `time`
+/// 0.3.55 was already compiled into this binary transitively through
+/// x509-parser and rcgen, so the 130 lines of hand-rolled civil-calendar
+/// math this module replaced duplicated a crate already in the tree).
 mod rfc3339 {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
     use super::DiagError;
 
-    /// Howard Hinnant's `civil_from_days` (public domain): days since the
-    /// Unix epoch to a proleptic-Gregorian `(year, month, day)`.
-    fn civil_from_days(z: i64) -> (i64, u32, u32) {
-        let z = z + 719_468;
-        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-        #[allow(clippy::cast_sign_loss)]
-        let doe = (z - era * 146_097) as u64;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-        #[allow(clippy::cast_possible_wrap)]
-        let y = yoe as i64 + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        #[allow(clippy::cast_possible_truncation)]
-        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-        #[allow(clippy::cast_possible_truncation)]
-        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-        (if m <= 2 { y + 1 } else { y }, m, d)
-    }
-
-    /// The inverse of [`civil_from_days`]: a proleptic-Gregorian date to
-    /// days since the Unix epoch.
-    fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-        let y = if m <= 2 { y - 1 } else { y };
-        let era = if y >= 0 { y } else { y - 399 } / 400;
-        #[allow(clippy::cast_sign_loss)]
-        let yoe = (y - era * 400) as u64;
-        let m = u64::from(m);
-        let d = u64::from(d);
-        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        #[allow(clippy::cast_possible_wrap)]
-        let doe = doe as i64;
-        era * 146_097 + doe - 719_468
-    }
+    /// The fallback timestamp used only on the practically unreachable
+    /// path where `epoch_ms` cannot be represented (library code never
+    /// panics, invariant 1): the Unix epoch itself, unmistakably wrong to
+    /// a reader rather than silently plausible.
+    const EPOCH_FALLBACK: &str = "1970-01-01T00:00:00Z";
 
     /// Formats `epoch_ms` (milliseconds since the Unix epoch, never
     /// negative in this codebase, see `now_ms` in `gate/mod.rs`) as an RFC
-    /// 3339 UTC timestamp with millisecond precision.
+    /// 3339 UTC timestamp.
     #[must_use]
     pub fn format(epoch_ms: u64) -> String {
-        #[allow(clippy::cast_possible_wrap)]
-        let epoch_s = (epoch_ms / 1000) as i64;
-        let ms = epoch_ms % 1000;
-        let days = epoch_s.div_euclid(86_400);
-        let secs_of_day = epoch_s.rem_euclid(86_400);
-        let (y, m, d) = civil_from_days(days);
-        let h = secs_of_day / 3600;
-        let min = (secs_of_day % 3600) / 60;
-        let s = secs_of_day % 60;
-        format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}.{ms:03}Z")
+        let nanos = i128::from(epoch_ms) * 1_000_000;
+        OffsetDateTime::from_unix_timestamp_nanos(nanos)
+            .ok()
+            .and_then(|dt| dt.format(&Rfc3339).ok())
+            .unwrap_or_else(|| EPOCH_FALLBACK.to_string())
     }
 
-    /// Parses an RFC 3339 UTC timestamp of the exact shape [`format`]
-    /// produces back to milliseconds since the Unix epoch.
+    /// Parses an RFC 3339 UTC timestamp back to milliseconds since the
+    /// Unix epoch.
     ///
     /// # Errors
-    /// Returns [`DiagError::Malformed`] if `s` is not that shape.
+    /// Returns [`DiagError::Malformed`] if `s` is not a valid RFC 3339
+    /// timestamp, or names a time before the Unix epoch.
     pub fn parse(s: &str) -> Result<u64, DiagError> {
-        let bad = || DiagError::Malformed(format!("bad RFC 3339 timestamp: {s:?}"));
-        let s = s.strip_suffix('Z').ok_or_else(bad)?;
-        let (date, time) = s.split_once('T').ok_or_else(bad)?;
-        let mut date_parts = date.split('-');
-        let y: i64 = date_parts
-            .next()
-            .ok_or_else(bad)?
-            .parse()
-            .map_err(|_| bad())?;
-        let m: u32 = date_parts
-            .next()
-            .ok_or_else(bad)?
-            .parse()
-            .map_err(|_| bad())?;
-        let d: u32 = date_parts
-            .next()
-            .ok_or_else(bad)?
-            .parse()
-            .map_err(|_| bad())?;
-        if date_parts.next().is_some() {
-            return Err(bad());
+        let dt = OffsetDateTime::parse(s, &Rfc3339)
+            .map_err(|e| DiagError::Malformed(format!("bad RFC 3339 timestamp {s:?}: {e}")))?;
+        let nanos = dt.unix_timestamp_nanos();
+        if nanos < 0 {
+            return Err(DiagError::Malformed(format!(
+                "timestamp before the Unix epoch: {s:?}"
+            )));
         }
-        let (hms, ms) = time.split_once('.').ok_or_else(bad)?;
-        let ms: u64 = ms.parse().map_err(|_| bad())?;
-        let mut hms_parts = hms.split(':');
-        let h: i64 = hms_parts
-            .next()
-            .ok_or_else(bad)?
-            .parse()
-            .map_err(|_| bad())?;
-        let min: i64 = hms_parts
-            .next()
-            .ok_or_else(bad)?
-            .parse()
-            .map_err(|_| bad())?;
-        let sec: i64 = hms_parts
-            .next()
-            .ok_or_else(bad)?
-            .parse()
-            .map_err(|_| bad())?;
-        if hms_parts.next().is_some() {
-            return Err(bad());
-        }
-        let days = days_from_civil(y, m, d);
-        let secs_of_day = h * 3600 + min * 60 + sec;
-        let epoch_s = days * 86_400 + secs_of_day;
-        if epoch_s < 0 {
-            return Err(bad());
-        }
-        #[allow(clippy::cast_sign_loss)]
-        let epoch_s = epoch_s as u64;
-        Ok(epoch_s * 1000 + ms)
+        u64::try_from(nanos / 1_000_000)
+            .map_err(|_| DiagError::Malformed(format!("timestamp out of range: {s:?}")))
     }
 
     /// The `YYYY-MM-DD` UTC date `epoch_ms` falls on, used to name a day's
     /// diagnostics file.
     #[must_use]
     pub fn date_only(epoch_ms: u64) -> String {
-        #[allow(clippy::cast_possible_wrap)]
-        let epoch_s = (epoch_ms / 1000) as i64;
-        let days = epoch_s.div_euclid(86_400);
-        let (y, m, d) = civil_from_days(days);
-        format!("{y:04}-{m:02}-{d:02}")
+        let nanos = i128::from(epoch_ms) * 1_000_000;
+        match OffsetDateTime::from_unix_timestamp_nanos(nanos) {
+            Ok(dt) => format!(
+                "{:04}-{:02}-{:02}",
+                dt.year(),
+                u8::from(dt.month()),
+                dt.day()
+            ),
+            Err(_) => "1970-01-01".to_string(),
+        }
     }
 }
 
 // ---------------------------------------------------------------------
-// A minimal JSON encoder/decoder scoped to DiagRecord's own shape
+// JSON via serde_json
 // ---------------------------------------------------------------------
 
-/// A tiny JSON value tree, just enough to decode one line back into a
-/// [`DiagRecord`] and reject a malformed one. No dependency in this
-/// workspace parses JSON (see `rfc3339`'s comment on dates for the same
-/// reasoning), and this module is not a general purpose parser: it exists
-/// to invert exactly what [`DiagRecord::to_json_line`] emits.
-mod json {
-    use super::DiagError;
+/// The length free-text fields (`detail`, `version`, `platform`) are capped
+/// at before being written, so a caller that accidentally formats secret
+/// bytes into one of them (Konrad's review of PR #28, should 5: "a 1.4b
+/// caller formatting an error over sealed bytes writes them") produces a
+/// visibly truncated record rather than a complete leak. Generous against
+/// section 7's own wire caps (`Error.detail` 64 bytes, `Introduce.sealed`
+/// 512 bytes): an ordinary error message or version string is never cut.
+const MAX_FREE_TEXT_LEN: usize = 256;
 
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum Value {
-        Null,
-        Bool(bool),
-        /// The raw digit sequence, kept as text so integers up to `u64`
-        /// round-trip exactly (an `f64` cannot represent every `u64`).
-        Number(String),
-        String(String),
-        Array(Vec<Value>),
-        Object(Vec<(String, Value)>),
+/// Truncates `s` to at most [`MAX_FREE_TEXT_LEN`] bytes on a `char`
+/// boundary, appending a marker so truncation is visible in the record
+/// rather than silently changing what it says.
+fn cap_text(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.len() <= MAX_FREE_TEXT_LEN {
+        return std::borrow::Cow::Borrowed(s);
     }
-
-    impl Value {
-        pub fn as_str(&self) -> Result<&str, DiagError> {
-            match self {
-                Value::String(s) => Ok(s),
-                other => Err(DiagError::Malformed(format!(
-                    "expected a string, found {other:?}"
-                ))),
-            }
-        }
-
-        pub fn as_bool(&self) -> Result<bool, DiagError> {
-            match self {
-                Value::Bool(b) => Ok(*b),
-                other => Err(DiagError::Malformed(format!(
-                    "expected a bool, found {other:?}"
-                ))),
-            }
-        }
-
-        pub fn as_u64(&self) -> Result<u64, DiagError> {
-            match self {
-                Value::Number(n) => n.parse().map_err(|_| {
-                    DiagError::Malformed(format!("expected an unsigned integer: {n:?}"))
-                }),
-                other => Err(DiagError::Malformed(format!(
-                    "expected a number, found {other:?}"
-                ))),
-            }
-        }
-
-        pub fn as_array(&self) -> Result<&[Value], DiagError> {
-            match self {
-                Value::Array(items) => Ok(items),
-                other => Err(DiagError::Malformed(format!(
-                    "expected an array, found {other:?}"
-                ))),
-            }
-        }
-
-        pub fn as_object(&self) -> Result<&[(String, Value)], DiagError> {
-            match self {
-                Value::Object(fields) => Ok(fields),
-                other => Err(DiagError::Malformed(format!(
-                    "expected an object, found {other:?}"
-                ))),
-            }
-        }
-
-        pub fn get<'a>(&'a self, key: &str) -> Result<&'a Value, DiagError> {
-            self.as_object()?
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v)
-                .ok_or_else(|| DiagError::Malformed(format!("missing field {key:?}")))
-        }
+    let mut end = MAX_FREE_TEXT_LEN;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
     }
-
-    /// Escapes `s` for placement inside a JSON string literal.
-    pub fn escape(s: &str) -> String {
-        let mut out = String::with_capacity(s.len() + 2);
-        for c in s.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-                c => out.push(c),
-            }
-        }
-        out
-    }
-
-    /// Parses one JSON value from `input`, erroring on anything left over
-    /// but leading or trailing whitespace.
-    pub fn parse(input: &str) -> Result<Value, DiagError> {
-        let mut parser = Parser {
-            chars: input.chars().peekable(),
-        };
-        let value = parser.parse_value()?;
-        parser.skip_ws();
-        if parser.chars.peek().is_some() {
-            return Err(DiagError::Malformed(
-                "trailing data after JSON value".to_string(),
-            ));
-        }
-        Ok(value)
-    }
-
-    struct Parser<'a> {
-        chars: std::iter::Peekable<std::str::Chars<'a>>,
-    }
-
-    impl Parser<'_> {
-        fn skip_ws(&mut self) {
-            while matches!(self.chars.peek(), Some(c) if c.is_whitespace()) {
-                self.chars.next();
-            }
-        }
-
-        fn expect(&mut self, expected: char) -> Result<(), DiagError> {
-            match self.chars.next() {
-                Some(c) if c == expected => Ok(()),
-                other => Err(DiagError::Malformed(format!(
-                    "expected {expected:?}, found {other:?}"
-                ))),
-            }
-        }
-
-        fn parse_value(&mut self) -> Result<Value, DiagError> {
-            self.skip_ws();
-            match self.chars.peek() {
-                Some('{') => self.parse_object(),
-                Some('[') => self.parse_array(),
-                Some('"') => self.parse_string().map(Value::String),
-                Some('t') | Some('f') => self.parse_bool(),
-                Some('n') => self.parse_null(),
-                Some(c) if c.is_ascii_digit() || *c == '-' => self.parse_number(),
-                other => Err(DiagError::Malformed(format!(
-                    "unexpected character starting a value: {other:?}"
-                ))),
-            }
-        }
-
-        fn parse_object(&mut self) -> Result<Value, DiagError> {
-            self.expect('{')?;
-            let mut fields = Vec::new();
-            self.skip_ws();
-            if self.chars.peek() == Some(&'}') {
-                self.chars.next();
-                return Ok(Value::Object(fields));
-            }
-            loop {
-                self.skip_ws();
-                let key = self.parse_string()?;
-                self.skip_ws();
-                self.expect(':')?;
-                let value = self.parse_value()?;
-                fields.push((key, value));
-                self.skip_ws();
-                match self.chars.next() {
-                    Some(',') => continue,
-                    Some('}') => break,
-                    other => {
-                        return Err(DiagError::Malformed(format!(
-                            "expected ',' or '}}' in object, found {other:?}"
-                        )));
-                    }
-                }
-            }
-            Ok(Value::Object(fields))
-        }
-
-        fn parse_array(&mut self) -> Result<Value, DiagError> {
-            self.expect('[')?;
-            let mut items = Vec::new();
-            self.skip_ws();
-            if self.chars.peek() == Some(&']') {
-                self.chars.next();
-                return Ok(Value::Array(items));
-            }
-            loop {
-                let value = self.parse_value()?;
-                items.push(value);
-                self.skip_ws();
-                match self.chars.next() {
-                    Some(',') => continue,
-                    Some(']') => break,
-                    other => {
-                        return Err(DiagError::Malformed(format!(
-                            "expected ',' or ']' in array, found {other:?}"
-                        )));
-                    }
-                }
-            }
-            Ok(Value::Array(items))
-        }
-
-        fn parse_string(&mut self) -> Result<String, DiagError> {
-            self.expect('"')?;
-            let mut out = String::new();
-            loop {
-                match self.chars.next() {
-                    Some('"') => return Ok(out),
-                    Some('\\') => match self.chars.next() {
-                        Some('"') => out.push('"'),
-                        Some('\\') => out.push('\\'),
-                        Some('/') => out.push('/'),
-                        Some('n') => out.push('\n'),
-                        Some('r') => out.push('\r'),
-                        Some('t') => out.push('\t'),
-                        Some('b') => out.push('\u{8}'),
-                        Some('f') => out.push('\u{c}'),
-                        Some('u') => {
-                            let mut code = 0u32;
-                            for _ in 0..4 {
-                                let digit =
-                                    self.chars.next().and_then(|c| c.to_digit(16)).ok_or_else(
-                                        || DiagError::Malformed("bad \\u escape".to_string()),
-                                    )?;
-                                code = code * 16 + digit;
-                            }
-                            let c = char::from_u32(code).ok_or_else(|| {
-                                DiagError::Malformed("bad \\u escape".to_string())
-                            })?;
-                            out.push(c);
-                        }
-                        other => {
-                            return Err(DiagError::Malformed(format!("bad escape: {other:?}")));
-                        }
-                    },
-                    Some(c) => out.push(c),
-                    None => return Err(DiagError::Malformed("unterminated string".to_string())),
-                }
-            }
-        }
-
-        fn parse_bool(&mut self) -> Result<Value, DiagError> {
-            for expected in ["true", "false"] {
-                if self.try_consume(expected) {
-                    return Ok(Value::Bool(expected == "true"));
-                }
-            }
-            Err(DiagError::Malformed("expected true or false".to_string()))
-        }
-
-        fn parse_null(&mut self) -> Result<Value, DiagError> {
-            if self.try_consume("null") {
-                Ok(Value::Null)
-            } else {
-                Err(DiagError::Malformed("expected null".to_string()))
-            }
-        }
-
-        fn try_consume(&mut self, literal: &str) -> bool {
-            let mut clone = self.chars.clone();
-            for expected in literal.chars() {
-                if clone.next() != Some(expected) {
-                    return false;
-                }
-            }
-            self.chars = clone;
-            true
-        }
-
-        fn parse_number(&mut self) -> Result<Value, DiagError> {
-            let mut digits = String::new();
-            if self.chars.peek() == Some(&'-') {
-                digits.push('-');
-                self.chars.next();
-            }
-            let mut saw_digit = false;
-            while matches!(self.chars.peek(), Some(c) if c.is_ascii_digit()) {
-                if let Some(c) = self.chars.next() {
-                    digits.push(c);
-                    saw_digit = true;
-                }
-            }
-            if !saw_digit {
-                return Err(DiagError::Malformed("expected a digit".to_string()));
-            }
-            Ok(Value::Number(digits))
-        }
-    }
+    std::borrow::Cow::Owned(format!("{}...[truncated]", s.get(..end).unwrap_or("")))
 }
 
 /// Renders an [`Addr`] as `"host:port"`, the human-readable form section 7
@@ -942,87 +737,137 @@ fn addr_from_json_string(s: &str) -> Result<Addr, DiagError> {
     Ok(Addr::from_socket_addr(socket_addr))
 }
 
+/// Looks up `key` in a `serde_json::Value` expected to be an object.
+///
+/// # Errors
+/// Returns [`DiagError::Malformed`] if `key` is absent.
+fn field<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a serde_json::Value, DiagError> {
+    value
+        .get(key)
+        .ok_or_else(|| DiagError::Malformed(format!("missing field {key:?}")))
+}
+
+/// [`field`] plus a string type check.
+fn field_str<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str, DiagError> {
+    field(value, key)?
+        .as_str()
+        .ok_or_else(|| DiagError::Malformed(format!("field {key:?} is not a string")))
+}
+
+/// [`field`] plus an unsigned integer type check.
+fn field_u64(value: &serde_json::Value, key: &str) -> Result<u64, DiagError> {
+    field(value, key)?
+        .as_u64()
+        .ok_or_else(|| DiagError::Malformed(format!("field {key:?} is not an unsigned integer")))
+}
+
+/// [`field`] plus a bool type check.
+fn field_bool(value: &serde_json::Value, key: &str) -> Result<bool, DiagError> {
+    field(value, key)?
+        .as_bool()
+        .ok_or_else(|| DiagError::Malformed(format!("field {key:?} is not a bool")))
+}
+
+/// [`field`] plus an array type check.
+fn field_array<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a Vec<serde_json::Value>, DiagError> {
+    field(value, key)?
+        .as_array()
+        .ok_or_else(|| DiagError::Malformed(format!("field {key:?} is not an array")))
+}
+
+/// A `serde_json::Value`'s own string type check, for an element that is
+/// not itself a named object field (an array entry).
+fn as_str(value: &serde_json::Value) -> Result<&str, DiagError> {
+    value
+        .as_str()
+        .ok_or_else(|| DiagError::Malformed(format!("expected a string, found {value:?}")))
+}
+
 impl DiagRecord {
     /// Encodes this record as one line of JSON, no trailing newline.
     #[must_use]
     pub fn to_json_line(&self) -> String {
-        let mut steps = String::from("[");
-        for (i, step) in self.steps.iter().enumerate() {
-            if i > 0 {
-                steps.push(',');
-            }
-            steps.push_str(&format!(
-                "{{\"step\":\"{}\",\"at_ms\":{},\"outcome\":\"{}\",\"detail\":\"{}\"}}",
-                step.step.as_str(),
-                step.at_ms,
-                step.outcome.as_str(),
-                json::escape(&step.detail)
-            ));
-        }
-        steps.push(']');
+        let steps: Vec<serde_json::Value> = self
+            .steps
+            .iter()
+            .map(|step| {
+                serde_json::json!({
+                    "step": step.step.as_str(),
+                    "at_ms": step.at_ms,
+                    "outcome": step.outcome.as_str(),
+                    "detail": cap_text(&step.detail),
+                })
+            })
+            .collect();
 
-        let failed_step = match self.failed_step {
-            Some(step) => format!("\"{}\"", step.as_str()),
-            None => "null".to_string(),
-        };
+        let [local_first, local_second] = self.local_observed;
 
-        format!(
-            "{{\"attempt\":\"{}\",\"session\":{},\"gate_ms\":{},\"peer\":\"{}\",\
-             \"started_at\":\"{}\",\"ended_at\":\"{}\",\"steps\":{},\"failed_step\":{},\
-             \"local_observed\":[\"{}\",\"{}\"],\"peer_observed\":\"{}\",\"mapping\":\"{}\",\
-             \"gate_carried_traffic\":{},\"gate_bytes\":{},\"path\":\"{}\",\"path_addr\":\"{}\",\
-             \"path_rtt_us\":{},\"reason\":\"{}\",\"version\":\"{}\",\"platform\":\"{}\"}}",
-            hex_encode(&self.attempt),
-            self.session,
-            self.gate_ms,
-            self.peer.as_hex(),
-            rfc3339::format(self.started_at_ms),
-            rfc3339::format(self.ended_at_ms),
-            steps,
-            failed_step,
-            addr_to_json_string(self.local_observed[0]),
-            addr_to_json_string(self.local_observed[1]),
-            addr_to_json_string(self.peer_observed),
-            self.mapping.as_str(),
-            self.gate_carried_traffic,
-            self.gate_bytes,
-            self.path.kind_str(),
-            addr_to_json_string(self.path.addr()),
-            self.path_rtt_us,
-            self.reason.as_str(),
-            json::escape(&self.version),
-            json::escape(&self.platform),
-        )
+        let value = serde_json::json!({
+            "attempt": hex_encode(&self.attempt),
+            "session": self.session,
+            "gate_ms": self.gate_ms,
+            "peer": self.peer.as_hex(),
+            "started_at": rfc3339::format(self.started_at_ms),
+            "ended_at": rfc3339::format(self.ended_at_ms),
+            "steps": steps,
+            "failed_step": self.failed_step.map(Step::as_str),
+            "local_observed": [
+                addr_to_json_string(local_first),
+                addr_to_json_string(local_second),
+            ],
+            "peer_observed": addr_to_json_string(self.peer_observed),
+            "mapping": self.mapping.as_str(),
+            "gate_carried_traffic": self.gate_carried_traffic,
+            "gate_bytes": self.gate_bytes,
+            "path": self.path.kind_str(),
+            "path_addr": addr_to_json_string(self.path.addr()),
+            "path_rtt_us": self.path_rtt_us,
+            "reason": self.reason.as_str(),
+            "version": cap_text(&self.version),
+            "platform": cap_text(&self.platform),
+        });
+
+        // `to_string` fails only on a non-finite float or a non-string map
+        // key, neither of which this value contains; the fallback is
+        // unreachable in practice but keeps this function panic-free
+        // (invariant 1) rather than relying on that being true forever.
+        serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
     }
 
     /// Parses one line of JSON, as produced by [`DiagRecord::to_json_line`],
-    /// back into a record.
+    /// back into a record. Recursion depth is bounded by `serde_json`
+    /// itself (its `Value` deserializer errors past 128 levels rather than
+    /// overflowing the stack; Konrad's review of PR #28, must 2).
     ///
     /// # Errors
     /// Returns [`DiagError::Malformed`] if `line` is not valid JSON or does
     /// not match a [`DiagRecord`]'s shape.
     pub fn from_json_line(line: &str) -> Result<Self, DiagError> {
-        let value = json::parse(line)?;
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| DiagError::Malformed(format!("invalid JSON: {e}")))?;
 
-        let attempt_hex = value.get("attempt")?.as_str()?;
+        let attempt_hex = field_str(&value, "attempt")?;
         let attempt_bytes = hex_decode(attempt_hex)?;
         let attempt: [u8; 16] = attempt_bytes
             .try_into()
             .map_err(|_| DiagError::Malformed("attempt must be 16 bytes".to_string()))?;
 
-        let session = u32::try_from(value.get("session")?.as_u64()?)
+        let session = u32::try_from(field_u64(&value, "session")?)
             .map_err(|_| DiagError::Malformed("session out of range".to_string()))?;
-        let gate_ms = value.get("gate_ms")?.as_u64()?;
-        let peer = PeerFingerprint::from_hex(value.get("peer")?.as_str()?)?;
-        let started_at_ms = rfc3339::parse(value.get("started_at")?.as_str()?)?;
-        let ended_at_ms = rfc3339::parse(value.get("ended_at")?.as_str()?)?;
+        let gate_ms = field_u64(&value, "gate_ms")?;
+        let peer = PeerFingerprint::from_hex(field_str(&value, "peer")?)?;
+        let started_at_ms = rfc3339::parse(field_str(&value, "started_at")?)?;
+        let ended_at_ms = rfc3339::parse(field_str(&value, "ended_at")?)?;
 
         let mut steps = Vec::new();
-        for item in value.get("steps")?.as_array()? {
-            let step = Step::parse_str(item.get("step")?.as_str()?)?;
-            let at_ms = item.get("at_ms")?.as_u64()?;
-            let outcome = StepOutcome::parse_str(item.get("outcome")?.as_str()?)?;
-            let detail = item.get("detail")?.as_str()?.to_string();
+        for item in field_array(&value, "steps")? {
+            let step = Step::parse_str(field_str(item, "step")?)?;
+            let at_ms = field_u64(item, "at_ms")?;
+            let outcome = StepOutcome::parse_str(field_str(item, "outcome")?)?;
+            let detail = field_str(item, "detail")?.to_string();
             steps.push(StepRecord {
                 step,
                 at_ms,
@@ -1031,29 +876,32 @@ impl DiagRecord {
             });
         }
 
-        let failed_step = match value.get("failed_step")? {
-            json::Value::Null => None,
-            other => Some(Step::parse_str(other.as_str()?)?),
+        let failed_step = match field(&value, "failed_step")? {
+            serde_json::Value::Null => None,
+            other => Some(Step::parse_str(as_str(other)?)?),
         };
 
-        let local_observed_raw = value.get("local_observed")?.as_array()?;
-        let [first, second] = local_observed_raw else {
-            return Err(DiagError::Malformed(
-                "local_observed must have exactly two entries".to_string(),
-            ));
+        let local_observed_raw = field_array(&value, "local_observed")?;
+        let (first, second) = match local_observed_raw.as_slice() {
+            [first, second] => (first, second),
+            _ => {
+                return Err(DiagError::Malformed(
+                    "local_observed must have exactly two entries".to_string(),
+                ));
+            }
         };
         let local_observed = [
-            addr_from_json_string(first.as_str()?)?,
-            addr_from_json_string(second.as_str()?)?,
+            addr_from_json_string(as_str(first)?)?,
+            addr_from_json_string(as_str(second)?)?,
         ];
 
-        let peer_observed = addr_from_json_string(value.get("peer_observed")?.as_str()?)?;
-        let mapping = Mapping::parse_str(value.get("mapping")?.as_str()?)?;
-        let gate_carried_traffic = value.get("gate_carried_traffic")?.as_bool()?;
-        let gate_bytes = value.get("gate_bytes")?.as_u64()?;
+        let peer_observed = addr_from_json_string(field_str(&value, "peer_observed")?)?;
+        let mapping = Mapping::parse_str(field_str(&value, "mapping")?)?;
+        let gate_carried_traffic = field_bool(&value, "gate_carried_traffic")?;
+        let gate_bytes = field_u64(&value, "gate_bytes")?;
 
-        let path_kind = value.get("path")?.as_str()?;
-        let path_addr = addr_from_json_string(value.get("path_addr")?.as_str()?)?;
+        let path_kind = field_str(&value, "path")?;
+        let path_addr = addr_from_json_string(field_str(&value, "path_addr")?)?;
         let path = match path_kind {
             "relay" => PathChoice::Relay(path_addr),
             "direct" => PathChoice::Direct(path_addr),
@@ -1064,11 +912,11 @@ impl DiagRecord {
             }
         };
 
-        let path_rtt_us = u32::try_from(value.get("path_rtt_us")?.as_u64()?)
+        let path_rtt_us = u32::try_from(field_u64(&value, "path_rtt_us")?)
             .map_err(|_| DiagError::Malformed("path_rtt_us out of range".to_string()))?;
-        let reason = Reason::parse_str(value.get("reason")?.as_str()?)?;
-        let version = value.get("version")?.as_str()?.to_string();
-        let platform = value.get("platform")?.as_str()?.to_string();
+        let reason = Reason::parse_str(field_str(&value, "reason")?)?;
+        let version = field_str(&value, "version")?.to_string();
+        let platform = field_str(&value, "platform")?.to_string();
 
         Ok(DiagRecord {
             attempt,
@@ -1097,27 +945,61 @@ impl DiagRecord {
 // The writer
 // ---------------------------------------------------------------------
 
-/// The cap on one day's diagnostics file, section 7: "5 MiB per file".
+/// The cap on one diagnostics file, section 7: "5 MiB per file".
 ///
-/// Section 7 gives no rule for a day whose records exceed this before the
-/// day ends, and the file naming scheme (`YYYY-MM-DD.jsonl`, one per day)
-/// leaves no room for a second file the same day. This writer's documented
-/// choice: once a day's file has reached the cap, further records for that
-/// day are dropped (silently, from the writer's point of view; a caller may
-/// count drops if it wants to) rather than started in a new file, so a
-/// day's diagnostics never exceed the cap that makes the file cheap to
-/// attach to an issue.
+/// Section 7 states no rule for a day whose records exceed this before the
+/// day ends (a gap Konrad's review of PR #28, must 3, flagged and asked to
+/// be raised with Xavier as a section 7 amendment, tracked separately from
+/// this fix). Between this writer's two implementable choices — start a
+/// numbered overflow file for the rest of the day, or rewrite the current
+/// file dropping its oldest lines — [`DiagWriter`] rotates to an overflow
+/// file (`YYYY-MM-DD.1.jsonl`, `.2.jsonl`, ...): the newest records, which
+/// describe whatever is currently going wrong, are the ones a person reads
+/// this file to see, so they are never the ones dropped. Rewriting the
+/// current file in place was rejected: it means reading and rewriting up to
+/// 5 MiB on every over-cap append, and a writer killed mid-rewrite leaves a
+/// truncated or corrupt file, where every other write in this module is a
+/// single `write_all` to the end of a file, safe to interrupt at any point.
 pub const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
-/// The number of day files kept, section 7: "7 files kept". Enforced by
-/// [`DiagWriter`] deleting the oldest file by name (the `YYYY-MM-DD.jsonl`
-/// naming sorts chronologically) whenever a new day's file is opened and
-/// more than this many already exist.
+/// The number of UTC days of diagnostics files kept, section 7: "7 files
+/// kept". Enforced by [`DiagWriter`] deleting every file (the day's primary
+/// file and any overflow parts) belonging to the oldest days once more than
+/// this many distinct days exist, whenever a new day's file is opened.
 pub const MAX_FILES_KEPT: usize = 7;
 
-/// Appends [`DiagRecord`]s to `<dir>/<YYYY-MM-DD>.jsonl`, rotating to a new
-/// file when the UTC day changes and pruning to [`MAX_FILES_KEPT`] files,
-/// per section 7's "Location" paragraph.
+/// The file name for `date`'s diagnostics file: `part` `0` is the primary
+/// file section 7 names (`YYYY-MM-DD.jsonl`); `part` `1` and above are
+/// overflow files opened once the previous part reaches [`MAX_FILE_BYTES`]
+/// (`YYYY-MM-DD.N.jsonl`, [`MAX_FILE_BYTES`]'s doc comment).
+fn file_name_for(date: &str, part: u32) -> String {
+    if part == 0 {
+        format!("{date}.jsonl")
+    } else {
+        format!("{date}.{part}.jsonl")
+    }
+}
+
+/// The `YYYY-MM-DD` day prefix of a diagnostics file name, own or overflow
+/// part alike, or `None` if `name` does not start with one (so an unrelated
+/// file in the same directory is never touched by pruning).
+fn day_prefix(name: &str) -> Option<&str> {
+    let candidate = name.get(..10)?;
+    let bytes = candidate.as_bytes();
+    let is_date_shaped = bytes.len() == 10
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+    is_date_shaped.then_some(candidate)
+}
+
+/// Appends [`DiagRecord`]s to `<dir>/<YYYY-MM-DD>[.N].jsonl`, rotating to a
+/// new file when the UTC day changes or the current file reaches
+/// [`MAX_FILE_BYTES`], and pruning to [`MAX_FILES_KEPT`] days, per section
+/// 7's "Location" paragraph and [`MAX_FILE_BYTES`]'s doc comment.
 ///
 /// Buffering is bounded and simple: each record is written and flushed
 /// before [`DiagWriter::append`] returns, so a crash loses at most the
@@ -1130,22 +1012,26 @@ pub const MAX_FILES_KEPT: usize = 7;
 pub struct DiagWriter {
     dir: PathBuf,
     open_date: Option<String>,
+    open_part: u32,
     file: Option<std::io::BufWriter<std::fs::File>>,
     bytes_written: u64,
 }
 
 impl DiagWriter {
-    /// Opens a writer rooted at `dir`, creating it if it does not exist.
-    /// No file is opened until the first [`DiagWriter::append`] call, so
-    /// constructing a writer that is never used creates nothing.
+    /// Opens a writer rooted at `dir`, creating it (mode `0700` on Unix; it
+    /// holds [`InstallSalt`] beside these logs) if it does not exist. No
+    /// file is opened until the first [`DiagWriter::append`] call, so
+    /// constructing a writer that is never used creates nothing beyond the
+    /// directory itself.
     ///
     /// # Errors
     /// Returns [`DiagError::Io`] if `dir` cannot be created.
     pub fn new(dir: PathBuf) -> Result<Self, DiagError> {
-        std::fs::create_dir_all(&dir)?;
+        ensure_private_dir(&dir)?;
         Ok(Self {
             dir,
             open_date: None,
+            open_part: 0,
             file: None,
             bytes_written: 0,
         })
@@ -1154,19 +1040,23 @@ impl DiagWriter {
     /// Appends `record`, rotating to a new day's file if `now_ms` (the
     /// caller's clock, injected rather than read from `SystemTime` here so
     /// rotation is testable without waiting for a real day to change) falls
-    /// on a different UTC day than the currently open file.
+    /// on a different UTC day than the currently open file, or to the next
+    /// overflow part if the current file has reached [`MAX_FILE_BYTES`].
     ///
-    /// Returns `Ok(true)` if the record was written, `Ok(false)` if it was
-    /// dropped because the day's file has reached [`MAX_FILE_BYTES`] (see
-    /// that constant's doc comment for why dropping, not a second file, is
-    /// this writer's choice).
+    /// Always returns `Ok(true)` once the record is written; the return
+    /// type stays `Result<bool, DiagError>` rather than `Result<(),
+    /// DiagError>` because a record is never silently dropped now
+    /// (`MAX_FILE_BYTES`'s doc comment), so `false` would never occur, and
+    /// a future caller comparing against it would be dead code — kept as
+    /// `bool` anyway so a change back to a dropping policy would not be a
+    /// signature change.
     ///
     /// # Errors
-    /// Returns [`DiagError::Io`] if opening or writing the file fails.
+    /// Returns [`DiagError::Io`] if opening or writing a file fails.
     pub fn append(&mut self, record: &DiagRecord, now_ms: u64) -> Result<bool, DiagError> {
         let today = rfc3339::date_only(now_ms);
         if self.open_date.as_deref() != Some(today.as_str()) {
-            self.rotate(&today)?;
+            self.rotate_to_day(&today)?;
         }
 
         let mut line = record.to_json_line();
@@ -1174,13 +1064,13 @@ impl DiagWriter {
         let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
 
         if self.bytes_written.saturating_add(line_len) > MAX_FILE_BYTES {
-            return Ok(false);
+            self.open_next_part()?;
         }
 
         let Some(file) = self.file.as_mut() else {
-            return Err(DiagError::Malformed(
-                "diagnostics file not open after rotation".to_string(),
-            ));
+            return Err(DiagError::Io(std::io::Error::other(
+                "diagnostics file not open after rotation",
+            )));
         };
         use std::io::Write;
         file.write_all(line.as_bytes())?;
@@ -1189,54 +1079,63 @@ impl DiagWriter {
         Ok(true)
     }
 
-    /// Closes the currently open file (if any), prunes old day files beyond
-    /// [`MAX_FILES_KEPT`], and opens (or reopens, in append mode) `today`'s
-    /// file.
-    fn rotate(&mut self, today: &str) -> Result<(), DiagError> {
-        self.file = None;
-
+    /// Closes the currently open file (if any), prunes days beyond
+    /// [`MAX_FILES_KEPT`], and opens `today`'s primary file (part `0`),
+    /// resuming an existing file's byte count rather than assuming it is
+    /// empty, so a writer restarted mid-day rolls to an overflow part at
+    /// the right point instead of silently growing past the cap.
+    fn rotate_to_day(&mut self, today: &str) -> Result<(), DiagError> {
         self.prune(today)?;
-
-        let path = self.dir.join(format!("{today}.jsonl"));
-        let mut open_options = std::fs::OpenOptions::new();
-        open_options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            open_options.mode(0o600);
-        }
-        let file = open_options.open(&path)?;
-        let existing_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-
-        self.file = Some(std::io::BufWriter::new(file));
         self.open_date = Some(today.to_string());
+        self.open_part = 0;
+        self.open_part_file(today, 0)
+    }
+
+    /// Closes the currently open file and opens the next overflow part for
+    /// the same day.
+    fn open_next_part(&mut self) -> Result<(), DiagError> {
+        let today = self
+            .open_date
+            .clone()
+            .ok_or_else(|| DiagError::Io(std::io::Error::other("no day open to roll over")))?;
+        self.open_part = self.open_part.saturating_add(1);
+        self.open_part_file(&today, self.open_part)
+    }
+
+    /// Opens (creating if absent, appending if present) `date`'s file for
+    /// `part`, resuming `bytes_written` from the file's real size.
+    fn open_part_file(&mut self, date: &str, part: u32) -> Result<(), DiagError> {
+        self.file = None;
+        let path = self.dir.join(file_name_for(date, part));
+        let file = open_private_append(&path)?;
+        let existing_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        self.file = Some(std::io::BufWriter::new(file));
         self.bytes_written = existing_len;
         Ok(())
     }
 
-    /// Deletes the oldest `*.jsonl` day files in `self.dir` so that, once
-    /// `today`'s file is created, at most [`MAX_FILES_KEPT`] remain.
+    /// Deletes every file (primary and overflow parts alike) belonging to
+    /// the oldest UTC days in `self.dir`, so that once `today` is counted
+    /// at most [`MAX_FILES_KEPT`] distinct days remain.
     fn prune(&self, today: &str) -> Result<(), DiagError> {
-        let mut day_files: Vec<String> = std::fs::read_dir(&self.dir)?
+        let mut days: std::collections::BTreeSet<String> = std::fs::read_dir(&self.dir)?
             .filter_map(std::result::Result::ok)
             .filter_map(|entry| entry.file_name().into_string().ok())
             .filter(|name| name.ends_with(".jsonl"))
+            .filter_map(|name| day_prefix(&name).map(str::to_string))
             .collect();
-        day_files.sort();
+        days.insert(today.to_string());
 
-        // `today` counts toward the cap whether or not its file exists yet.
-        let mut names: Vec<String> = day_files
-            .into_iter()
-            .filter(|name| name != &format!("{today}.jsonl"))
-            .collect();
-        names.push(format!("{today}.jsonl"));
-        names.sort();
-
-        let to_remove = names.len().saturating_sub(MAX_FILES_KEPT);
-        for name in names.into_iter().take(to_remove) {
-            let path = self.dir.join(name);
-            if path.exists() {
-                std::fs::remove_file(path)?;
+        let to_remove = days.len().saturating_sub(MAX_FILES_KEPT);
+        for old_day in days.iter().take(to_remove) {
+            for entry in std::fs::read_dir(&self.dir)? {
+                let entry = entry?;
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if day_prefix(&name) == Some(old_day.as_str()) {
+                    std::fs::remove_file(entry.path())?;
+                }
             }
         }
         Ok(())
@@ -1355,12 +1254,23 @@ mod tests {
         ))
     }
 
+    /// A fresh [`InstallSalt`], persisted under a unique temp directory so
+    /// parallel test threads (same process, same `std::process::id()`)
+    /// never race on the same salt file.
+    fn test_salt() -> InstallSalt {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("jerome14-diag-salt-{}-{n}", std::process::id()));
+        InstallSalt::load_or_create(&dir).unwrap()
+    }
+
     fn sample_record(reason: Reason, failed_step: Option<Step>) -> DiagRecord {
         DiagRecord {
             attempt: [7u8; 16],
             session: 42,
             gate_ms: 123_456,
-            peer: PeerFingerprint::from_key(b"install-salt-16b", &[9u8; 32]),
+            peer: PeerFingerprint::from_key(&test_salt(), &[9u8; 32]),
             started_at_ms: 1_700_000_000_000,
             ended_at_ms: 1_700_000_001_500,
             steps: vec![StepRecord {
@@ -1470,7 +1380,7 @@ mod tests {
     #[test]
     fn peer_fingerprint_differs_from_the_key_it_was_built_from() {
         let key = [0xABu8; 32];
-        let fp = PeerFingerprint::from_key(b"salt", &key);
+        let fp = PeerFingerprint::from_key(&test_salt(), &key);
         // The fingerprint's hex is 8 characters; the key's would be 64.
         // They cannot be equal, and the fingerprint never contains a
         // contiguous run of the key's bytes because it is a keyed hash
@@ -1483,9 +1393,78 @@ mod tests {
     fn record_json_never_contains_the_raw_peer_key() {
         let key = [0x42u8; 32];
         let mut record = sample_record(Reason::Ok, None);
-        record.peer = PeerFingerprint::from_key(b"another-salt-val", &key);
+        record.peer = PeerFingerprint::from_key(&test_salt(), &key);
         let line = record.to_json_line();
         assert!(!line.contains(&hex_encode(&key)));
+    }
+
+    // --- install salt (Konrad's review of PR #28, must 1) -------------------
+
+    #[test]
+    fn install_salt_cannot_structurally_be_empty() {
+        // A fixed 16 byte array cannot hold zero bytes; `b""` (the review's
+        // example of the pre-fix bug) is not an `[u8; 16]` and cannot be
+        // passed to any constructor this type has.
+        assert_eq!(std::mem::size_of::<InstallSalt>(), 16);
+    }
+
+    #[test]
+    fn install_salt_persists_and_is_stable_across_loads() {
+        let dir = std::env::temp_dir().join(format!(
+            "jerome14-diag-installsalt-persist-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let first = InstallSalt::load_or_create(&dir).unwrap();
+        let second = InstallSalt::load_or_create(&dir).unwrap();
+        assert_eq!(
+            first, second,
+            "a second load must return the persisted salt, not a fresh one"
+        );
+
+        let salt_path = dir.join("install_salt");
+        assert!(salt_path.exists());
+        assert_eq!(std::fs::read(&salt_path).unwrap().len(), 16);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn install_salt_changes_the_fingerprint() {
+        let key = [0x11u8; 32];
+        let salt_a = test_salt();
+        let salt_b = test_salt();
+        let fp_a = PeerFingerprint::from_key(&salt_a, &key);
+        let fp_b = PeerFingerprint::from_key(&salt_b, &key);
+        assert_ne!(
+            fp_a, fp_b,
+            "the same key salted differently must fingerprint differently, or a peer would be correlatable across installs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_salt_file_and_directory_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "jerome14-diag-installsalt-perms-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        InstallSalt::load_or_create(&dir).unwrap();
+
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let file_mode = std::fs::metadata(dir.join("install_salt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // --- per-platform location -------------------------------------------
@@ -1614,29 +1593,78 @@ mod tests {
     }
 
     #[test]
-    fn writer_drops_records_once_the_days_file_reaches_the_size_cap() {
-        let dir = std::env::temp_dir().join(format!("jerome14-diag-size-{}", std::process::id()));
+    fn writer_rolls_to_an_overflow_file_instead_of_dropping_the_newest_record() {
+        // Konrad's review of PR #28, must 3: the previous version dropped
+        // the newest record once a day's file hit the cap. This asserts
+        // the replacement never drops: every record appended is present
+        // somewhere afterward, split across the primary file and one or
+        // more numbered overflow files.
+        let dir =
+            std::env::temp_dir().join(format!("jerome14-diag-overflow-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut writer = DiagWriter::new(dir.clone()).unwrap();
-
-        let mut record = sample_record(Reason::Ok, None);
-        // A large detail string so a handful of records blow past a tiny
-        // artificial cap without needing to write 5 MiB in a test.
-        record.steps[0].detail = "x".repeat(1024);
         let now_ms = rfc3339::parse("2026-09-07T00:00:00.000Z").unwrap();
 
-        // Force the writer past MAX_FILE_BYTES by writing directly to the
-        // day's file before the writer ever opens it, so the very first
-        // `append` call already sees a file at the cap.
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("2026-09-07.jsonl");
-        std::fs::write(&path, vec![b'a'; MAX_FILE_BYTES as usize]).unwrap();
+        // Force the writer past MAX_FILE_BYTES on its very first append by
+        // writing directly to the day's primary file before the writer
+        // ever opens it.
+        std::fs::write(
+            dir.join("2026-09-07.jsonl"),
+            vec![b'a'; MAX_FILE_BYTES as usize],
+        )
+        .unwrap();
+
+        let mut record = sample_record(Reason::Ok, None);
+        record.steps[0].detail = "distinguishing-marker".to_string();
 
         let wrote = writer.append(&record, now_ms).unwrap();
+        assert!(wrote, "append must never report a dropped record");
+
+        let overflow_path = dir.join("2026-09-07.1.jsonl");
         assert!(
-            !wrote,
-            "a record must be dropped once the day's file is at the cap"
+            overflow_path.exists(),
+            "an overflow part must be created once the primary file is at the cap"
         );
+        let outcomes = read_records(&overflow_path).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let ReadOutcome::Record(recorded) = &outcomes[0] else {
+            panic!("expected the record to parse");
+        };
+        assert_eq!(recorded.steps[0].detail, "distinguishing-marker");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn writer_resumes_the_correct_part_after_reopening_mid_day() {
+        let dir = std::env::temp_dir().join(format!(
+            "jerome14-diag-overflow-resume-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now_ms = rfc3339::parse("2026-09-07T00:00:00.000Z").unwrap();
+        let record = sample_record(Reason::Ok, None);
+
+        // The primary file already at the cap and a part-1 file already
+        // present, simulating a previous process run that had already
+        // rolled over once, before this writer ever opens anything.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("2026-09-07.jsonl"),
+            vec![b'a'; MAX_FILE_BYTES as usize],
+        )
+        .unwrap();
+        std::fs::write(dir.join("2026-09-07.1.jsonl"), b"not full yet\n").unwrap();
+
+        let mut writer = DiagWriter::new(dir.clone()).unwrap();
+        assert!(writer.append(&record, now_ms).unwrap());
+
+        // The new writer must have appended to the existing part-1 file
+        // (which was under the cap), not silently overwritten it and not
+        // skipped straight to part 2.
+        let part_one = std::fs::read_to_string(dir.join("2026-09-07.1.jsonl")).unwrap();
+        assert!(part_one.starts_with("not full yet\n"));
+        assert!(!dir.join("2026-09-07.2.jsonl").exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1675,5 +1703,38 @@ mod tests {
         let formatted = rfc3339::format(ms);
         let parsed = rfc3339::parse(&formatted).unwrap();
         assert_eq!(parsed, ms);
+    }
+
+    // --- JSON parser safety (Konrad's review of PR #28, must 2) -------------
+
+    #[test]
+    fn deeply_nested_json_is_reported_as_malformed_not_a_crash() {
+        // serde_json's `Value` deserializer errors past a fixed recursion
+        // depth rather than overflowing the stack; this is the property
+        // that made replacing the hand-rolled parser a `must`, not just a
+        // style preference. 10,000 nested arrays comfortably exceeds it.
+        let nested = "[".repeat(10_000);
+        let result = DiagRecord::from_json_line(&nested);
+        assert!(matches!(result, Err(DiagError::Malformed(_))));
+    }
+
+    #[test]
+    fn detail_holding_a_quote_and_newline_round_trips() {
+        let mut record = sample_record(Reason::Ok, None);
+        record.steps[0].detail = "line one\nline \"two\"\tend".to_string();
+        let line = record.to_json_line();
+        let parsed = DiagRecord::from_json_line(&line).unwrap();
+        assert_eq!(parsed.steps[0].detail, "line one\nline \"two\"\tend");
+    }
+
+    #[test]
+    fn free_text_over_the_cap_is_truncated_not_dropped_or_left_whole() {
+        let mut record = sample_record(Reason::Ok, None);
+        record.version = "v".repeat(MAX_FREE_TEXT_LEN * 2);
+        let line = record.to_json_line();
+        let parsed = DiagRecord::from_json_line(&line).unwrap();
+        assert!(parsed.version.len() < record.version.len());
+        assert!(parsed.version.starts_with('v'));
+        assert!(parsed.version.ends_with("[truncated]"));
     }
 }
