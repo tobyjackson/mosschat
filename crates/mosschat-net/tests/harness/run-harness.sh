@@ -5,6 +5,14 @@
 #                                    # house-b, doctor smoke, fault matrix.
 #                                    # --relay-only adds --no-punch to both
 #                                    # the house and every doctor row.
+#   sudo bash run-harness.sh capture  # community, gatehouse, house-b, one
+#                                    # doctor row (--hold 20), tcpdump on
+#                                    # both NATs' outward interfaces and both
+#                                    # houses' interfaces, a mid-hold
+#                                    # conntrack/nft/ip snapshot, then its own
+#                                    # teardown. Self-contained: do not run
+#                                    # `down` after it, and do not run it
+#                                    # while `matrix` or `nat` is up (issue 88).
 #   sudo bash run-harness.sh down     # teardown only (namespaces, veths, nft)
 # Wraps netns-nat.sh, fault-matrix.sh and teardown.sh in this directory;
 # adds nothing to them. Output goes under <repo root>/docs/measurements/.
@@ -79,6 +87,34 @@ stop_house(){
   rm -f "$RUN/house-b.pid"
 }
 
+# capture()'s four tcpdumps. Same pidfile rule as the gatehouse and
+# house-b above, and the same reason (issue #50): the pid is written from
+# inside the process that becomes tcpdump, by its own `$$`, right before
+# `exec`, so it is never a wrapper's.
+start_tcpdump(){
+  local ns="$1" iface="$2" out="$3" tag="$4"
+  say "tcpdump on $iface in $ns -> $out"
+  sh -c "echo \$\$ > $RUN/tcpdump-$tag.pid; exec ip netns exec $ns tcpdump -n -i $iface -w $out udp" \
+    >"$RUN/tcpdump-$tag.log" 2>&1 &
+}
+
+stop_tcpdump(){
+  local tag="$1" pid
+  pid="$(cat "$RUN/tcpdump-$tag.pid" 2>/dev/null)" || return 0
+  if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -q tcpdump; then
+    echo "stopping tcpdump $tag pid $pid"; kill -TERM "$pid" 2>/dev/null; sleep 1
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+  fi
+  rm -f "$RUN/tcpdump-$tag.pid"
+}
+
+stop_tcpdumps(){
+  local tag
+  for tag in nat-a nat-b house-a house-b; do
+    stop_tcpdump "$tag"
+  done
+}
+
 # Copies house-b's own event log out of .run before `down` calls
 # teardown.sh, which deletes .run, so the callee's account of the matrix
 # survives (README, "The long-lived row command").
@@ -135,10 +171,14 @@ pub_of(){
 # SEEDS seeds are minted up front, every public key goes in the members
 # file before the gatehouse starts, and `row` takes the next unused one.
 #
-# Identity SEEDS (14) is not a doctor identity: it is house-b's own, the
+# Identity SEEDS is not a doctor identity: it is house-b's own, the
 # long-lived callee every row's doctor visits. Seeds 01 to DOCTOR_SEEDS
-# (13) are the doctor's, one per doctor run -- the smoke run plus the
-# fault matrix's 12 rows.
+# are the doctor's, one per doctor run. matrix() and capture() each
+# export both of these (to 14/13 and 3/2 respectively) right before
+# calling setup_eim(), so the fresh `bash run-harness.sh row` process
+# each row's DOCTOR command starts sees the same bound, not the defaults
+# below (which are only what a bare `row` outside either of them would
+# see).
 SEEDS=14
 DOCTOR_SEEDS=$((SEEDS - 1))
 next_seed(){
@@ -149,30 +189,36 @@ next_seed(){
   printf '%02d' "$n"
 }
 
-matrix(){
-  local relay_only=0
-  [ "${1:-}" = "--relay-only" ] && relay_only=1
-  local f="$OUT/${DATE_TAG}-matrix-setup.txt"
-  trap 'stop_house; stop_gatehouse' EXIT INT TERM
-  say "netns-nat.sh --mode eim (left up for the matrix)"
+# Shared by matrix() and capture(): brings up the eim topology, mints
+# $1 identities (the last one is house-b's own; the rest are doctor
+# seeds, taken in order by next_seed()), builds members.txt and
+# friends.txt, starts the gatehouse and starts house-b headless.
+# Transcript goes to $2. $3 is relay_only (0 or 1), same meaning as
+# matrix's own flag. Callers set SEEDS and DOCTOR_SEEDS (next_seed()'s
+# existing contract) before calling this. Exports MOSS_COMMUNITY,
+# MOSS_RUN, MOSS_RELAY_ONLY and MOSS_HOUSE_B for row(), same as matrix()
+# always has.
+setup_eim(){
+  local total="$1" f="$2" relay_only="${3:-0}"
+  say "netns-nat.sh --mode eim (left up for this run)"
   bash "$H/netns-nat.sh" --mode eim || { echo "netns-nat.sh failed"; return 1; }
 
-  say "community, $SEEDS identities ($DOCTOR_SEEDS doctor, 1 house-b), members, friends"
+  say "community, $total identities ($((total - 1)) doctor, 1 house-b), members, friends"
   local COMMUNITY seed pub tag
   COMMUNITY="$(openssl rand -hex 32)"
   mkdir -p "$RUN/seeds"; : > "$RUN/members.txt"; echo 1 > "$RUN/seed-next"
-  for tag in $(seq -f '%02g' 1 "$SEEDS"); do
+  for tag in $(seq -f '%02g' 1 "$total"); do
     seed="$(openssl rand -hex 32)"
     ( umask 077; echo "$seed" > "$RUN/seeds/$tag.seed" )
     pub="$(pub_of house-a "$seed" 10.1.0.2:7777 "$tag")"
     [ ${#pub} -eq 64 ] || { echo "could not read public key $tag off spike; see $RUN/spike-id-$tag.log"; return 1; }
     echo "$pub" >> "$RUN/members.txt"
   done
-  # house-b's own key (tag $SEEDS, the last line of members.txt) does not
+  # house-b's own key (tag $total, the last line of members.txt) does not
   # go in its own friends file; friends.txt is who house-b answers a
-  # knock from, seeds 01 to $DOCTOR_SEEDS, in the same order they were
+  # knock from, seeds 01 to $((total - 1)), in the same order they were
   # just written.
-  head -n "$DOCTOR_SEEDS" "$RUN/members.txt" > "$RUN/friends.txt"
+  head -n "$((total - 1))" "$RUN/members.txt" > "$RUN/friends.txt"
   {
     echo "# hewn-mini $(uname -r) $(date -u +%FT%TZ)"
     echo "community: $COMMUNITY"
@@ -181,9 +227,8 @@ matrix(){
     else
       echo "mode: normal (punching allowed)"
     fi
-    echo "identities: $SEEDS total; $DOCTOR_SEEDS for doctor runs (smoke run plus the 12" \
-      "matrix rows, one identity each, in $RUN/seeds), identity $SEEDS is house-b's own;" \
-      "public keys:"
+    echo "identities: $total total; $((total - 1)) for doctor runs, one identity each, in" \
+      "$RUN/seeds; identity $total is house-b's own; public keys:"
     cat "$RUN/members.txt"
   } | tee "$f"
   export MOSS_COMMUNITY="$COMMUNITY" MOSS_RUN="$RUN" MOSS_RELAY_ONLY="$relay_only"
@@ -206,7 +251,7 @@ matrix(){
   [ "$relay_only" -eq 1 ] && house_no_punch=" --no-punch"
   say "house-b in its own namespace, headless (log: $RUN/house-b.jsonl)"
   mkdir -p "$RUN/state-house-a" "$RUN/state-house-b"
-  sh -c "echo \$\$ > $RUN/house-b.pid; XDG_STATE_HOME=$RUN/state-house-b exec ip netns exec house-b $MOSSCHAT_BIN house --headless --gate 203.0.113.1:443 --community $COMMUNITY --identity-file $RUN/seeds/$SEEDS.seed --friends $RUN/friends.txt$house_no_punch" >"$RUN/house-b.jsonl" 2>"$RUN/house-b.stderr.log" &
+  sh -c "echo \$\$ > $RUN/house-b.pid; XDG_STATE_HOME=$RUN/state-house-b exec ip netns exec house-b $MOSSCHAT_BIN house --headless --gate 203.0.113.1:443 --community $COMMUNITY --identity-file $RUN/seeds/$total.seed --friends $RUN/friends.txt$house_no_punch" >"$RUN/house-b.jsonl" 2>"$RUN/house-b.stderr.log" &
 
   local i
   # 50 x 0.2s = 10s, bounded.
@@ -230,6 +275,16 @@ matrix(){
   [ -n "$MOSS_HOUSE_B" ] && [ "${#MOSS_HOUSE_B}" -eq 64 ] || { echo "could not read house-b's public key off its registered line:"; cat "$RUN/house-b.jsonl"; return 1; }
   echo "house-b public key: $MOSS_HOUSE_B" | tee -a "$f"
   export MOSS_HOUSE_B
+}
+
+matrix(){
+  local relay_only=0
+  [ "${1:-}" = "--relay-only" ] && relay_only=1
+  local f="$OUT/${DATE_TAG}-matrix-setup.txt"
+  trap 'stop_house; stop_gatehouse' EXIT INT TERM
+  export SEEDS=14
+  export DOCTOR_SEEDS=$((SEEDS - 1))
+  setup_eim "$SEEDS" "$f" "$relay_only" || return 1
 
   # Per-row command: house-a's doctor visiting house-b and holding the
   # visit open (README, "The long-lived row command"). MOSS_HOLD sets how
@@ -279,10 +334,112 @@ row(){
   XDG_STATE_HOME="$MOSS_RUN/state-house-a" exec ip netns exec house-a "$MOSSCHAT_BIN" doctor --gate 203.0.113.1:443 --community "$MOSS_COMMUNITY" --identity-file "$MOSS_RUN/seeds/$tag.seed" --friend "$MOSS_HOUSE_B" --hold "$hold" --json "${flags[@]}"
 }
 
+# Issue 88: both houses behind EIM masquerade NAT probe each other's
+# gate-reflected address and neither probe is ever answered. This answers
+# the two questions that decide it: does an 81 byte probe datagram leave
+# each NAT for the peer's reflected address, and does the reply tuple's
+# port in conntrack match the port the gate reflected. Self-contained:
+# brings its own topology up and tears it down, so do not run `down`
+# after it and do not run it while `matrix` or `nat` already has the
+# namespaces up.
+capture(){
+  command -v tcpdump >/dev/null 2>&1 || {
+    echo "capture needs tcpdump: sudo apt install tcpdump"
+    return 2
+  }
+  local f="$OUT/${DATE_TAG}-capture-setup.txt"
+  local capdir="$OUT/${DATE_TAG}-capture"
+  mkdir -p "$capdir"
+  trap 'stop_tcpdumps; stop_house; stop_gatehouse' EXIT INT TERM
+
+  # 2 doctor seeds (only one row runs, but next_seed() takes the contract
+  # from matrix() as given -- see the SEEDS/DOCTOR_SEEDS comment above)
+  # plus house-b's own, matching the work order's "2 doctor seeds plus
+  # house-b".
+  export SEEDS=3
+  export DOCTOR_SEEDS=2
+  setup_eim "$SEEDS" "$f" 0 || return 1
+
+  say "four tcpdumps: both NATs' outward interfaces and both houses'"
+  start_tcpdump nat-a veth-na-out "$capdir/nat-a.pcap" nat-a
+  start_tcpdump nat-b veth-nb-out "$capdir/nat-b.pcap" nat-b
+  start_tcpdump house-a veth-ha "$capdir/house-a.pcap" house-a
+  start_tcpdump house-b veth-hb "$capdir/house-b.pcap" house-b
+  sleep 1
+
+  # Stdout only, same as matrix()'s own smoke-run capture: `doctor --json`
+  # prints the record's one JSON line on stdout and the privacy notice on
+  # stderr (print_record, main.rs), and doctor.json has to stay exactly
+  # that one line for the grep below and for whoever reads it back.
+  say "doctor row from house-a, hold 20s (log: $capdir/doctor.json)"
+  MOSS_HOLD=20 bash "$H/run-harness.sh" row >"$capdir/doctor.json" &
+  local doctor_pid=$!
+
+  sleep 10
+  say "mid-hold snapshot at ~10s: conntrack, nft ruleset, ip state in all five namespaces"
+  {
+    echo "# conntrack -L -n (nat-a) $(date -u +%FT%TZ)"
+    ip netns exec nat-a conntrack -L -n 2>&1
+  } >"$capdir/conntrack-nat-a.txt"
+  {
+    echo "# conntrack -L -n (nat-b) $(date -u +%FT%TZ)"
+    ip netns exec nat-b conntrack -L -n 2>&1
+  } >"$capdir/conntrack-nat-b.txt"
+  ip netns exec nat-a nft list ruleset >"$capdir/nft-nat-a.txt" 2>&1
+  ip netns exec nat-b nft list ruleset >"$capdir/nft-nat-b.txt" 2>&1
+  {
+    local ns
+    for ns in house-a nat-a house-b nat-b internet; do
+      echo "# $ns: ip -j addr"
+      ip netns exec "$ns" ip -j addr 2>&1
+      echo "# $ns: ip route"
+      ip netns exec "$ns" ip route 2>&1
+      echo
+    done
+  } >"$capdir/netns-state.txt"
+
+  say "waiting for the doctor's 20s hold to finish"
+  wait "$doctor_pid"
+  local doctor_rc=$?
+  echo "doctor exit: $doctor_rc" | tee -a "$f"
+
+  say "stopping the four tcpdumps"
+  stop_tcpdumps
+
+  say "copying house-b's log and both roles' diagnostics records"
+  cp "$RUN/house-b.jsonl" "$capdir/house-b.jsonl" 2>/dev/null || echo "no $RUN/house-b.jsonl"
+  save_records
+  local role
+  for role in house-a house-b; do
+    [ -f "$OUT/${DATE_TAG}-$role-records.jsonl" ] && cp "$OUT/${DATE_TAG}-$role-records.jsonl" "$capdir/"
+  done
+
+  say "summary: probe traffic in each pcap (udp, excluding the gate's ports 443 and 444)"
+  local pcap
+  for pcap in nat-a nat-b house-a house-b; do
+    echo "-- $capdir/$pcap.pcap --"
+    tcpdump -n -r "$capdir/$pcap.pcap" 'udp and not port 443 and not port 444' 2>/dev/null | head -40
+  done
+
+  say "doctor record: candidate_exchange and probe_burst"
+  grep -o '"step":"candidate_exchange"[^}]*}' "$capdir/doctor.json" 2>/dev/null
+  grep -o '"step":"probe_burst"[^}]*}' "$capdir/doctor.json" 2>/dev/null
+
+  say "capture is self-contained: stopping house-b and the gatehouse and tearing down"
+  stop_house
+  stop_gatehouse
+  bash "$H/teardown.sh"
+  trap - EXIT INT TERM
+
+  say "done. Results: $capdir"
+  return "$doctor_rc"
+}
+
 case "${1:-}" in
-  row)    row ;;
-  nat)    nat_proof eim && nat_proof edm ;;
-  matrix) matrix "${2:-}" ;;
-  down)   stop_house; stop_gatehouse; save_house_log; save_records; bash "$H/teardown.sh" ;;
-  *)      sed -n 2,8p "$(readlink -f "$0")"; exit 2 ;;
+  row)     row ;;
+  nat)     nat_proof eim && nat_proof edm ;;
+  matrix)  matrix "${2:-}" ;;
+  capture) capture ;;
+  down)    stop_house; stop_gatehouse; save_house_log; save_records; bash "$H/teardown.sh" ;;
+  *)       sed -n 2,16p "$(readlink -f "$0")"; exit 2 ;;
 esac

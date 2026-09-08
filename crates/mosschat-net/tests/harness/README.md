@@ -32,6 +32,10 @@ On the Linux box (hewn-mini or hewn-pc), with a one-line check for each:
 - `nftables` (`nft`): `command -v nft >/dev/null && echo ok`
 - `conntrack-tools` (`conntrack`): `command -v conntrack >/dev/null && echo ok`
 - `socat`, for the fixed-source-port NAT-mode probe below: `command -v socat >/dev/null && echo ok`
+- `tcpdump`, for `run-harness.sh capture` (see "Capturing a held visit's
+  packets and NAT state" below): `command -v tcpdump >/dev/null && echo ok`.
+  `capture` checks for it itself and fails with the line below rather than
+  running partway; this line is only for checking ahead of time.
 - GNU coreutils' `timeout`, which every fault-matrix.sh row is bounded by: `command -v timeout >/dev/null && echo ok`
 - `openssl`, only for generating the community id and identity seeds below: `command -v openssl >/dev/null && echo ok`
 - `gh`, the GitHub CLI, to fetch the prebuilt binaries below: `command -v gh >/dev/null && echo ok`
@@ -40,9 +44,9 @@ On the Linux box (hewn-mini or hewn-pc), with a one-line check for each:
 - `iperf3` is not required by anything here; skip it unless you want it
   for your own bandwidth sanity checks outside this harness
 
-Debian/Ubuntu: `sudo apt install iproute2 nftables conntrack socat coreutils openssl gh`
-Arch: `sudo pacman -S iproute2 nftables conntrack-tools socat coreutils openssl github-cli`
-NixOS or any Nix install: `nix-shell -p iproute2 nftables conntrack-tools socat coreutils openssl gh`
+Debian/Ubuntu: `sudo apt install iproute2 nftables conntrack socat coreutils openssl gh tcpdump`
+Arch: `sudo pacman -S iproute2 nftables conntrack-tools socat coreutils openssl github-cli tcpdump`
+NixOS or any Nix install: `nix-shell -p iproute2 nftables conntrack-tools socat coreutils openssl gh tcpdump`
 (coreutils and openssl are normally already on the system; the package
 names above only matter if either is missing).
 
@@ -544,6 +548,80 @@ binaries *outside* the namespaces is not: `local_observed` is then
 whatever address your gate reflected, which is your machine's. Read a
 record before committing one that did not come from this harness
 (Yseult's Info 1 on PR 89).
+
+## Capturing a held visit's packets and NAT state
+
+Issue 88: every row of the fault matrix relayed. Both houses sit behind
+endpoint-independent masquerade NATs, offer each other exactly the right
+candidate (the peer's gate-reflected address), and neither side's probe is
+ever answered. `sudo bash run-harness.sh capture` is one command that
+answers the two questions that decide why: does an 81 byte probe datagram
+actually leave each NAT for the peer's reflected address, and does the
+reply tuple's port in `conntrack` match the port the gate reflected.
+
+It shares `matrix()`'s own setup (`setup_eim`, the function both call):
+the `eim` topology, a community, three identities (two doctor seeds and
+house-b's own, rather than fourteen), members and friends files, the
+gatehouse, and house-b headless. Then it starts four `tcpdump`s, one on
+each NAT's outward interface (`veth-na-out`, `veth-nb-out`) and one on
+each house's interface (`veth-ha`, `veth-hb`), so both sides of each NAT
+are visible; runs one `doctor --hold 20 --json` row from house-a; about
+10 seconds into that hold, while the visit should be live and probing,
+snapshots `conntrack -L -n` and `nft list ruleset` in both NAT namespaces
+and `ip -j addr` plus `ip route` in all five namespaces; and once the
+doctor exits, stops the four captures, copies house-b's stdout and both
+roles' section 7 diagnostics records into the results directory, and
+prints a summary.
+
+Everything lands under `docs/measurements/<date>-capture/`:
+
+- `nat-a.pcap`, `nat-b.pcap`, `house-a.pcap`, `house-b.pcap` -- the four
+  captures, readable with `tcpdump -n -r <file>` or Wireshark.
+- `conntrack-nat-a.txt`, `conntrack-nat-b.txt`, `nft-nat-a.txt`,
+  `nft-nat-b.txt`, `netns-state.txt` -- the mid-hold snapshot.
+- `doctor.json` -- the row's `--json` record (stdout only; the privacy
+  notice `doctor` prints on stderr is not in this file, so it stays
+  exactly one JSON line).
+- `house-b.jsonl` -- house-b's own event log for this run.
+- `<date>-house-a-records.jsonl`, `<date>-house-b-records.jsonl` -- both
+  roles' section 7 diagnostics records (`save_records()`, the same
+  mechanism `down` uses; each role runs with its own `XDG_STATE_HOME`
+  under `.run`, so the two sides land in two files rather than
+  interleaved in one).
+
+**How to read it, the two questions this exists to answer:**
+
+1. Does a probe datagram leave each NAT for the peer's reflected address
+   at all? Read `nat-a.pcap` for anything leaving `203.0.113.11` for
+   `203.0.113.12`, port equal to house-b's gate-reflected port
+   (`doctor.json`'s `peer_observed`), and `nat-b.pcap` the other way, for
+   anything leaving `203.0.113.12` for `203.0.113.11`, port equal to
+   house-a's (`doctor.json`'s `local_observed`). The summary `capture`
+   prints at the end does this for you: `tcpdump -n -r <file> 'udp and
+   not port 443 and not port 444'` on each pcap, which excludes the gate
+   traffic on 443/444 and leaves only the direct-path probes. If a pcap
+   shows nothing there, that side never sent (or the packet never
+   reached that interface); if both show something, read whether the far
+   side's pcap shows the same datagram arriving.
+2. Does the reply tuple's port in `conntrack` match the port the gate
+   reflected? In `conntrack-nat-a.txt`, find the line whose original
+   tuple's `dst=` is `203.0.113.12` (house-b's NAT) -- its reply tuple's
+   `dport=` (same field `netns-nat.sh`'s own NAT-mode check reads, the
+   second tuple, not any `sport=`) is the external port house-a's probe
+   actually used. Compare that to `local_observed` in `doctor.json`
+   (house-a's own two gate reflections, section 7's field of that name):
+   that is the same address the gate would have told house-b house-a's
+   was, in its `Introduction`. If they differ, the mapping is not
+   endpoint-independent across destination *addresses* (only ever proven
+   across destination *ports*, by the NAT-mode check above) -- a
+   different fact, and the one a hole punch actually needs.
+   `conntrack-nat-b.txt` is the same check the other way.
+
+**Self-contained.** `capture` brings its own topology up and tears it
+down (`down`'s own steps, at the end), so do not run `down` after it, and
+do not run it while `matrix` or `nat` already has the namespaces up --
+`netns-nat.sh` is idempotent, but the community, gatehouse and house-b
+`capture` starts are its own, not whatever `matrix` left running.
 
 ### One identity cannot run every row
 
