@@ -1,0 +1,13 @@
+# hewn-mini 7.0.0-31-generic 2026-09-08T16:19:57Z mode=eim
+# probes: house-a 10.1.0.2:55555 -> 203.0.113.1:443 and :444
+# conntrack -L -n -s 10.1.0.2  (nat-a)
+conntrack v1.4.9 (conntrack-tools): 2 flow entries have been shown.
+udp      17 29 src=10.1.0.2 dst=203.0.113.1 sport=55555 dport=444 [UNREPLIED] src=203.0.113.1 dst=203.0.113.11 sport=444 dport=55555 mark=0 use=1
+udp      17 28 src=10.1.0.2 dst=203.0.113.1 sport=55555 dport=443 [UNREPLIED] src=203.0.113.1 dst=203.0.113.11 sport=443 dport=55555 mark=0 use=1
+# nft ruleset (nat-a)
+table ip nat {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 10.1.0.0/24 oifname "veth-na-out" masquerade
+	}
+}
