@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use minicbor::{Decoder, Encoder, decode::Error as DecodeError};
 use rand::RngExt as _;
 
+use crate::diag::{self, Reason, Recorder, Step, StepOutcome};
 use crate::gate::GateError;
 use crate::gate::wire::Addr;
 
@@ -1244,6 +1245,11 @@ pub struct DoorbellParams {
     /// same-LAN pair upgrade to a private-range address at all (issue
     /// #37). Empty is the ordinary case: no discovery, no relaxation.
     pub peer_discovered: Vec<SocketAddr>,
+    /// This attempt's diagnostics recorder (section 7), or `None` for a
+    /// house running without a diagnostics directory. The same handle the
+    /// gate client holds, so one attempt's gate steps and doorbell steps
+    /// land in one record: [`crate::gate::client::GateClient::recorder`].
+    pub recorder: Option<Recorder>,
 }
 
 /// A live doorbell's one control: whether it still answers pings.
@@ -1334,6 +1340,30 @@ pub async fn write_porch_frame(
     Ok(())
 }
 
+/// Reads this peer's shaper counters out of the path table and into the
+/// record (section 7: "recorded on every connection, success or not").
+///
+/// This peer's own entry rather than the endpoint-wide fold: an attempt's
+/// record describes one relay leg, and a second peer's traffic over the
+/// same gate connection is not this attempt's.
+fn record_relay_counters(recorder: Option<&Recorder>, path: Option<&crate::path::PathEntry>) {
+    if let (Some(recorder), Some(path)) = (recorder, path) {
+        recorder.set_relay_stats(&path.egress().stats());
+    }
+}
+
+/// Closes the attempt's record with `reason` and writes it.
+///
+/// A failed write is deliberately not propagated: a diagnostics log that
+/// cannot be written is no reason to fail a connection that worked, and
+/// `doctor`, the one caller that must know, holds the record itself and
+/// checks the write there.
+fn settle(recorder: Option<&Recorder>, reason: Reason) {
+    if let Some(recorder) = recorder {
+        let (_record, _written) = recorder.finish(reason);
+    }
+}
+
 /// Runs section 2 for one peer, end to end, on an already-open end to end
 /// QUIC connection that is already carrying traffic through the relay.
 ///
@@ -1362,20 +1392,34 @@ pub async fn run_doorbell(
     control: &std::sync::Arc<DoorbellControl>,
 ) -> Result<DoorbellOutcome, GateError> {
     let initiator = params.role == 1;
+    let rec = params.recorder.as_ref();
     let mut half = [0u8; 32];
     rand::rng().fill(&mut half);
 
     // Step 3. The initiator opens the porch stream and names the attempt;
     // the responder accepts and adopts it, so one id names the attempt in
     // both houses' records without either having to agree on a draw.
-    let (mut send, mut recv) = if initiator {
-        peer.open_bi().await?
+    let opened = if initiator {
+        peer.open_bi().await
     } else {
-        peer.accept_bi().await?
+        peer.accept_bi().await
+    };
+    let (mut send, mut recv) = match opened {
+        Ok(stream) => stream,
+        Err(e) => {
+            diag::record(
+                rec,
+                Step::CandidateExchange,
+                StepOutcome::Fail,
+                e.to_string(),
+            );
+            settle(rec, Reason::PeerHandshakeFailed);
+            return Err(e.into());
+        }
     };
     let deadline = crate::authed::control_read_deadline();
 
-    let (attempt, peer_addrs, peer_half) = if initiator {
+    let exchange = if initiator {
         let mut attempt = [0u8; 16];
         rand::rng().fill(&mut attempt);
         write_porch_frame(
@@ -1393,15 +1437,28 @@ pub async fn run_doorbell(
             },
         )
         .await?;
-        let (peer_attempt, addrs, peer_half) = expect_candidates(&mut recv, deadline).await?;
-        if peer_attempt != attempt {
-            return Err(GateError::Protocol(
+        match expect_candidates(&mut recv, deadline).await {
+            Ok((peer_attempt, _, _)) if peer_attempt != attempt => Err(GateError::Protocol(
                 "the responder's Candidates named a different attempt".into(),
-            ));
+            )),
+            Ok((_, addrs, peer_half)) => Ok((attempt, addrs, peer_half)),
+            Err(e) => Err(e),
         }
-        (attempt, addrs, peer_half)
     } else {
-        let (attempt, addrs, peer_half) = expect_candidates(&mut recv, deadline).await?;
+        let received = expect_candidates(&mut recv, deadline).await;
+        let (attempt, addrs, peer_half) = match received {
+            Ok(candidates) => candidates,
+            Err(e) => {
+                diag::record(
+                    rec,
+                    Step::CandidateExchange,
+                    StepOutcome::Fail,
+                    e.to_string(),
+                );
+                settle(rec, Reason::PeerHandshakeFailed);
+                return Err(e);
+            }
+        };
         write_porch_frame(
             &mut send,
             &PorchFrame::Candidates {
@@ -1417,8 +1474,24 @@ pub async fn run_doorbell(
             },
         )
         .await?;
-        (attempt, addrs, peer_half)
+        Ok((attempt, addrs, peer_half))
     };
+    let (attempt, peer_addrs, peer_half) = match exchange {
+        Ok(exchanged) => exchanged,
+        Err(e) => {
+            diag::record(
+                rec,
+                Step::CandidateExchange,
+                StepOutcome::Fail,
+                e.to_string(),
+            );
+            settle(rec, Reason::PeerHandshakeFailed);
+            return Err(e);
+        }
+    };
+    if let Some(recorder) = rec {
+        recorder.set_attempt(attempt);
+    }
 
     let (half_initiator, half_responder) = if initiator {
         (half, peer_half)
@@ -1453,18 +1526,83 @@ pub async fn run_doorbell(
         state.add_discovered(*addr);
     }
 
+    // Section 7 names no `gather` step, so section 2 step 1's result is
+    // recorded as the detail of the exchange that carried it: how many
+    // addresses this house offered, how many the peer offered, and how
+    // many survived into the candidate table to be probed.
+    diag::record(
+        rec,
+        Step::CandidateExchange,
+        StepOutcome::Ok,
+        format!(
+            "{local} local, {peer} from the peer, {discovered} discovered, {probed} probed",
+            local = params.candidates.len(),
+            peer = peer_addrs.len(),
+            discovered = params.peer_discovered.len(),
+            probed = state.candidate_count(),
+        ),
+    );
+    if state.candidate_count() == 0 {
+        // Nothing to probe: the attempt stays on the relay for good, and
+        // section 7's `no_candidates` says why.
+        diag::record(
+            rec,
+            Step::ProbeBurst,
+            StepOutcome::Fail,
+            "no candidates to probe",
+        );
+    }
+
     // Step 4. Either side may ask; the initiator does, so exactly one
     // request is sent for the ordinary case and the 4 per session budget
     // is not spent on a race.
-    if initiator {
-        gate.request_start(params.session).await?;
+    if initiator && let Err(e) = gate.request_start(params.session).await {
+        diag::record(rec, Step::StartSignal, StepOutcome::Fail, e.to_string());
+        settle(rec, Reason::Internal);
+        return Err(e);
     }
-    let start = gate
+    let start = match gate
         .await_start(params.session, Duration::from_secs(10))
-        .await?;
+        .await
+    {
+        Ok(start) => start,
+        Err(e) => {
+            // Section 7's reason enum names no missing-`Start` case, so
+            // this is `internal`, its own stated catch-all, with the step
+            // saying which one it was.
+            diag::record(rec, Step::StartSignal, StepOutcome::Fail, e.to_string());
+            settle(rec, Reason::Internal);
+            return Err(e);
+        }
+    };
+    if let Some(recorder) = rec {
+        // Frame 7's `gate_ms`, the one shared timestamp: it is written
+        // into both houses' records so two logs align, and is never a time
+        // to act on.
+        recorder.set_gate_ms(start.gate_ms);
+        recorder.set_session(params.session);
+    }
+    diag::record(
+        rec,
+        Step::StartSignal,
+        StepOutcome::Ok,
+        format!("firing in {} ms", start.fire_in_ms),
+    );
     state.start_signal_received(start.received_at);
 
     let path = porch.path_for(&params.peer_key);
+    // A relay path's address is the gate's: that is where this house's
+    // traffic for this peer actually leaves to while it is relayed. The
+    // peer's synthetic address (section 3) never leaves the machine and
+    // would tell a reader of the record nothing.
+    let relay_addr = Addr::from_socket_addr(gate.gate_connection().remote_address());
+    if let Some(recorder) = rec {
+        // Section 2 step 2: traffic is on the relay from before this
+        // function was called, so the record says relay until an upgrade
+        // changes it. The address is the peer's synthetic one (section 3),
+        // which is the only address this end of a relayed path has.
+        recorder.set_path(diag::PathChoice::Relay(relay_addr), 0);
+    }
     let mut outcome = DoorbellOutcome {
         attempt,
         upgraded_to: None,
@@ -1496,10 +1634,25 @@ pub async fn run_doorbell(
                 live_misses = live_misses.saturating_add(1);
             }
             if live_misses >= LIVE_PROBES_TO_STALE {
+                diag::record(
+                    rec,
+                    Step::PathLost,
+                    StepOutcome::Fail,
+                    format!("{LIVE_PROBES_TO_STALE} consecutive probes unanswered on {winner}"),
+                );
                 if let Some(path) = path.as_ref() {
                     path.fall_back_to_relay();
                 }
                 outcome.fell_back = true;
+                if let Some(recorder) = rec {
+                    recorder.set_path(diag::PathChoice::Relay(relay_addr), 0);
+                }
+                diag::record(
+                    rec,
+                    Step::RelayFallback,
+                    StepOutcome::Ok,
+                    "traffic moved back to the relay session",
+                );
                 let _ = write_porch_frame(
                     &mut send,
                     &PorchFrame::PathDown {
@@ -1511,6 +1664,8 @@ pub async fn run_doorbell(
                     },
                 )
                 .await;
+                record_relay_counters(rec, path.as_ref());
+                settle(rec, Reason::PathIdleTimeout);
                 return Ok(outcome);
             }
             if live_last_sent.is_none_or(|last| now.duration_since(last) >= LIVE_PROBE_INTERVAL) {
@@ -1541,6 +1696,28 @@ pub async fn run_doorbell(
                 let _ = porch.send_probe(to, &bytes);
             }
             if state.given_up(now) {
+                diag::record(
+                    rec,
+                    Step::ProbeBurst,
+                    StepOutcome::Fail,
+                    format!(
+                        "0 of {count} candidates answered",
+                        count = state.candidate_count()
+                    ),
+                );
+                record_relay_counters(rec, path.as_ref());
+                // Section 7's inference, so the Phase 1 gate's named
+                // reason for case (d) is a rule and not a guess. The
+                // counters are read first because the hairpin rule asks
+                // whether the relay worked.
+                let reason = rec.map_or(Reason::ProbeTimeout, |recorder| {
+                    if state.candidate_count() == 0 {
+                        Reason::NoCandidates
+                    } else {
+                        recorder.probe_failure_reason()
+                    }
+                });
+                settle(rec, reason);
                 return Ok(outcome);
             }
         }
@@ -1599,6 +1776,34 @@ pub async fn run_doorbell(
                 // (Konrad's should 4).
                 path.record_rtt(winner.rtt);
             }
+            let rtt_us_now = u32::try_from(winner.rtt.as_micros()).unwrap_or(u32::MAX);
+            diag::record(
+                rec,
+                Step::ProbeBurst,
+                StepOutcome::Ok,
+                format!(
+                    "{winner_addr} answered {CONSECUTIVE_PONGS_TO_WIN} consecutive probes",
+                    winner_addr = winner.addr
+                ),
+            );
+            diag::record(
+                rec,
+                Step::Upgrade,
+                StepOutcome::Ok,
+                format!("direct to {addr} at {rtt_us_now} us", addr = winner.addr),
+            );
+            if let Some(recorder) = rec {
+                recorder.set_path(
+                    diag::PathChoice::Direct(Addr::from_socket_addr(winner.addr)),
+                    rtt_us_now,
+                );
+            }
+            diag::record(
+                rec,
+                Step::Live,
+                StepOutcome::Ok,
+                "traffic on the direct path",
+            );
             outcome.upgraded_to = Some(winner.addr);
             live_last_sent = Some(Instant::now());
             live_outstanding = None;
@@ -1619,7 +1824,26 @@ pub async fn run_doorbell(
 
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(20)) => {}
-            _ = peer.closed() => return Ok(outcome),
+            _ = peer.closed() => {
+                diag::record(
+                    rec,
+                    Step::Closed,
+                    StepOutcome::Ok,
+                    "the peer connection closed",
+                );
+                record_relay_counters(rec, path.as_ref());
+                // An attempt that reached a direct path and then had its
+                // connection closed ended the way it should; one closed
+                // before that did not, and `internal` is section 7's own
+                // catch-all for a failure it does not name.
+                let reason = if outcome.upgraded_to.is_some() {
+                    Reason::Ok
+                } else {
+                    Reason::Internal
+                };
+                settle(rec, reason);
+                return Ok(outcome);
+            }
         }
     }
 }

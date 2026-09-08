@@ -21,3 +21,11 @@ mosschat-tui = { path = "../mosschat-tui" }
 # `mosschat-net`'s gate server. Same version pinned there.
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal"] }
 rand = "0.10"
+
+# WO-1.4b: `tests/doctor.rs` runs the built binary and parses the record it
+# wrote back through `diag`'s own reader, which is the verification section
+# 8 asks for. `mosschat-net` is already a normal dependency of this crate;
+# an integration test links only the crate under test and its
+# dev-dependencies, so it is named again here rather than added to the tree.
+[dev-dependencies]
+mosschat-net = { path = "../mosschat-net" }

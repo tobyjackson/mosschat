@@ -21,6 +21,7 @@ use rand::RngExt;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::authed::{self, AuthedConnection};
+use crate::diag::{self, Recorder, Step, StepOutcome};
 use crate::gate::wire::{self, Addr, Frame};
 use crate::gate::{GateError, SeenSet, limits, now_ms, within_freshness_window};
 use crate::lockext::LockExt;
@@ -358,6 +359,18 @@ struct Inner {
     /// discarded, so a house could learn either only out of band).
     registered_observed: std::net::SocketAddr,
     registered_secondary_port: u16,
+    /// The diagnostics recorder for the attempt this client was opened
+    /// for, if the caller gave one ([`GateClient::connect_with_recorder`]).
+    /// A plain `Option` rather than something settable later: section 7's
+    /// record is per connection attempt, and the gate steps of an attempt
+    /// are the ones that opened this connection.
+    recorder: Option<Recorder>,
+    /// The client-side QUIC configuration this house dials with, kept so
+    /// [`GateClient::dial_peer`] can clone it and attach a peer
+    /// connection's own transport config (section 3's pinned MTU and
+    /// epoch-resetting congestion factory) without rebuilding the identity
+    /// certificate from a seed this struct would then have to hold.
+    client_config: quinn::ClientConfig,
     /// The sessions this house actually holds, from its own `Introduce` or
     /// from an `Introduction` following a `Knock` it accepted.
     ///
@@ -451,6 +464,43 @@ impl GateClient {
         friends: Arc<dyn FriendStore>,
         invites: Arc<dyn InviteStore>,
     ) -> Result<Self, GateError> {
+        Self::connect_with_recorder(
+            primary_addr,
+            identity_seed,
+            community,
+            expected_gate_key,
+            friends,
+            invites,
+            None,
+        )
+        .await
+    }
+
+    /// [`GateClient::connect`], recording section 7's `gate_dial`,
+    /// `gate_register` and `reflect_primary` steps into `recorder` and
+    /// holding it for the `introduce`, `relay_open` and `peer_handshake`
+    /// steps that follow on this connection.
+    ///
+    /// A separate constructor rather than a seventh parameter on
+    /// [`GateClient::connect`] so that every existing caller (a house with
+    /// no diagnostics directory, and every test written before WO-1.4b)
+    /// keeps working unchanged.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`GateClient::connect`]; each failure is recorded
+    /// against the step it happened in before it is returned.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_recorder(
+        primary_addr: std::net::SocketAddr,
+        identity_seed: [u8; 32],
+        community: [u8; 32],
+        expected_gate_key: Option<[u8; 32]>,
+        friends: Arc<dyn FriendStore>,
+        invites: Arc<dyn InviteStore>,
+        recorder: Option<Recorder>,
+    ) -> Result<Self, GateError> {
+        let rec = recorder.as_ref();
         authed::install_crypto_provider();
         let (cert, key) = authed::self_signed_cert(&identity_seed)
             .map_err(|e| GateError::Protocol(e.to_string()))?;
@@ -497,7 +547,7 @@ impl GateClient {
             Arc::clone(&porch) as Arc<dyn quinn::AsyncUdpSocket>,
             runtime,
         )?;
-        endpoint.set_default_client_config(client_config);
+        endpoint.set_default_client_config(client_config.clone());
 
         // Section 3's drop rule (`PorchSocket::allow_source`): the gate's
         // primary address is in no peer's candidate table, so it must be
@@ -508,12 +558,46 @@ impl GateClient {
         // too and `arm`'s doc is true of the code (Konrad's item 2:
         // `attach_gate` alone left it off until the handshake completed).
         porch.arm();
-        let connecting = endpoint.connect(primary_addr, "gate")?;
-        let connection = connecting.await?;
-        let authed_conn = AuthedConnection::new(connection)?;
+        // Section 7's `gate_dial`: the QUIC handshake with the gate. A
+        // dial that never completes is `gate_unreachable`; one that
+        // completes and is then refused is a `gate_register` failure
+        // below, since the refusal arrives as an `Error` frame.
+        let connecting = match endpoint.connect(primary_addr, "gate") {
+            Ok(connecting) => connecting,
+            Err(e) => {
+                diag::record(rec, Step::GateDial, StepOutcome::Fail, e.to_string());
+                return Err(e.into());
+            }
+        };
+        let connection = match connecting.await {
+            Ok(connection) => connection,
+            Err(e) => {
+                diag::record(rec, Step::GateDial, StepOutcome::Fail, e.to_string());
+                return Err(e.into());
+            }
+        };
+        let authed_conn = match AuthedConnection::new(connection) {
+            Ok(authed_conn) => authed_conn,
+            Err(e) => {
+                diag::record(rec, Step::GateDial, StepOutcome::Fail, e.to_string());
+                return Err(e);
+            }
+        };
+        diag::record(
+            rec,
+            Step::GateDial,
+            StepOutcome::Ok,
+            format!("gate at {primary_addr}"),
+        );
         if let Some(expected) = expected_gate_key
             && authed_conn.peer_key() != expected
         {
+            diag::record(
+                rec,
+                Step::GateDial,
+                StepOutcome::Fail,
+                "the gate's TLS-proven key does not match the pinned key",
+            );
             authed_conn
                 .connection()
                 .close(0u32.into(), b"gate key does not match the pinned key");
@@ -537,17 +621,56 @@ impl GateClient {
                 secondary_port,
                 ..
             } => {
-                let observed = observed.to_socket_addr().ok_or_else(|| {
+                let decoded = observed.to_socket_addr().ok_or_else(|| {
                     GateError::Protocol("Registered.observed did not decode".into())
-                })?;
-                (observed, secondary_port)
+                });
+                let decoded = match decoded {
+                    Ok(decoded) => decoded,
+                    Err(e) => {
+                        diag::record(rec, Step::GateRegister, StepOutcome::Fail, e.to_string());
+                        return Err(e);
+                    }
+                };
+                diag::record(
+                    rec,
+                    Step::GateRegister,
+                    StepOutcome::Ok,
+                    format!("registered, secondary port {secondary_port}"),
+                );
+                // Frame 2's `observed` is section 7's first reflection:
+                // the source address the gate saw on the primary port.
+                if let Some(recorder) = rec {
+                    recorder.set_local_observed_primary(observed);
+                }
+                diag::record(
+                    rec,
+                    Step::ReflectPrimary,
+                    StepOutcome::Ok,
+                    format!("gate saw {decoded}"),
+                );
+                (decoded, secondary_port)
             }
             Frame::Error { code, detail, .. } => {
+                // `detail` is the gate's own text, capped at 64 bytes on
+                // the wire (section 1) and capped again by the record's
+                // free-text limit; the code is section 7's reason enum.
+                diag::record(
+                    rec,
+                    Step::GateRegister,
+                    StepOutcome::Fail,
+                    format!("gate refused registration: code={code} detail={detail}"),
+                );
                 return Err(GateError::Protocol(format!(
                     "gate refused registration: code={code} detail={detail}"
                 )));
             }
             other => {
+                diag::record(
+                    rec,
+                    Step::GateRegister,
+                    StepOutcome::Fail,
+                    format!("expected Registered or Error, got {other:?}"),
+                );
                 return Err(GateError::Protocol(format!(
                     "expected Registered or Error, got {other:?}"
                 )));
@@ -576,6 +699,8 @@ impl GateClient {
             auto_answer_knocks: std::sync::atomic::AtomicBool::new(true),
             registered_observed,
             registered_secondary_port,
+            recorder,
+            client_config,
             sessions: StdMutex::new(HashMap::new()),
             starts: StdMutex::new(HashMap::new()),
         });
@@ -666,6 +791,19 @@ impl GateClient {
         self.inner.endpoint.clone()
     }
 
+    /// The UDP port this house's porch socket is bound to locally, which
+    /// is the port section 2 step 1's local candidates carry.
+    ///
+    /// `None` if the socket cannot report its address. Named here so a
+    /// caller outside this crate (the `doctor` subcommand) can gather
+    /// candidates without depending on quinn for the `AsyncUdpSocket`
+    /// trait that carries `local_addr`.
+    #[must_use]
+    pub fn local_port(&self) -> Option<u16> {
+        use quinn::AsyncUdpSocket as _;
+        self.inner.porch.local_addr().ok().map(|addr| addr.port())
+    }
+
     /// The porch socket backing [`Self::endpoint`].
     #[must_use]
     pub fn porch(&self) -> Arc<PorchSocket> {
@@ -677,6 +815,14 @@ impl GateClient {
     #[must_use]
     pub fn synthetic_addr_for(&self, peer_key: &[u8; 32]) -> std::net::SocketAddr {
         sock::synthetic_addr(self.inner.process_salt, peer_key)
+    }
+
+    /// This client's diagnostics recorder, if it was opened with one.
+    /// The doorbell takes the same handle, so one attempt's gate steps and
+    /// doorbell steps land in one record (section 7).
+    #[must_use]
+    pub fn recorder(&self) -> Option<Recorder> {
+        self.inner.recorder.clone()
     }
 
     /// Disables this client's automatic `Knock` answering, so a test can
@@ -717,15 +863,34 @@ impl GateClient {
     ///
     /// Returns a [`GateError`] if the connection or exchange fails.
     pub async fn reflect(&self, secondary_addr: std::net::SocketAddr) -> Result<Addr, GateError> {
+        let rec = self.inner.recorder.as_ref();
         // The gate's secondary port is the other address this house dials
         // itself, and the only other one; allowed for the life of this
         // short connection and withdrawn when it closes.
         let lease = self.inner.porch.allow_source(secondary_addr);
-        let connecting = self.inner.endpoint.connect(secondary_addr, "gate")?;
+        let connecting = match self.inner.endpoint.connect(secondary_addr, "gate") {
+            Ok(connecting) => connecting,
+            Err(e) => {
+                self.inner.porch.forget_source(lease);
+                diag::record(
+                    rec,
+                    Step::ReflectSecondary,
+                    StepOutcome::Fail,
+                    e.to_string(),
+                );
+                return Err(e.into());
+            }
+        };
         let connection = match connecting.await {
             Ok(connection) => connection,
             Err(e) => {
                 self.inner.porch.forget_source(lease);
+                diag::record(
+                    rec,
+                    Step::ReflectSecondary,
+                    StepOutcome::Fail,
+                    e.to_string(),
+                );
                 return Err(e.into());
             }
         };
@@ -738,10 +903,34 @@ impl GateClient {
         connection.close(0u32.into(), b"reflect done");
         self.inner.porch.forget_source(lease);
         match reply {
-            Frame::Reflected { observed, .. } => Ok(observed),
-            other => Err(GateError::Protocol(format!(
-                "expected Reflected, got {other:?}"
-            ))),
+            Frame::Reflected { observed, .. } => {
+                // Section 7's second reflection, off the other port: the
+                // pair is what `Mapping` is inferred from.
+                if let Some(recorder) = rec {
+                    recorder.set_local_observed_secondary(observed);
+                }
+                diag::record(
+                    rec,
+                    Step::ReflectSecondary,
+                    StepOutcome::Ok,
+                    match observed.to_socket_addr() {
+                        Some(addr) => format!("gate saw {addr}"),
+                        None => "gate saw an address that did not decode".to_string(),
+                    },
+                );
+                Ok(observed)
+            }
+            other => {
+                diag::record(
+                    rec,
+                    Step::ReflectSecondary,
+                    StepOutcome::Fail,
+                    format!("expected Reflected, got {other:?}"),
+                );
+                Err(GateError::Protocol(format!(
+                    "expected Reflected, got {other:?}"
+                )))
+            }
         }
     }
 
@@ -805,6 +994,7 @@ impl GateClient {
         ttl_s: u16,
         invite: Option<InviteProof>,
     ) -> Result<IntroduceOutcome, GateError> {
+        let rec = self.inner.recorder.as_ref();
         let tag = pair_tag(&self.inner.community, &self.public_key(), &peer_key);
         let body = SealedBody {
             from: self.public_key(),
@@ -844,18 +1034,126 @@ impl GateClient {
                 // table entry exists from the introduction, not from the
                 // upgrade. The doorbell finds it with `porch.path_for`.
                 self.inner.porch.insert_relay_path(peer_key, synthetic);
+                // The record names no key: the session and the peer's
+                // gate-observed address are what section 7 asks for, and
+                // the peer itself is already the record's redacted
+                // fingerprint.
+                if let Some(recorder) = rec {
+                    recorder.set_session(outcome.session);
+                    recorder.set_peer_observed(outcome.peer_observed);
+                }
+                diag::record(
+                    rec,
+                    Step::Introduce,
+                    StepOutcome::Ok,
+                    format!(
+                        "introduced as role {role}, session {session}",
+                        role = outcome.role,
+                        session = outcome.session
+                    ),
+                );
+                // The relay session exists from here: the gate forwards
+                // datagrams for it, and the path table entry above is the
+                // house's end of it.
+                diag::record(
+                    rec,
+                    Step::RelayOpen,
+                    StepOutcome::Ok,
+                    format!("relay session {session}", session = outcome.session),
+                );
                 Ok(outcome)
             }
             _ => {
                 self.inner.introductions.lock_or_recover().remove(&tag);
+                // Section 7: `introduce_timeout` is inferred locally from
+                // `ttl_s` elapsing, and is all an unsuccessful `Introduce`
+                // yields. A tag matching nobody, a house that declined and
+                // one that never answered are deliberately one outcome.
+                diag::record(
+                    rec,
+                    Step::Introduce,
+                    StepOutcome::Fail,
+                    format!("no Introduction inside {ttl_s} s"),
+                );
                 Err(GateError::Protocol("introduce_timeout".into()))
             }
         }
     }
+
+    /// Section 2 step 2: dials the end to end QUIC connection to `peer_key`
+    /// through the relay session [`GateClient::introduce`] already opened,
+    /// and returns it once the peer's TLS-proven key matches.
+    ///
+    /// The connection addresses the peer's synthetic address throughout
+    /// (section 3), so it never learns which path carries it; the porch
+    /// socket decides that. `peer_handshake` is the step section 7 names,
+    /// and `peer_key_mismatch` the reason a wrong key produces.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`GateError`] if the path table has no entry for this
+    /// peer (nothing has introduced it), the handshake fails, or the key
+    /// the handshake proves is not `peer_key`.
+    pub async fn dial_peer(&self, peer_key: &[u8; 32]) -> Result<quinn::Connection, GateError> {
+        let rec = self.inner.recorder.as_ref();
+        let Some(path) = self.inner.porch.path_for(peer_key) else {
+            let detail = "no relay path for this peer: nothing has introduced it";
+            diag::record(rec, Step::PeerHandshake, StepOutcome::Fail, detail);
+            return Err(GateError::Protocol(detail.into()));
+        };
+        let mut config = self.inner.client_config.clone();
+        config.transport_config(crate::path::peer_transport_config(path.epoch()));
+        let synthetic = self.synthetic_addr_for(peer_key);
+        let connecting = match self.inner.endpoint.connect_with(config, synthetic, "peer") {
+            Ok(connecting) => connecting,
+            Err(e) => {
+                diag::record(rec, Step::PeerHandshake, StepOutcome::Fail, e.to_string());
+                return Err(e.into());
+            }
+        };
+        let connection = match connecting.await {
+            Ok(connection) => connection,
+            Err(e) => {
+                diag::record(rec, Step::PeerHandshake, StepOutcome::Fail, e.to_string());
+                return Err(e.into());
+            }
+        };
+        let authed_conn = match AuthedConnection::new(connection) {
+            Ok(authed_conn) => authed_conn,
+            Err(e) => {
+                diag::record(rec, Step::PeerHandshake, StepOutcome::Fail, e.to_string());
+                return Err(e);
+            }
+        };
+        if authed_conn.peer_key() != *peer_key {
+            // Section 7's `peer_key_mismatch`. The record names neither
+            // key: the expected one is already the record's redacted peer
+            // fingerprint, and the one that answered is not written at all.
+            diag::record(
+                rec,
+                Step::PeerHandshake,
+                StepOutcome::Fail,
+                "the peer's TLS-proven key is not the key this attempt asked for",
+            );
+            authed_conn
+                .connection()
+                .close(0u32.into(), b"peer key mismatch");
+            return Err(GateError::InvalidIdentity(
+                "peer key does not match the key this attempt asked for".into(),
+            ));
+        }
+        diag::record(
+            rec,
+            Step::PeerHandshake,
+            StepOutcome::Ok,
+            "end to end connection open over the relay",
+        );
+        Ok(authed_conn.connection().clone())
+    }
 }
 
 /// `BLAKE3("mosschat-gate-pair-v1" || community || min(kA,kB) || max(kA,kB))`
-/// (section 1).
+/// (section 1), the pair tag.
 #[must_use]
 pub fn pair_tag(community: &[u8; 32], a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
@@ -1057,6 +1355,13 @@ async fn answer_knock(inner: &Arc<Inner>, tag: [u8; 32], sealed: Vec<u8>) {
         // silence, per section 1.
         return;
     }
+
+    diag::record(
+        inner.recorder.as_ref(),
+        Step::Introduce,
+        StepOutcome::Ok,
+        "knock accepted",
+    );
 
     {
         inner

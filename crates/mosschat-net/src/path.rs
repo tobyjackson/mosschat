@@ -314,6 +314,15 @@ const DELAY_SAMPLES: usize = 1024;
 pub struct ShaperStats {
     /// Datagrams that entered this direction's queue.
     pub relay_queued: u64,
+    /// Payload bytes that entered this direction's queue, which is what
+    /// section 7's `gate_bytes` reports: the bytes this endpoint handed to
+    /// the relay leg, not counting the 5 byte `Relay` header the gate
+    /// connection adds around each one.
+    ///
+    /// WO-1.3c counted datagrams and not bytes, so `gate_bytes` had no
+    /// source at all; a count of datagrams times the 1200 byte cap would
+    /// be a guess, and section 7's field asks for a measurement.
+    pub relay_bytes: u64,
     /// The median time a datagram waited, over the last
     /// [`DELAY_SAMPLES`] drained, in microseconds.
     pub relay_shaped_delay_p50_us: u64,
@@ -342,6 +351,7 @@ impl ShaperStats {
     pub fn merged(self, other: Self) -> Self {
         Self {
             relay_queued: self.relay_queued.saturating_add(other.relay_queued),
+            relay_bytes: self.relay_bytes.saturating_add(other.relay_bytes),
             relay_shaped_delay_p50_us: self
                 .relay_shaped_delay_p50_us
                 .max(other.relay_shaped_delay_p50_us),
@@ -395,6 +405,7 @@ struct ShaperInner {
     state: Mutex<ShaperState>,
     arrivals: Notify,
     queued: AtomicU64,
+    bytes: AtomicU64,
     dropped_at_full: AtomicU64,
     backpressure: AtomicU64,
     delay_max_us: AtomicU64,
@@ -474,6 +485,7 @@ impl RelayShaper {
                 }),
                 arrivals: Notify::new(),
                 queued: AtomicU64::new(0),
+                bytes: AtomicU64::new(0),
                 dropped_at_full: AtomicU64::new(0),
                 backpressure: AtomicU64::new(0),
                 delay_max_us: AtomicU64::new(0),
@@ -522,11 +534,14 @@ impl RelayShaper {
             return Enqueued::Full;
         }
         let count = payloads.len() as u64;
+        let mut bytes = 0u64;
         for payload in payloads {
+            bytes = bytes.saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
             state.items.push_back((now, payload));
         }
         drop(state);
         self.inner.queued.fetch_add(count, Ordering::Relaxed);
+        self.inner.bytes.fetch_add(bytes, Ordering::Relaxed);
         self.inner.arrivals.notify_one();
         Enqueued::Accepted
     }
@@ -556,9 +571,11 @@ impl RelayShaper {
             self.inner.dropped_at_full.fetch_add(1, Ordering::Relaxed);
             return Enqueued::Full;
         }
+        let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         state.items.push_back((now, payload));
         drop(state);
         self.inner.queued.fetch_add(1, Ordering::Relaxed);
+        self.inner.bytes.fetch_add(bytes, Ordering::Relaxed);
         self.inner.arrivals.notify_one();
         Enqueued::Accepted
     }
@@ -718,6 +735,7 @@ impl RelayShaper {
         };
         ShaperStats {
             relay_queued: self.inner.queued.load(Ordering::Relaxed),
+            relay_bytes: self.inner.bytes.load(Ordering::Relaxed),
             relay_shaped_delay_p50_us: p50,
             relay_shaped_delay_max_us: self.inner.delay_max_us.load(Ordering::Relaxed),
             relay_dropped_at_full: self.inner.dropped_at_full.load(Ordering::Relaxed),
