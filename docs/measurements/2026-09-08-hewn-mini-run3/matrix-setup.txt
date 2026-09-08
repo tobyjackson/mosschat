@@ -1,0 +1,25 @@
+# hewn-mini 7.0.0-31-generic 2026-09-08T21:04:42Z
+community: 90b3b560119614156ce60390a4ad1508886d4e5e939070f97fcd5cc3c19ed8fc
+mode: normal (punching allowed)
+identities: 14 total; 13 for doctor runs (smoke run plus the 12 matrix rows, one identity each, in /home/hewn/mosschat/crates/mosschat-net/tests/harness/.run/seeds), identity 14 is house-b's own; public keys:
+91e525cb38cdae124533a871a14b83cca4197392d3c3f6aa8af90bedf1d3acf2
+4de7d62251cdf326b9dd6eca94d75e0ea8964674cd769c20e4826686e0971fdb
+20ff5a2da57b905db3648e4e869f820e0fe450e8490a375a9522aa167a48e4b5
+4645f0c93c87776c7f540b6ea1abd0686f2d34f8de8f21ab5b61f290a59b9d35
+6eacaa61a5761135f78b45d7cf7618c0c76905b4110dc668ecc668ad9932342f
+15630d14357d1f5443417a87a83e3db9e0ecf2d01b42e557619de225ee766851
+0ee763c434b429379a4eefd35eb6ca99c9d21daa189a42fe9294a1c11a5e7964
+a1255045e0a4e8cbefce4c110a2baab7ec25fcc09e1f6e1bfeebeaf8e516d673
+790ec1ec01ec1fa31ab9a58ba7499369a5b7fdd063b6e76ad582d0891e3bb92b
+0060bb72b61238e5b2f567ff7203f53bf26c63402ac4732a97e10265eea4cfb7
+0f1ed547eaa3878617b3fecd95228a1df465b85ceac7570375c7600ce5312080
+97046f0c09b4826120622211b978de79954118287bcc41cc22cf01b000da5924
+a124ae04aaee6fde68b616bf1f2f55e6bab784095801092be818e16c3a192fcd
+659ec7498f49778ba340db1b53eab01c63fa5c746668383499161dc59bc45aed
+house-b public key: 659ec7498f49778ba340db1b53eab01c63fa5c746668383499161dc59bc45aed
+# identity 01
+{"attempt":"37f64a144a5aa310ce1d88256ef32d55","ended_at":"2026-09-08T21:04:49.653Z","events":[{"at_ms":6,"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open"},{"at_ms":5013,"detail":"the hold elapsed","event":"goodbye"}],"failed_step":null,"gate_bytes":2904,"gate_carried_traffic":true,"gate_ms":14,"local_observed":["203.0.113.11:42943","203.0.113.11:42943"],"mapping":"endpoint_independent","path":"relay","path_addr":"[::ffff:203.0.113.1]:443","path_rtt_us":0,"peer":"03ceb110","peer_observed":"203.0.113.12:38639","platform":"linux","reason":"probe_timeout","relay_dropped_at_full":0,"relay_queued":9,"relay_shaped_delay_max_us":1067,"relay_shaped_delay_p50_us":17,"rtt_median_us":1766,"rtt_p95_us":1766,"rtt_samples":4,"rtt_source":"quic","session":1772967836,"started_at":"2026-09-08T21:04:44.616Z","steps":[{"at_ms":1,"detail":"gate at 203.0.113.1:443","outcome":"ok","step":"gate_dial"},{"at_ms":2,"detail":"registered, secondary port 444","outcome":"ok","step":"gate_register"},{"at_ms":2,"detail":"gate saw 203.0.113.11:42943","outcome":"ok","step":"reflect_primary"},{"at_ms":3,"detail":"gate saw 203.0.113.11:42943","outcome":"ok","step":"reflect_secondary"},{"at_ms":3,"detail":"introduced as role 1, session 1772967836","outcome":"ok","step":"introduce"},{"at_ms":3,"detail":"relay session 1772967836","outcome":"ok","step":"relay_open"},{"at_ms":6,"detail":"end to end connection open over the relay","outcome":"ok","step":"peer_handshake"},{"at_ms":6,"detail":"the visit is open on the relay path","outcome":"ok","step":"live"},{"at_ms":18,"detail":"2 local, 2 from the peer, 0 discovered, 1 probed","outcome":"ok","step":"candidate_exchange"},{"at_ms":18,"detail":"firing in 200 ms","outcome":"ok","step":"start_signal"}],"version":"0.1.0"}
+doctor exit: 0
+matrix exit: 0
+mosschat gatehouse: community=90b3b560119614156ce60390a4ad1508886d4e5e939070f97fcd5cc3c19ed8fc
+mosschat gatehouse: primary=203.0.113.1:443 secondary=203.0.113.1:444

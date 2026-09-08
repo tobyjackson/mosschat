@@ -1,0 +1,12 @@
+# fault-matrix.sh row: duplicate
+# condition: Duplicate
+# pass criterion: QUIC dedups; no duplicate message in the recording
+# started (UTC): 2026-09-08T21:15:31Z
+# command: bash /home/hewn/mosschat/crates/mosschat-net/tests/harness/run-harness.sh row
+# netem applied (tc qdisc show, captured right after applying):
+# tc qdisc show dev veth-ha (in house-a):
+#   qdisc netem 8022: root refcnt 5 limit 1000 duplicate 1% seed 1527731734418067819
+# --- command output follows ---
+# identity 09
+This report contains IP addresses: yours, your friend's and your gate's.
+{"attempt":"bc08127b3427018915a1d1303b33c70c","ended_at":"2026-09-08T21:17:01.426Z","events":[{"at_ms":7,"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open"},{"at_ms":90007,"detail":"the hold elapsed","event":"goodbye"}],"failed_step":"probe_burst","gate_bytes":3300,"gate_carried_traffic":true,"gate_ms":15,"local_observed":["203.0.113.11:40362","203.0.113.11:40362"],"mapping":"endpoint_independent","path":"relay","path_addr":"[::ffff:203.0.113.1]:443","path_rtt_us":0,"peer":"03ceb110","peer_observed":"203.0.113.12:38639","platform":"linux","reason":"probe_timeout","relay_dropped_at_full":0,"relay_queued":20,"relay_shaped_delay_max_us":1902,"relay_shaped_delay_p50_us":13,"rtt_median_us":2366,"rtt_p95_us":2476,"rtt_samples":88,"rtt_source":"quic","session":1672643246,"started_at":"2026-09-08T21:15:31.414Z","steps":[{"at_ms":1,"detail":"gate at 203.0.113.1:443","outcome":"ok","step":"gate_dial"},{"at_ms":1,"detail":"registered, secondary port 444","outcome":"ok","step":"gate_register"},{"at_ms":1,"detail":"gate saw 203.0.113.11:40362","outcome":"ok","step":"reflect_primary"},{"at_ms":3,"detail":"gate saw 203.0.113.11:40362","outcome":"ok","step":"reflect_secondary"},{"at_ms":3,"detail":"introduced as role 1, session 1672643246","outcome":"ok","step":"introduce"},{"at_ms":3,"detail":"relay session 1672643246","outcome":"ok","step":"relay_open"},{"at_ms":6,"detail":"end to end connection open over the relay","outcome":"ok","step":"peer_handshake"},{"at_ms":7,"detail":"the visit is open on the relay path","outcome":"ok","step":"live"},{"at_ms":19,"detail":"2 local, 2 from the peer, 0 discovered, 1 probed","outcome":"ok","step":"candidate_exchange"},{"at_ms":19,"detail":"firing in 200 ms","outcome":"ok","step":"start_signal"},{"at_ms":10225,"detail":"0 of 1 candidates answered","outcome":"fail","step":"probe_burst"}],"version":"0.1.0"}
