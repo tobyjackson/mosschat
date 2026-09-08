@@ -34,3 +34,13 @@ Card: 0 PASS, 12 FAIL. Read past the verdicts:
 house-b.jsonl is the callee's view: twelve knocks accepted, eleven
 visits closed by the peer's goodbye, the twelfth (the blackout row) open
 at 827.8 s with nothing after it.
+
+## Addendum: house-b's own records (house-b-diagnostics.jsonl)
+
+Copied off the mini's root diagnostics directory after the run (Toby).
+50 records; the 11 whose relay_open reads "as the responder" are
+house-b's side of the 11 visits. Every one of them: start_signal ok
+"firing in 200 ms", then probe_burst fail "0 of 1 candidates answered".
+Both sides probed; neither was answered. That moves issue 88 from "did
+house-b probe" to "why do the probes not cross two EIM NATs on one
+bridge", which the harness capture phase is for.
