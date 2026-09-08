@@ -144,6 +144,8 @@ mod house {
         house_key: [u8; 32],
         /// A gate member the house has never listed as a friend.
         stranger_seed: [u8; 32],
+        /// A second friend, so a test can hold two visits at once.
+        second_seed: [u8; 32],
         events: Collected,
         house_diagnostics: std::path::PathBuf,
         stop_house: Option<tokio::sync::oneshot::Sender<()>>,
@@ -157,9 +159,11 @@ mod house {
             let community = random_seed();
             let house_seed = random_seed();
             let caller_seed = random_seed();
+            let second_seed = random_seed();
             let stranger_seed = random_seed();
             let house_key = public_key_of(&house_seed);
             let caller_key = public_key_of(&caller_seed);
+            let second_key = public_key_of(&second_seed);
             // A member of the community whose knock this house will not
             // answer: on the gate's list, absent from the house's
             // friends.
@@ -168,7 +172,7 @@ mod house {
             let gate = GateServer::bind(GateServerConfig {
                 community,
                 identity_seed: random_seed(),
-                members: MemberList::from_keys([house_key, caller_key, stranger_key]),
+                members: MemberList::from_keys([house_key, caller_key, second_key, stranger_key]),
                 primary_bind: "127.0.0.1:0".parse().unwrap(),
                 secondary_bind: "127.0.0.1:0".parse().unwrap(),
                 max_registrations: 256,
@@ -187,6 +191,7 @@ mod house {
                 friends: {
                     let friends = Arc::new(InMemoryFriendStore::new());
                     friends.add(caller_key);
+                    friends.add(second_key);
                     friends
                 },
                 no_punch,
@@ -215,6 +220,7 @@ mod house {
                     community,
                     house_key,
                     stranger_seed,
+                    second_seed,
                     events,
                     house_diagnostics,
                     stop_house: Some(stop_house),
@@ -695,6 +701,128 @@ mod house {
 
         connection.close(0u32.into(), b"test over");
         let _ = std::fs::remove_dir_all(&caller_diagnostics);
+        fixture.stop().await;
+    }
+
+    /// Yseult's High on PR 89: a house holding two relayed visits at once
+    /// keeps both of them, and neither doorbell eats the other's pongs.
+    ///
+    /// There is one porch socket per house and one doorbell per visit.
+    /// Before the probe queue was keyed by attempt, each doorbell drained
+    /// the one queue to empty and threw away whatever was not its own, so
+    /// with section 4 now probing every relayed visit twice a second, two
+    /// friends visiting one house took roughly half of each other's
+    /// answers. Three misses is stale, dead is absorbing, and on the relay
+    /// there is no fall back, so a healthy visit was reported dead and then
+    /// stopped being watched at all. Two friends visiting one house is the
+    /// product, not an edge case.
+    ///
+    /// Six seconds is three times the stale deadline and twelve probe
+    /// intervals, so a queue either side was stealing from would have gone
+    /// stale several times over inside it.
+    ///
+    /// Deliberate break to fail this test: in `run_doorbell`, replace
+    /// `porch.try_recv_probe(&attempt)` with a drain of every attempt
+    /// followed by `if probe.attempt != attempt { continue; }`, which is
+    /// the code before this fix. Both visits then miss probes and at least
+    /// one reports `path_stale` well inside the six seconds.
+    #[tokio::test]
+    async fn two_relayed_visits_on_one_house_do_not_eat_each_others_probes() {
+        let (fixture, first_seed) = Fixture::start("twovisits", true).await;
+        let second_seed = fixture.second_seed;
+        let (first, first_connection, first_session) = fixture.call(first_seed).await;
+        let (second, second_connection, second_session) = fixture.call(second_seed).await;
+
+        let mut held = Vec::new();
+        let mut controls = Vec::new();
+        let mut dirs = Vec::new();
+        for (name, caller, connection, session) in [
+            ("twovisits-first", &first, &first_connection, first_session),
+            (
+                "twovisits-second",
+                &second,
+                &second_connection,
+                second_session,
+            ),
+        ] {
+            let diagnostics = diag_dir(name);
+            let control = DoorbellControl::new();
+            held.push(
+                Held {
+                    caller,
+                    connection,
+                    session,
+                    peer_key: fixture.house_key,
+                    hold: Hold::For(Duration::from_secs(7)),
+                    no_punch: true,
+                    control: &control,
+                    diagnostics: &diagnostics,
+                    events: None,
+                    candidates: None,
+                    vouch_peer: true,
+                }
+                .spawn(),
+            );
+            controls.push(control);
+            dirs.push(diagnostics);
+        }
+
+        // Both visits open on the callee, which is the only side that runs
+        // two doorbells against one socket.
+        let opened = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if fixture
+                    .events
+                    .kinds()
+                    .iter()
+                    .filter(|kind| **kind == VisitEventKind::VisitOpen)
+                    .count()
+                    >= 2
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            opened.is_ok(),
+            "both visits must open: {:?}",
+            fixture.events.kinds()
+        );
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        assert!(
+            !fixture.events.kinds().contains(&VisitEventKind::PathStale),
+            "neither of the callee's two visits may go stale while both relays answer: {:?}",
+            fixture.events.kinds()
+        );
+        assert!(
+            !fixture.events.kinds().contains(&VisitEventKind::PathDead),
+            "and certainly neither may be called dead: {:?}",
+            fixture.events.kinds()
+        );
+
+        for handle in held {
+            let record = tokio::time::timeout(Duration::from_secs(20), handle)
+                .await
+                .expect("each hold must end")
+                .unwrap();
+            assert_eq!(
+                record.reason,
+                Reason::PunchDisabled,
+                "a visit nobody interrupted ends on the flag it ran under: {:?}",
+                record.steps
+            );
+        }
+
+        first_connection.close(0u32.into(), b"test over");
+        second_connection.close(0u32.into(), b"test over");
+        for dir in dirs {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        drop(controls);
         fixture.stop().await;
     }
 

@@ -2414,10 +2414,13 @@ pub async fn run_doorbell(
             // is 20 ms rather than the probe interval so a pong is timed
             // at roughly its true round trip rather than rounded up to the
             // next schedule point.
-            while let Some((from, probe)) = porch.try_recv_probe() {
-                if probe.attempt != attempt {
-                    continue;
-                }
+            // Only this attempt's probes: the queue is keyed by attempt
+            // inside the socket, so a house holding two visits at once
+            // never has one doorbell consume the other's pongs (Yseult's
+            // High on PR 89). The attempt filter that used to stand here
+            // discarded them instead, which with section 4 probing every
+            // relayed visit is a false `path_dead` on a healthy path.
+            while let Some((from, probe)) = porch.try_recv_probe(&attempt) {
                 let arrived = Instant::now();
                 match probe.kind {
                     PROBE_PING => {
