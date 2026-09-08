@@ -89,6 +89,26 @@ save_house_log(){
   echo "wrote $dest"
 }
 
+# The same for both roles' section 7 diagnostics records, which are the
+# only place a callee's own view of a visit exists.
+#
+# Run 3 needed exactly this and did not have it: house-b's stdout showed a
+# visit open and then nothing, and the one thing that would have said
+# whether it ever probed -- its own `start_signal` and `probe_burst` steps
+# -- was inside .run, which teardown.sh deletes. Each role gets its own
+# XDG_STATE_HOME (see matrix() and row()) so the two sides' records land in
+# two files rather than interleaved in one.
+save_records(){
+  local role dir dest
+  for role in house-a house-b; do
+    dir="$RUN/state-$role/mosschat/diagnostics"
+    [ -d "$dir" ] || continue
+    dest="$OUT/${DATE_TAG}-$role-records.jsonl"
+    cat "$dir"/*.jsonl > "$dest" 2>/dev/null || continue
+    echo "wrote $dest ($(wc -l < "$dest") records)"
+  done
+}
+
 # Read a fixed identity's public key off a short-lived spike listen
 # (nothing else derives a public key from a seed on the command line).
 pub_of(){
@@ -179,7 +199,8 @@ matrix(){
   local house_no_punch=""
   [ "$relay_only" -eq 1 ] && house_no_punch=" --no-punch"
   say "house-b in its own namespace, headless (log: $RUN/house-b.jsonl)"
-  sh -c "echo \$\$ > $RUN/house-b.pid; exec ip netns exec house-b $MOSSCHAT_BIN house --headless --gate 203.0.113.1:443 --community $COMMUNITY --identity-file $RUN/seeds/$SEEDS.seed --friends $RUN/friends.txt$house_no_punch" >"$RUN/house-b.jsonl" 2>"$RUN/house-b.stderr.log" &
+  mkdir -p "$RUN/state-house-a" "$RUN/state-house-b"
+  sh -c "echo \$\$ > $RUN/house-b.pid; XDG_STATE_HOME=$RUN/state-house-b exec ip netns exec house-b $MOSSCHAT_BIN house --headless --gate 203.0.113.1:443 --community $COMMUNITY --identity-file $RUN/seeds/$SEEDS.seed --friends $RUN/friends.txt$house_no_punch" >"$RUN/house-b.jsonl" 2>"$RUN/house-b.stderr.log" &
 
   local i
   # 50 x 0.2s = 10s, bounded.
@@ -211,9 +232,29 @@ matrix(){
   local DOCTOR=(bash "$H/run-harness.sh" row)
 
   say "doctor smoke run, unshaped, hold 5s"
-  MOSS_HOLD=5 "${DOCTOR[@]}" | tee -a "$f"; local rc="${PIPESTATUS[0]}"
+  local smoke="$RUN/smoke.json"
+  MOSS_HOLD=5 "${DOCTOR[@]}" | tee "$smoke" | tee -a "$f"; local rc="${PIPESTATUS[0]}"
   echo "doctor exit: $rc" | tee -a "$f"
   [ "$rc" -eq 0 ] || { echo "doctor failed unshaped; not running the matrix. gatehouse log:"; cat "$RUN/gatehouse.log"; return 1; }
+
+  # **The smoke run has to prove a direct path, not just exit 0** (run 3,
+  # issue 84). Exit 0 means the visit went live, which a visit that relayed
+  # for its whole hold also did: run 3 relayed all twelve rows, reported
+  # `probe_timeout` in every record, and the matrix called it a pass,
+  # because nothing here ever looked at the path. In normal mode the smoke
+  # run's whole job is to say the lab can punch before 25 minutes are spent
+  # measuring how it degrades, so a relayed smoke run stops here and prints
+  # the record that says so.
+  if [ "$relay_only" -eq 0 ] && ! grep -q '"path":"direct"' "$smoke"; then
+    echo
+    echo "run-harness.sh: the unshaped smoke run never left the relay, so every matrix row"
+    echo "run-harness.sh: would measure fall-back behaviour and none would measure a direct"
+    echo "run-harness.sh: path. Its record:"
+    grep -o '"path":"[^"]*"\|"reason":"[^"]*"\|"failed_step":[^,]*' "$smoke" | sed 's/^/run-harness.sh:   /'
+    echo "run-harness.sh: to run the matrix anyway, set MOSS_ALLOW_RELAY_SMOKE=1."
+    [ "${MOSS_ALLOW_RELAY_SMOKE:-0}" = "1" ] || return 1
+    echo "run-harness.sh: MOSS_ALLOW_RELAY_SMOKE=1, continuing on the relay."
+  fi
 
   say "fault matrix (12 rows, each on its own identity, hold 90s; blackout starts 10s in" \
     "and holds 60s, --row-timeout 240s)"
@@ -229,13 +270,13 @@ row(){
   tag="$(next_seed)" || exit 2
   echo "# identity $tag"
   [ "${MOSS_RELAY_ONLY:-0}" = "1" ] && flags=(--no-punch)
-  exec ip netns exec house-a "$MOSSCHAT_BIN" doctor --gate 203.0.113.1:443 --community "$MOSS_COMMUNITY" --identity-file "$MOSS_RUN/seeds/$tag.seed" --friend "$MOSS_HOUSE_B" --hold "$hold" --json "${flags[@]}"
+  XDG_STATE_HOME="$MOSS_RUN/state-house-a" exec ip netns exec house-a "$MOSSCHAT_BIN" doctor --gate 203.0.113.1:443 --community "$MOSS_COMMUNITY" --identity-file "$MOSS_RUN/seeds/$tag.seed" --friend "$MOSS_HOUSE_B" --hold "$hold" --json "${flags[@]}"
 }
 
 case "${1:-}" in
   row)    row ;;
   nat)    nat_proof eim && nat_proof edm ;;
   matrix) matrix "${2:-}" ;;
-  down)   stop_house; stop_gatehouse; save_house_log; bash "$H/teardown.sh" ;;
+  down)   stop_house; stop_gatehouse; save_house_log; save_records; bash "$H/teardown.sh" ;;
   *)      sed -n 2,8p "$(readlink -f "$0")"; exit 2 ;;
 esac

@@ -260,8 +260,14 @@ pub async fn run(
     let mut visits = tokio::task::JoinSet::new();
     let endpoint = client.endpoint();
 
+    // The gate connection this house's registration hangs off. A house
+    // that loses it is no longer reachable by any friend, however healthy
+    // it looks from the outside, so the loop below watches it.
+    let gate_connection = client.gate_connection();
+
     let shutdown = std::pin::pin!(shutdown);
     let mut shutdown = shutdown;
+    let mut gate_lost: Option<String> = None;
     loop {
         tokio::select! {
             // Biased so a stop is taken before another visit is started:
@@ -269,6 +275,19 @@ pub async fn run(
             // house already on its way out.
             biased;
             () = &mut shutdown => break,
+            // **A house that cannot reach its gate says so and leaves**
+            // (run 3, issue 84). Before this, the gate connection dying
+            // took the registration with it in silence: the reader and
+            // keepalive tasks returned, nothing else noticed, and the
+            // process went on running as a callee no knock could ever
+            // reach. Every later measurement then failed at `introduce`
+            // against a house that was still in the process table. Ordered
+            // after `shutdown` so a house told to stop reports the stop and
+            // not the close its own goodbye caused.
+            error = gate_connection.closed() => {
+                gate_lost = Some(diag::safe_text(&error.to_string()));
+                break;
+            }
             event = gate_events.recv() => {
                 let Some(event) = event else { break };
                 match event {
@@ -341,6 +360,22 @@ pub async fn run(
     })
     .await;
     visits.shutdown().await;
+    if let Some(error) = gate_lost {
+        // Said before the error is returned, and on the same stdout as
+        // every other event, so a harness reading the log sees the death
+        // in the record rather than inferring it from a gap. The goodbye
+        // is not attempted: the connection it would go on is the one that
+        // just ended.
+        emit(
+            &events,
+            VisitEventKind::GateLost,
+            None,
+            format!("the gate connection ended, so this house is no longer reachable: {error}"),
+        );
+        return Err(GateError::Protocol(format!(
+            "the gate connection ended while this house was registered: {error}"
+        )));
+    }
     let _ = client.goodbye(GOODBYE_HOUSE_STOPPING).await;
     Ok(())
 }

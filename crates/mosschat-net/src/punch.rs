@@ -1650,7 +1650,13 @@ enum Phase {
     /// On the relay with nothing under probe: hole punching was switched
     /// off, every candidate was given up, or a dead path's rerun is this
     /// side's to wait for rather than to start.
-    Relayed,
+    ///
+    /// Carrying a [`RelayWatch`], because section 4 is about the path a
+    /// visit is on and a relayed visit is on the relay session. Before
+    /// this, a relayed visit had no liveness at all: it died in silence,
+    /// with no `path_stale`, no `path_dead` and a reason naming whatever
+    /// the upgrade had failed of ten seconds earlier.
+    Relayed(RelayWatch),
 }
 
 /// One upgraded path under section 4's liveness policy.
@@ -1661,6 +1667,50 @@ struct Watch {
     /// it answers rather than to whatever arrived.
     outstanding: Option<[u8; 8]>,
     sent_at: Option<Instant>,
+}
+
+/// The relay session under section 4's liveness, for a visit whose traffic
+/// is on the relay.
+///
+/// The probe is section 2's own 81 byte packet, authenticated under the
+/// same attempt key and answered by the same `pong_for`, addressed to the
+/// peer's synthetic address so [`crate::sock::PorchSocket::send_probe`]
+/// wraps it as a `Relay` payload. Nothing new goes on the wire: the gate
+/// sees one more opaque relay datagram every
+/// [`crate::live::VISIT_PROBE_INTERVAL`], and the peer needs no code it
+/// does not already run, since a ping is answered in every phase.
+///
+/// **Detection, not fall-back.** A direct path that goes stale has
+/// somewhere to go; the relay does not. So this reports, and the visit
+/// ends when its connection does, with a reason that now names the path
+/// death rather than the old probe timeout. What it deliberately does not
+/// do is notice a relay that comes back after `dead`: probing stops there,
+/// and re-establishing a visit across a dead relay is the redial question
+/// of issue 84.
+struct RelayWatch {
+    /// The peer's synthetic address (section 3), which is both what quinn
+    /// addresses this peer at and what a relayed probe is sent to.
+    addr: SocketAddr,
+    liveness: crate::live::PeerLiveness,
+    /// The tx id of the probe in flight, so a pong is matched to the ping
+    /// it answers rather than to whatever arrived.
+    outstanding: Option<[u8; 8]>,
+    sent_at: Option<Instant>,
+}
+
+impl RelayWatch {
+    /// A relay path assumed live at `now`, which is what a visit carrying
+    /// traffic through the gate is.
+    fn new(addr: SocketAddr, recorder: Option<Recorder>, now: Instant) -> Self {
+        let mut liveness = crate::live::PeerLiveness::new(now).with_recorder(recorder);
+        liveness.set_activity(crate::live::Activity::Visit);
+        Self {
+            addr,
+            liveness,
+            outstanding: None,
+            sent_at: None,
+        }
+    }
 }
 
 /// Reads porch frames off `recv` into `queue` until the stream ends.
@@ -1759,6 +1809,12 @@ pub async fn run_doorbell(
     let held = params.hold != Hold::UntilAttemptSettles;
 
     let path = porch.path_for(&params.peer_key);
+    // The address quinn addresses this peer at, which never changes for
+    // the life of the connection (section 3: the end to end connection
+    // never learns the path moved). It is also the address a relayed
+    // liveness probe is sent to, and the source a relayed pong arrives
+    // from.
+    let synthetic = peer.remote_address();
     let gate_addr = gate.gate_connection().remote_address();
     // A relay path's address is the gate's: that is where this house's
     // traffic for this peer actually leaves to while it is relayed. The
@@ -1851,6 +1907,12 @@ pub async fn run_doorbell(
     // must not be reported by the reason of an attempt it recovered from
     // (Yseult's Low 4).
     let mut give_up_reason: Option<Reason>;
+    // Whether the relay session this visit was carried on went dead under
+    // section 4. It outlives an attempt on purpose: it is a fact about the
+    // visit, not about the attempt that happened to be running, and it is
+    // what makes the record's reason name what ended the visit rather than
+    // what the upgrade had failed of earlier.
+    let mut relay_dead = false;
     let mut attempts = 0u32;
 
     'attempts: loop {
@@ -2005,7 +2067,11 @@ pub async fn run_doorbell(
                 ),
             );
             give_up_reason = Some(Reason::PunchDisabled);
-            phase = Phase::Relayed;
+            phase = Phase::Relayed(RelayWatch::new(
+                synthetic,
+                params.recorder.clone(),
+                Instant::now(),
+            ));
         } else if state.candidate_count() == 0 {
             // Nothing to probe: the attempt stays on the relay for good,
             // and section 7's `no_candidates` says why.
@@ -2020,7 +2086,7 @@ pub async fn run_doorbell(
         // Step 4. Either side may ask; the initiator does, so exactly one
         // request is sent for the ordinary case and the 4 per session
         // budget is not spent on a race.
-        if !matches!(phase, Phase::Relayed)
+        if !matches!(phase, Phase::Relayed(_))
             && initiator
             && let Err(e) = gate.request_start(params.session).await
         {
@@ -2030,9 +2096,13 @@ pub async fn run_doorbell(
                 return Err(e);
             }
             give_up_reason = Some(Reason::Internal);
-            phase = Phase::Relayed;
+            phase = Phase::Relayed(RelayWatch::new(
+                synthetic,
+                params.recorder.clone(),
+                Instant::now(),
+            ));
         }
-        if !matches!(phase, Phase::Relayed) {
+        if !matches!(phase, Phase::Relayed(_)) {
             match gate
                 .await_start(params.session, Duration::from_secs(10))
                 .await
@@ -2067,7 +2137,11 @@ pub async fn run_doorbell(
                         return Err(e);
                     }
                     give_up_reason = Some(Reason::Internal);
-                    phase = Phase::Relayed;
+                    phase = Phase::Relayed(RelayWatch::new(
+                        synthetic,
+                        params.recorder.clone(),
+                        Instant::now(),
+                    ));
                 }
             }
         }
@@ -2120,6 +2194,7 @@ pub async fn run_doorbell(
                     &state,
                     rec,
                     outcome.upgraded_to.is_some() || outcome.fell_back,
+                    relay_dead,
                 );
                 finish_visit(rec, &rtt, path.as_ref(), reason);
                 return Ok(outcome);
@@ -2167,7 +2242,11 @@ pub async fn run_doorbell(
                         // the length of a hold is a burst nobody asked
                         // for.
                         give_up_reason = Some(reason);
-                        phase = Phase::Relayed;
+                        phase = Phase::Relayed(RelayWatch::new(
+                            synthetic,
+                            params.recorder.clone(),
+                            now,
+                        ));
                     }
                 }
                 Phase::Watching(watch) => {
@@ -2260,12 +2339,75 @@ pub async fn run_doorbell(
                                 // end it.
                                 continue 'attempts;
                             }
-                            phase = Phase::Relayed;
+                            phase = Phase::Relayed(RelayWatch::new(
+                                synthetic,
+                                params.recorder.clone(),
+                                now,
+                            ));
                         }
                         None => {}
                     }
                 }
-                Phase::Relayed => {}
+                Phase::Relayed(watch) => {
+                    // Section 4 on the relay session. The probe goes to the
+                    // peer's synthetic address, so the porch socket wraps
+                    // it as a `Relay` payload and the gate forwards it
+                    // opaquely; the peer answers it in whatever phase it is
+                    // in, because a ping is always answered.
+                    if watch.liveness.due_probe(now) {
+                        let mut tx = [0u8; 8];
+                        rand::rng().fill(&mut tx);
+                        let ping = Probe {
+                            kind: PROBE_PING,
+                            attempt,
+                            tx,
+                            observed: Addr::default(),
+                        };
+                        let _ = porch.send_probe(watch.addr, &ping.encode(&key));
+                        watch.outstanding = Some(tx);
+                        watch.sent_at = Some(now);
+                    }
+                    match watch.liveness.poll(now) {
+                        Some(crate::live::LivenessChange::WentStale) => {
+                            let probes = crate::live::PROBES_TO_STALE;
+                            emit(
+                                rec,
+                                sink,
+                                diag::VisitEventKind::PathStale,
+                                format!(
+                                    "{probes} consecutive probes unanswered on the relay \
+                                     through {gate_addr}"
+                                ),
+                            );
+                        }
+                        Some(crate::live::LivenessChange::WentDead) => {
+                            // Reported once per watch: `PeerLiveness::poll`
+                            // returns each transition exactly once and a
+                            // dead path is never probed again.
+                            relay_dead = true;
+                            emit(
+                                rec,
+                                sink,
+                                diag::VisitEventKind::PathDead,
+                                format!(
+                                    "the stale grace elapsed with no answer over the relay \
+                                     through {gate_addr}"
+                                ),
+                            );
+                            // A one-shot run has nothing left to wait for:
+                            // the path it was on is gone and there is no
+                            // other. A held visit stays, because its
+                            // connection may still close with something
+                            // more to say and the record is written once.
+                            if !held {
+                                record_relay_counters(rec, path.as_ref());
+                                settle(rec, Reason::PathIdleTimeout);
+                                return Ok(outcome);
+                            }
+                        }
+                        None => {}
+                    }
+                }
             }
 
             // Drain whatever has arrived, then wait a short tick. The tick
@@ -2318,7 +2460,27 @@ pub async fn run_doorbell(
                         Phase::Probing => {
                             state.on_pong(from, &probe, arrived);
                         }
-                        Phase::Relayed => {}
+                        Phase::Relayed(watch) => {
+                            // The relay path's own pong, matched the same
+                            // way a direct path's is: the source must be
+                            // the path being watched, which for a relayed
+                            // visit is the peer's synthetic address.
+                            if from == watch.addr && watch.outstanding == Some(probe.tx) {
+                                if let Some(sent) = watch.sent_at {
+                                    // Fed to the liveness only, never to
+                                    // `rtt`: section 7's `rtt_source` says
+                                    // `probe` for a direct path measured by
+                                    // its own probes and `quic` for a
+                                    // relayed visit, and quietly changing
+                                    // what a shipped measurement means is
+                                    // not this fix's to do.
+                                    watch
+                                        .liveness
+                                        .on_pong(arrived, arrived.duration_since(sent));
+                                }
+                                watch.outstanding = None;
+                            }
+                        }
                     },
                 }
             }
@@ -2510,7 +2672,11 @@ pub async fn run_doorbell(
                             note_superseded_path(rec, sink, &phase, path.as_ref());
                             continue 'attempts;
                         }
-                        phase = Phase::Relayed;
+                        phase = Phase::Relayed(RelayWatch::new(
+                            synthetic,
+                            params.recorder.clone(),
+                            Instant::now(),
+                        ));
                     }
                     Ok(PorchFrame::PathUp { .. } | PorchFrame::PathDown { .. }) => {}
                     Err(_) => {
@@ -2545,6 +2711,7 @@ pub async fn run_doorbell(
                             &state,
                             rec,
                             outcome.upgraded_to.is_some() || outcome.fell_back,
+                            relay_dead,
                         )
                     } else {
                         Reason::Internal
@@ -2618,7 +2785,15 @@ fn end_of_visit_reason(
     state: &Attempt,
     recorder: Option<&Recorder>,
     ever_upgraded: bool,
+    relay_dead: bool,
 ) -> Reason {
+    // What ended the visit outranks why it never upgraded. A relayed visit
+    // whose relay went dead under section 4 ended because its path did,
+    // and saying `probe_timeout` there reports a failure that happened ten
+    // seconds into a ninety second visit as the cause of its death.
+    if relay_dead {
+        return Reason::PathIdleTimeout;
+    }
     if params.no_punch {
         return Reason::PunchDisabled;
     }
@@ -3581,27 +3756,67 @@ mod tests {
         // Never upgraded, nothing to probe: the same answer the give-up
         // branch gives, whichever of them the hold beat.
         assert_eq!(
-            end_of_visit_reason(&params(false), None, Some(&relayed), &empty, None, false),
+            end_of_visit_reason(
+                &params(false),
+                None,
+                Some(&relayed),
+                &empty,
+                None,
+                false,
+                false
+            ),
             Reason::NoCandidates
         );
         // Never upgraded, candidates that never answered.
         assert_eq!(
-            end_of_visit_reason(&params(false), None, Some(&relayed), &probed, None, false),
+            end_of_visit_reason(
+                &params(false),
+                None,
+                Some(&relayed),
+                &probed,
+                None,
+                false,
+                false
+            ),
             Reason::ProbeTimeout
         );
         // Upgraded and lost: this is what `path_idle_timeout` means.
         assert_eq!(
-            end_of_visit_reason(&params(false), None, Some(&relayed), &probed, None, true),
+            end_of_visit_reason(
+                &params(false),
+                None,
+                Some(&relayed),
+                &probed,
+                None,
+                true,
+                false
+            ),
             Reason::PathIdleTimeout
         );
         // Upgraded and still there.
         assert_eq!(
-            end_of_visit_reason(&params(false), None, Some(&direct), &probed, None, true),
+            end_of_visit_reason(
+                &params(false),
+                None,
+                Some(&direct),
+                &probed,
+                None,
+                true,
+                false
+            ),
             Reason::Ok
         );
         // Told not to punch, whatever else happened.
         assert_eq!(
-            end_of_visit_reason(&params(true), None, Some(&relayed), &empty, None, false),
+            end_of_visit_reason(
+                &params(true),
+                None,
+                Some(&relayed),
+                &empty,
+                None,
+                false,
+                false
+            ),
             Reason::PunchDisabled
         );
         // A reason a give-up already named wins over the inference.
@@ -3612,9 +3827,54 @@ mod tests {
                 Some(&relayed),
                 &probed,
                 None,
+                false,
                 false
             ),
             Reason::HairpinFailure
+        );
+        // A relay that died under section 4 outranks every one of them:
+        // what ended the visit is not what it failed to upgrade to.
+        //
+        // Deliberate break to fail this: move the `if relay_dead` early
+        // return in `end_of_visit_reason` below the `give_up_reason`
+        // branch. The last two assertions then read back `punch_disabled`
+        // and `hairpin_failure`, which is exactly the run 3 record that
+        // reported `probe_timeout` for a visit killed by a blackout.
+        assert_eq!(
+            end_of_visit_reason(
+                &params(false),
+                None,
+                Some(&relayed),
+                &probed,
+                None,
+                false,
+                true
+            ),
+            Reason::PathIdleTimeout
+        );
+        assert_eq!(
+            end_of_visit_reason(
+                &params(true),
+                None,
+                Some(&relayed),
+                &empty,
+                None,
+                false,
+                true
+            ),
+            Reason::PathIdleTimeout
+        );
+        assert_eq!(
+            end_of_visit_reason(
+                &params(false),
+                Some(Reason::HairpinFailure),
+                Some(&relayed),
+                &probed,
+                None,
+                false,
+                true
+            ),
+            Reason::PathIdleTimeout
         );
     }
 

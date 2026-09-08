@@ -342,6 +342,12 @@ the reason section 3 gives.
   loss that is a 1 in 8000 false alarm, and at 500 ms it lands in about 1.5 s. Stale means stop sending on that path,
   move traffic to the relay at once, keep probing. **Dead** is stale plus a grace of `4 * srtt + 5 s` at one probe per
   second (Reticulum's shape): drop the path, rerun the doorbell.
+- **On the relay path too** (amendment 5). Everything above is written about a direct path, and a relayed visit had no
+  liveness at all until this: it died in silence. The same probe, the same three-unanswered rule and the same grace now
+  run against the relay session, the probe going to the peer's synthetic address so the porch socket wraps it as a
+  `Relay` payload. The one difference is what stale means, because there is nowhere to move to: on the relay, stale and
+  dead are reported and nothing else happens, and the visit ends when its connection does, with `path_idle_timeout` as
+  its reason.
 - **Goodbye.** Frame 19 to the peer, frame 11 to the gate. The receiver marks dead at once and skips stale, and each
   friend's last seen records which of the two it was (D8).
 - **Local address change** is the fast path for case (f): the interface list is polled every 1 s and a send error
@@ -598,6 +604,25 @@ against the bullet above it that was wrong or thin.
 - **`Hold::For` is clamped at a day**, and `doctor` refuses a longer `--hold` at the command line before any network work. An
   unbounded value overflowed the deadline arithmetic and panicked after the visit was already open, in a crate that forbids
   panics, or degraded into "hold forever" through a `checked_add` that quietly returned `None`.
+
+**Amendment 5, 2026-09-08: section 4 covers the relay path, and a house says when it loses its gate** (run 3 of the
+WO-1.6 harness, issue 84, Konrad). Two silences, both found by reading a matrix that ran to completion and reported
+nothing.
+
+- **A relayed visit had no liveness.** Section 4 is written about a direct path, and the doorbell ran it only after an
+  upgrade; a visit that stayed on the relay was watched by nothing. Run 3's `blackout-60s` row is what that looks like:
+  the visit died inside the blackout and neither side recorded `path_stale`, `path_dead` or a goodbye, and the record's
+  `reason` said `probe_timeout`, which was true of an upgrade that had failed 35 seconds earlier and false of what
+  ended the visit. The relay path now carries the same section 4 policy, as the bullet in that section says, and the
+  record's `reason` names the path death ahead of whatever the attempt had given up on. What this deliberately does not
+  do is notice a relay that comes back after `dead`: probing stops there, and re-establishing a visit across a dead
+  relay is the redial question issue 84 asks.
+- **A house that lost its gate said nothing and kept running.** When the gate connection hit its idle timeout the
+  reader and keepalive tasks returned and nothing else noticed, so the process went on as a callee no knock could
+  reach: in run 3 the two rows after the blackout both failed at `introduce` against a house that was still in the
+  process table. `gate_lost` is an eleventh name in section 7's event vocabulary, house stdout only for the same reason
+  `registered` is, and a house that emits it exits non-zero so a harness row cannot keep measuring against a callee
+  that is gone. Redialling instead of leaving is the separate decision, and it is not taken here.
 - **A role may print its own public key when it starts**, which section 7's redaction paragraph now says in as many
   words. A house's first line names its own key in full, because a friend needs it to knock and nothing else prints it,
   and the argument for that was in a code comment where the rule it bends is in this document. The house prints the same

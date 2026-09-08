@@ -567,6 +567,23 @@ impl PorchSocket {
             routes.by_session.get(&session).copied()
         };
         let Some(addr) = addr else { return };
+        // Section 3's split, applied to the relay leg as well as the wire:
+        // a probe is not a QUIC packet, and handing one to quinn would put
+        // 81 bytes of nothing into a connection that has no idea what it
+        // is. The discriminator is unambiguous here for the same reason it
+        // is on the wire (`is_probe`), since what a relay carries for this
+        // peer is that same end to end connection's packets. The source is
+        // the synthetic address, which is what the relay path's own
+        // liveness probes are addressed to and therefore what a pong from
+        // one must compare equal to.
+        if is_probe(payload)
+            && let Some(segment) = payload.get(..PROBE_LEN)
+        {
+            let mut probe = [0u8; PROBE_LEN];
+            probe.copy_from_slice(segment);
+            self.queue_probes(addr, &[probe]);
+            return;
+        }
         let pushed = {
             let mut queue = self.inbound_synthetic.lock_or_recover();
             if queue.len() >= INBOUND_RELAY_QUEUE_CAP {
@@ -743,6 +760,18 @@ impl PorchSocket {
     /// [`io::ErrorKind::WouldBlock`] if the socket is not writable; a probe
     /// is cheap and repeated every 100 ms, so a caller may simply drop it.
     pub fn send_probe(&self, to: SocketAddr, probe: &[u8; PROBE_LEN]) -> io::Result<()> {
+        // Section 4 applies to whichever path is carrying the visit, and a
+        // relayed visit's path is the relay session. A probe addressed to
+        // the peer's synthetic address is therefore wrapped as a `Relay`
+        // payload and shaped like any other relayed datagram rather than
+        // written to the wire, where a ULA that names nothing would go
+        // nowhere. There is no ambiguity to resolve: a synthetic address is
+        // a `fd00::/8` address this house invented and can never be a
+        // candidate, so a real candidate probe still takes the branch
+        // below.
+        if let Some(session) = self.relay_session_for(to) {
+            return self.send_probe_relayed(session, to, probe);
+        }
         let transmit = Transmit {
             destination: self.map_destination(to),
             ecn: None,
@@ -753,6 +782,49 @@ impl PorchSocket {
         self.udp.try_io(Interest::WRITABLE, || {
             self.state.send((&self.udp).into(), &transmit)
         })
+    }
+
+    /// The relay session registered for `synthetic_peer`, if that address
+    /// is one.
+    fn relay_session_for(&self, synthetic_peer: SocketAddr) -> Option<u32> {
+        self.relay
+            .lock_or_recover()
+            .by_synthetic
+            .get(&synthetic_peer)
+            .copied()
+    }
+
+    /// Sends one probe through `session`'s shaped queue.
+    ///
+    /// The same queue every relayed QUIC packet for this peer goes through,
+    /// so a relay probe is delayed and counted exactly as the traffic it is
+    /// measuring is, which is the only way its round trip means anything.
+    /// No gate-attached check, unlike [`PorchSocket::try_send`]'s relay
+    /// branch: that one exists so quinn gets a hard error to back off on,
+    /// while `register_relay_session` already documents that registering a
+    /// session and attaching a gate may happen in either order and that the
+    /// drain task starts with whichever arrives second. A probe queued
+    /// before a gate attaches therefore leaves when one does, and the only
+    /// caller is a visit already carrying its traffic through that gate.
+    fn send_probe_relayed(
+        &self,
+        session: u32,
+        synthetic_peer: SocketAddr,
+        probe: &[u8; PROBE_LEN],
+    ) -> io::Result<()> {
+        let payload = encode_relay(session, probe).map_err(|e| io::Error::other(e.to_string()))?;
+        let Some(shaper) = self.shaper_for(synthetic_peer) else {
+            return Err(io::Error::other(
+                "no path table entry for a registered relay session",
+            ));
+        };
+        match shaper.enqueue_or_drop(payload) {
+            Enqueued::Accepted => Ok(()),
+            // A probe is cheap and repeated, so a full queue drops this one
+            // rather than blocking: the caller documents exactly that.
+            Enqueued::Full => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            Enqueued::Closed => Err(io::Error::other("relay session closed")),
+        }
     }
 
     /// Takes the next probe lifted out of the inbound stream, if one is
@@ -1445,6 +1517,88 @@ mod tests {
         let queue = socket.inbound_synthetic.lock_or_recover();
         assert_eq!(queue.len(), INBOUND_RELAY_QUEUE_CAP);
         assert_eq!(queue.front().unwrap().1, vec![0u8]);
+    }
+
+    /// Section 4 reaches the relay path: a probe addressed to a registered
+    /// relay session's synthetic address is wrapped as a `Relay` payload
+    /// and put on that session's shaped queue, not written to the wire
+    /// where a `fd00::/8` address that names nothing would go nowhere.
+    ///
+    /// Deliberate break to fail this test: delete the `relay_session_for`
+    /// branch from `send_probe`, which is exactly the code before this fix.
+    /// The probe then takes the raw-socket path, the shaper stays empty,
+    /// and the length assertion below fails. That is the bug: a relayed
+    /// visit could not be probed at all, so it had no liveness and died in
+    /// silence.
+    #[test]
+    fn a_probe_to_a_synthetic_address_goes_through_the_relay_not_the_wire() {
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let socket = PorchSocket::new(std_socket).unwrap();
+        let synthetic = synthetic_addr([1, 2, 3, 4, 5], &[9u8; 32]);
+        socket.register_relay_session(7, synthetic);
+        let shaper = socket.shaper_for(synthetic).unwrap();
+        assert_eq!(shaper.len(), 0);
+
+        let probe = Probe {
+            kind: crate::punch::PROBE_PING,
+            attempt: [3u8; 16],
+            tx: [4u8; 8],
+            observed: crate::gate::wire::Addr::default(),
+        }
+        .encode(&[5u8; 32]);
+
+        // Queued on the peer's own shaper, one relayed datagram like any
+        // other, and nothing was written to the real socket.
+        assert!(socket.send_probe(synthetic, &probe).is_ok());
+        assert_eq!(shaper.len(), 1);
+
+        // A real address still takes the wire, which is the branch the
+        // doorbell's candidate burst uses: whether the send itself
+        // succeeds is the reactor's business, but it must not have gone
+        // anywhere near this peer's relay queue.
+        let elsewhere: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let _ = socket.send_probe(elsewhere, &probe);
+        assert_eq!(shaper.len(), 1);
+    }
+
+    /// The receive half of the same split: a probe arriving over the relay
+    /// is lifted into the probe queue with the synthetic address as its
+    /// source, never handed to quinn, which has no idea what an 81 byte
+    /// non-QUIC packet is.
+    ///
+    /// Deliberate break to fail this test: delete the `is_probe` branch
+    /// from `deliver_synthetic`. The probe then lands in
+    /// `inbound_synthetic` and the two assertions below swap.
+    #[test]
+    fn a_probe_arriving_over_the_relay_is_lifted_into_the_probe_queue() {
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let socket = PorchSocket::new(std_socket).unwrap();
+        let synthetic = synthetic_addr([1, 2, 3, 4, 5], &[9u8; 32]);
+        socket.register_relay_session(7, synthetic);
+        let key = [5u8; 32];
+        socket.arm_probe_key([3u8; 16], key);
+
+        let probe = Probe {
+            kind: crate::punch::PROBE_PONG,
+            attempt: [3u8; 16],
+            tx: [4u8; 8],
+            observed: crate::gate::wire::Addr::default(),
+        }
+        .encode(&key);
+        socket.deliver_synthetic(7, &probe);
+
+        assert_eq!(socket.inbound_synthetic.lock_or_recover().len(), 0);
+        let (from, received) = socket.try_recv_probe().expect("the probe was queued");
+        assert_eq!(from, synthetic);
+        assert_eq!(received.tx, [4u8; 8]);
+
+        // A relayed QUIC packet still goes where it always went.
+        socket.deliver_synthetic(7, &[0x40u8; 32]);
+        assert_eq!(socket.inbound_synthetic.lock_or_recover().len(), 1);
     }
 
     /// Section 3's per-packet gate-address check, the leaving half: an

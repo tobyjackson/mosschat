@@ -539,6 +539,107 @@ mod house {
         fixture.stop().await;
     }
 
+    /// Run 3, finding 1 of issue 84: section 4 covers the relay path, so a
+    /// relayed visit whose peer stops answering is reported as
+    /// `path_stale` then `path_dead` and settles with a reason that names
+    /// the path death, instead of dying in silence under whatever the
+    /// upgrade had failed of earlier.
+    ///
+    /// Both ends run `--no-punch`, which is the shortest way to a visit
+    /// that is relayed for its whole life, and the caller then stops
+    /// answering probes, which is what a blackout looks like from the
+    /// house's end. The house's probes go to the caller's synthetic
+    /// address, so they travel as `Relay` payloads through the real gate:
+    /// nothing here is simulated but the silence.
+    ///
+    /// Deliberate break to fail this test: change `Phase::Relayed`'s arm
+    /// in `run_doorbell` back to `Phase::Relayed => {}`, which is the code
+    /// this fixes. The house then sends no relay probe, never goes stale
+    /// or dead, and both event assertions below fail on a visit that ran
+    /// for a minute with nothing to say. Second break: move the
+    /// `if relay_dead` early return in `end_of_visit_reason` below the
+    /// `no_punch` branch, and the reason assertion reads `punch_disabled`.
+    #[tokio::test]
+    async fn a_relayed_visit_that_goes_quiet_is_reported_stale_then_dead() {
+        let (fixture, caller_seed) = Fixture::start("relaydead", true).await;
+        let (caller, connection, session) = fixture.call(caller_seed).await;
+
+        let caller_diagnostics = diag_dir("relaydead-caller");
+        let control = DoorbellControl::new();
+        let held = Held {
+            caller: &caller,
+            connection: &connection,
+            session,
+            peer_key: fixture.house_key,
+            hold: Hold::For(Duration::from_secs(60)),
+            no_punch: true,
+            control: &control,
+            diagnostics: &caller_diagnostics,
+            events: None,
+            candidates: None,
+            vouch_peer: true,
+        }
+        .spawn();
+
+        fixture
+            .events
+            .wait_for(VisitEventKind::VisitOpen, Duration::from_secs(10))
+            .await
+            .expect("the visit must open on the relay");
+
+        // The blackout: the caller's porch stops answering, so the house's
+        // relay probes go out and nothing comes back.
+        control.stop_answering_probes();
+
+        let stale = fixture
+            .events
+            .wait_for(VisitEventKind::PathStale, Duration::from_secs(15))
+            .await
+            .expect("section 4 must notice a relay that stopped answering");
+        assert!(
+            stale.detail.contains("relay"),
+            "the event names the path that went quiet: {}",
+            stale.detail
+        );
+        let dead = fixture
+            .events
+            .wait_for(VisitEventKind::PathDead, Duration::from_secs(30))
+            .await
+            .expect("a relay that never answers again is dead, not merely stale");
+        assert!(
+            dead.detail.contains("relay"),
+            "the event names the path that died: {}",
+            dead.detail
+        );
+
+        // The house's own record for this visit, once its peer hangs up:
+        // the reason names what ended it.
+        connection.close(0u32.into(), b"blackout over");
+        let house_record = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(record) = records_in(&fixture.house_diagnostics)
+                    .into_iter()
+                    .find(|record| record.reason != Reason::Internal)
+                {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the house must settle its record once the visit ends");
+        assert_eq!(
+            house_record.reason,
+            Reason::PathIdleTimeout,
+            "the reason names the path death, not the upgrade that was never asked for: {:?}",
+            house_record.steps
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(10), held).await;
+        let _ = std::fs::remove_dir_all(&caller_diagnostics);
+        fixture.stop().await;
+    }
+
     /// Yseult's uncovered case: a knock from a member of the community
     /// who is not on this house's friend list produces nothing at all.
     ///
