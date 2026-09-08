@@ -138,7 +138,15 @@ pub mod limits {
     pub const START_FIRE_IN_MS: u16 = 200;
     /// `Register`: 4 connection attempts per key per minute.
     pub const REGISTER_ATTEMPTS_PER_MINUTE: u32 = 4;
-    /// `Relay`: 2000 datagrams and 3 MiB/s per session each way.
+    /// `Relay`: 2000 datagrams per session each way, and no byte rate
+    /// beside it (amended section 1).
+    ///
+    /// This is a *shaper* rate, not a policer's: it is the rate the house
+    /// side queue of `crate::path::HOUSE_RELAY_QUEUE_DEPTH` drains at, and
+    /// the gate drains 10 percent over it. It used to say "and 3 MiB/s per
+    /// session each way": no per-second byte limiter exists or ever did,
+    /// and 2000 x 1200 is 2.29 MiB/s, so 3 MiB/s was unreachable anyway.
+    /// The only byte ceiling is [`RELAY_BYTES_PER_HOUR`].
     pub const RELAY_DATAGRAMS_PER_SECOND: u32 = 2000;
     /// `Relay`: 2 GiB per session per hour then `cap_exceeded`.
     pub const RELAY_BYTES_PER_HOUR: u64 = 2 * 1024 * 1024 * 1024;

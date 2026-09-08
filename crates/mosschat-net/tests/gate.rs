@@ -14,6 +14,7 @@
 mod gate {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use mosschat_net::authed;
@@ -258,6 +259,124 @@ mod gate {
 
         assert_eq!(received.len(), payload_len);
         assert_eq!(blake3::hash(&received), expected_hash);
+
+        // WO-1.3c's mechanism proof, asserted here so CI enforces it on
+        // every run rather than only when someone reads a counter by hand
+        // (amended section 1 and section 8). A relay that stayed inside its
+        // shaper carries 10 MiB with nothing policed, nothing dropped on a
+        // full queue and no `WouldBlock` refusal reaching quinn: the
+        // back-pressure a full house queue applies is `poll_writable`
+        // staying `Pending` until the next drain, and a `WouldBlock` out of
+        // `try_send` is the last resort that clears write readiness
+        // endpoint-wide.
+        let gate_shaper = server.relay_shaper_stats();
+        let alice_shaper = alice.porch().relay_stats();
+        let bob_shaper = bob.porch().relay_stats();
+        println!(
+            "relay shaper: gate queued={} p50={}us max={}us dropped_at_full={} rate_limited={}; \
+             alice queued={} p50={}us max={}us backpressure={}; \
+             bob queued={} p50={}us max={}us backpressure={}",
+            gate_shaper.relay_queued,
+            gate_shaper.relay_shaped_delay_p50_us,
+            gate_shaper.relay_shaped_delay_max_us,
+            server
+                .counters()
+                .relay_dropped_at_full
+                .load(Ordering::Relaxed),
+            server.counters().relay_rate_limited.load(Ordering::Relaxed),
+            alice_shaper.relay_queued,
+            alice_shaper.relay_shaped_delay_p50_us,
+            alice_shaper.relay_shaped_delay_max_us,
+            alice_shaper.relay_socket_backpressure,
+            bob_shaper.relay_queued,
+            bob_shaper.relay_shaped_delay_p50_us,
+            bob_shaper.relay_shaped_delay_max_us,
+            bob_shaper.relay_socket_backpressure,
+        );
+        assert_eq!(
+            server.counters().relay_rate_limited.load(Ordering::Relaxed),
+            0,
+            "the relay is shaped, not policed: nothing may be refused for rate"
+        );
+        assert_eq!(
+            server
+                .counters()
+                .relay_dropped_at_full
+                .load(Ordering::Relaxed),
+            0,
+            "a shaping house never fills the gate's 24 deep queue"
+        );
+        assert_eq!(
+            alice_shaper.relay_socket_backpressure, 0,
+            "a full house queue must reach quinn as Pending, never as WouldBlock"
+        );
+        assert_eq!(
+            bob_shaper.relay_socket_backpressure, 0,
+            "a full house queue must reach quinn as Pending, never as WouldBlock"
+        );
+        assert_eq!(
+            alice_shaper.relay_dropped_at_full, 0,
+            "the house side queue never drops"
+        );
+        assert_eq!(
+            bob_shaper.relay_dropped_at_full, 0,
+            "the house side queue never drops"
+        );
+        // 10 MiB is about 9119 datagrams at roughly 1150 stream bytes per
+        // 1200 byte packet (section 1); the gate having queued that many
+        // is what "forwards as many relay datagrams as it takes" means
+        // here, and it fails if a policer ate a share of them again.
+        assert!(
+            gate_shaper.relay_queued >= 9000,
+            "the gate forwarded only {} relay datagrams for a 10 MiB transfer",
+            gate_shaper.relay_queued
+        );
+    }
+
+    /// Section 3's per-packet gate-address check: an address enters the
+    /// live gate-address set at its connection's registration and leaves it
+    /// when that connection closes. This is the leaving half, against a
+    /// real gate connection; the drop and the count it causes are asserted
+    /// on the receive path itself in
+    /// `sock::tests::a_datagram_from_a_closed_gate_connections_address_is_dropped_and_counted`.
+    ///
+    /// Deliberate break to fail this test: delete the
+    /// `this.detach_gate(gate_addr)` call from `sock.rs::attach_gate`'s
+    /// reader task. The address then stays in the set forever and the wait
+    /// below times out.
+    #[tokio::test]
+    async fn a_closed_gate_connections_address_leaves_the_live_set() {
+        let community = random_seed();
+        let house_seed = random_seed();
+        let server = start_gate(&[public_key_of(&house_seed)], community, 256);
+
+        let house = connect_client(
+            &server,
+            house_seed,
+            community,
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await
+        .unwrap();
+
+        let gate_addr = server.primary_addr();
+        let porch = house.porch();
+        assert!(
+            porch.is_source_allowed(gate_addr),
+            "a registered gate's address is admitted"
+        );
+
+        house.gate_connection().close(0u32.into(), b"done");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while porch.is_source_allowed(gate_addr) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !porch.is_source_allowed(gate_addr),
+            "a closed gate connection's address must leave the live set"
+        );
     }
 
     // ------------------------------------------------------------------

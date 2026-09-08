@@ -1,0 +1,61 @@
+WO-1.3c relay shaper: 20 runs of relay_path_carries_10_mib_unchanged
+====================================================================
+
+What this is. The mechanism proof section 8's WO-1.3c asks for: 20 runs of
+`gate::relay_path_carries_10_mib_unchanged`, one at a time, each under 15 s
+of wall clock, and at the end of every run `relay_rate_limited`,
+`relay_dropped_at_full` and `relay_socket_backpressure` all 0. The counter
+assertions are in the test itself, so CI enforces them; this file is the
+wall clock record, which CI does not keep.
+
+When and where. 2026-09-08, finishing at 06:32 local time, timezone
+MDT (UTC-6), on a MacBook (Darwin 25.6.0 arm64), branch
+phase-1/wo-1.3c-shaper at the commit this file lands in. Nothing else
+running: no other build, no other test, no synthetic load.
+
+How. `cargo test -p mosschat-net --test gate --no-run` first, then the
+already-built harness invoked directly 20 times in sequence, each as
+`nice -n 10 target/debug/deps/gate-<hash> --exact
+gate::relay_path_carries_10_mib_unchanged --nocapture --test-threads 1`.
+The time is wall clock around the whole process, measured with a monotonic
+clock in the driver, so it includes process start and teardown as well as
+the test body. Compilation is not in it, and neither is any other test in
+the file.
+
+Result. 20 of 20 passed. Min 5.00 s, median 5.00 s, max 5.12 s, against
+the 15 s ceiling and against the 120.96 s, 124.02 s and 126.31 s wedges
+this test produced on `main` and on macOS CI before the shaper. Every run
+ended with the gate's `relay_rate_limited` and `relay_dropped_at_full` at
+0 and both houses' `relay_socket_backpressure` at 0.
+
+Reading the counter line. `gate queued` is both directions of the session
+as the gate saw them; `alice` is the 10 MiB sender and `bob` the receiver,
+each reporting its own house side egress queue. Alice's p50 of about
+49.9 ms is the shaper working as section 1 describes rather than a fault:
+a bulk sender fills its 100 deep queue, 100 datagrams at 2000 a second is
+50 ms, and every datagram then waits the depth of the queue. The gate's
+p50 of 4 to 8 microseconds is the other half of the same picture: a house
+that paces at 2000 a second never builds a queue at a gate draining at
+2200.
+
+run  wall     result  counters
+ 1    5.00s  pass  relay shaper: gate queued=12310 p50=5us max=631us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49933us max=51768us backpressure=0; bob queued=3328 p50=8us max=171us backpressure=0
+ 2    5.00s  pass  relay shaper: gate queued=12159 p50=4us max=442us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49954us max=52042us backpressure=0; bob queued=3177 p50=9us max=166us backpressure=0
+ 3    5.00s  pass  relay shaper: gate queued=12376 p50=4us max=471us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49932us max=52064us backpressure=0; bob queued=3393 p50=8us max=206us backpressure=0
+ 4    5.00s  pass  relay shaper: gate queued=11960 p50=8us max=561us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49942us max=51902us backpressure=0; bob queued=2978 p50=9us max=207us backpressure=0
+ 5    5.00s  pass  relay shaper: gate queued=12045 p50=5us max=455us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49951us max=51968us backpressure=0; bob queued=3063 p50=9us max=207us backpressure=0
+ 6    5.00s  pass  relay shaper: gate queued=12284 p50=5us max=480us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49922us max=51663us backpressure=0; bob queued=3301 p50=9us max=251us backpressure=0
+ 7    5.00s  pass  relay shaper: gate queued=12230 p50=5us max=440us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49929us max=52094us backpressure=0; bob queued=3248 p50=9us max=203us backpressure=0
+ 8    5.00s  pass  relay shaper: gate queued=12180 p50=5us max=481us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49920us max=51804us backpressure=0; bob queued=3198 p50=9us max=185us backpressure=0
+ 9    5.01s  pass  relay shaper: gate queued=12271 p50=5us max=471us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49932us max=51707us backpressure=0; bob queued=3289 p50=9us max=164us backpressure=0
+10    5.01s  pass  relay shaper: gate queued=12274 p50=5us max=476us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49931us max=51735us backpressure=0; bob queued=3291 p50=9us max=174us backpressure=0
+11    5.00s  pass  relay shaper: gate queued=12037 p50=4us max=464us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49927us max=51995us backpressure=0; bob queued=3055 p50=9us max=217us backpressure=0
+12    5.00s  pass  relay shaper: gate queued=12216 p50=4us max=502us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49933us max=52044us backpressure=0; bob queued=3234 p50=8us max=212us backpressure=0
+13    5.00s  pass  relay shaper: gate queued=12139 p50=5us max=486us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49931us max=51811us backpressure=0; bob queued=3157 p50=9us max=212us backpressure=0
+14    5.01s  pass  relay shaper: gate queued=12002 p50=6us max=445us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49953us max=51918us backpressure=0; bob queued=3020 p50=9us max=210us backpressure=0
+15    5.12s  pass  relay shaper: gate queued=12055 p50=5us max=593us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49978us max=172020us backpressure=0; bob queued=3072 p50=9us max=362us backpressure=0
+16    5.01s  pass  relay shaper: gate queued=12205 p50=4us max=514us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49943us max=51994us backpressure=0; bob queued=3223 p50=8us max=229us backpressure=0
+17    5.00s  pass  relay shaper: gate queued=12078 p50=4us max=523us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49935us max=52001us backpressure=0; bob queued=3095 p50=9us max=210us backpressure=0
+18    5.00s  pass  relay shaper: gate queued=12169 p50=5us max=528us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49963us max=52140us backpressure=0; bob queued=3187 p50=9us max=218us backpressure=0
+19    5.00s  pass  relay shaper: gate queued=12124 p50=5us max=495us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49918us max=51858us backpressure=0; bob queued=3142 p50=9us max=192us backpressure=0
+20    5.01s  pass  relay shaper: gate queued=12401 p50=4us max=468us dropped_at_full=0 rate_limited=0; alice queued=8983 p50=49921us max=52017us backpressure=0; bob queued=3419 p50=8us max=185us backpressure=0

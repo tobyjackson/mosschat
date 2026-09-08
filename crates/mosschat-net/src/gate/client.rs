@@ -503,7 +503,7 @@ impl GateClient {
         // primary address is in no peer's candidate table, so it must be
         // allowed explicitly, and before the dial rather than after, since
         // the handshake's own packets come back from it.
-        porch.allow_source(primary_addr);
+        let primary_lease = porch.allow_source(primary_addr);
         // Armed here, before the dial, so the rule covers the handshake
         // too and `arm`'s doc is true of the code (Konrad's item 2:
         // `attach_gate` alone left it off until the handshake completed).
@@ -522,6 +522,11 @@ impl GateClient {
             ));
         }
         porch.attach_gate(authed_conn.connection().clone());
+        // The handshake window is over: this connection now holds its own
+        // entry in the live gate-address set (`attach_gate`), so the
+        // pre-dial one is handed back. The union never dips, since the
+        // connection's own lease was taken before this line.
+        porch.forget_source(primary_lease);
 
         let (mut send, mut recv) = authed_conn.connection().open_bi().await?;
         wire::write_frame(&mut send, &Frame::Register { v: 1, community }).await?;
@@ -715,12 +720,12 @@ impl GateClient {
         // The gate's secondary port is the other address this house dials
         // itself, and the only other one; allowed for the life of this
         // short connection and withdrawn when it closes.
-        self.inner.porch.allow_source(secondary_addr);
+        let lease = self.inner.porch.allow_source(secondary_addr);
         let connecting = self.inner.endpoint.connect(secondary_addr, "gate")?;
         let connection = match connecting.await {
             Ok(connection) => connection,
             Err(e) => {
-                self.inner.porch.forget_source(&secondary_addr);
+                self.inner.porch.forget_source(lease);
                 return Err(e.into());
             }
         };
@@ -731,7 +736,7 @@ impl GateClient {
         // for this before dropping its own `Connection`, see `server.rs`)
         // does not sit on its bounded wait for no reason.
         connection.close(0u32.into(), b"reflect done");
-        self.inner.porch.forget_source(&secondary_addr);
+        self.inner.porch.forget_source(lease);
         match reply {
             Frame::Reflected { observed, .. } => Ok(observed),
             other => Err(GateError::Protocol(format!(

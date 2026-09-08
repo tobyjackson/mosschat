@@ -46,7 +46,7 @@ use tokio::io::Interest;
 use crate::gate::limits::{INBOUND_PROBE_QUEUE_CAP, INBOUND_RELAY_QUEUE_CAP};
 use crate::gate::wire::{decode_relay, encode_relay};
 use crate::lockext::LockExt;
-use crate::path::{PathEntry, PathTable};
+use crate::path::{Enqueued, PathEntry, PathTable, RelayShaper, ShaperStats};
 use crate::punch::{PROBE_LEN, Probe, is_probe};
 
 /// Builds the stable synthetic address for `peer_key` (section 3): `fd`, 5
@@ -82,12 +82,84 @@ pub(crate) fn unmap_v4(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+/// A handle to one connection's entry in the live gate-address set
+/// (section 3). Returned by [`PorchSocket::allow_source`] and given back
+/// to [`PorchSocket::forget_source`], so a connection can only withdraw
+/// what it itself added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceLease(u64);
+
+/// The live gate-address set of section 3: "a packet is matched against
+/// the union of the live sets", one set per live connection.
+///
+/// **Why the union is refcounted rather than recomputed.** Section 3's
+/// check runs on every received datagram against reversing condition (b)'s
+/// 20 microsecond budget, so the membership question has to stay one hash
+/// lookup; walking every connection's set per packet would make it linear
+/// in connections. `refcounts` is that union, maintained as a multiset,
+/// and `by_lease` records what each connection put into it so a close can
+/// take back exactly its own contributions.
+///
+/// **What this fixes** (Yseult's latent gap): this used to be a single
+/// `HashSet` with an unconditional `forget_source`, so two live
+/// connections on one address, which a gate naming a `secondary_port`
+/// equal to its primary port produces, collapsed into one entry and the
+/// first close blinded the survivor.
+#[derive(Debug, Default)]
+struct AllowedSources {
+    by_lease: HashMap<u64, Vec<SocketAddr>>,
+    refcounts: HashMap<SocketAddr, usize>,
+}
+
+impl AllowedSources {
+    /// Adds `addr` to `lease`'s set and to the union.
+    fn allow(&mut self, lease: SourceLease, addr: SocketAddr) {
+        self.by_lease.entry(lease.0).or_default().push(addr);
+        *self.refcounts.entry(addr).or_insert(0) += 1;
+    }
+
+    /// Drops `lease`'s whole set, taking each of its addresses out of the
+    /// union only when no other live connection still holds it.
+    fn forget(&mut self, lease: SourceLease) {
+        let Some(addrs) = self.by_lease.remove(&lease.0) else {
+            return;
+        };
+        for addr in addrs {
+            if let Some(count) = self.refcounts.get_mut(&addr) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.refcounts.remove(&addr);
+                }
+            }
+        }
+    }
+
+    /// Whether any live connection's set holds `addr`.
+    fn contains(&self, addr: &SocketAddr) -> bool {
+        self.refcounts.contains_key(addr)
+    }
+
+    /// How many addresses the union holds, for tests.
+    #[cfg(test)]
+    fn union_len(&self) -> usize {
+        self.refcounts.len()
+    }
+}
+
 struct RelayRoutes {
     /// The gate control connection whose `Relay` datagrams carry this
     /// socket's peer traffic. WO-1.3a supports exactly one gate at a time.
     gate: Option<quinn::Connection>,
+    /// The gate connection's own entry in the live gate-address set, so
+    /// its close withdraws exactly that connection's address and not an
+    /// address another live connection still needs.
+    gate_lease: Option<SourceLease>,
     by_synthetic: HashMap<SocketAddr, u32>,
     by_session: HashMap<u32, SocketAddr>,
+    /// Synthetic peer addresses whose shaper already has a drain task, so
+    /// a repeated registration never starts a second one on the same
+    /// queue.
+    drained: HashSet<SocketAddr>,
 }
 
 /// A `quinn::AsyncUdpSocket` backed by a real UDP socket for the gate
@@ -147,7 +219,9 @@ pub struct PorchSocket {
     /// The real source addresses whose QUIC packets may reach quinn
     /// unchanged: the gate addresses this house itself dialled. See
     /// [`PorchSocket::allow_source`].
-    allowed_sources: Mutex<HashSet<SocketAddr>>,
+    allowed_sources: Mutex<AllowedSources>,
+    /// Source of the next [`SourceLease`] id.
+    next_source_lease: AtomicU64,
     /// Whether section 3's drop rule is in force.
     ///
     /// Set by [`PorchSocket::arm`] and by [`PorchSocket::attach_gate`], and
@@ -179,6 +253,25 @@ pub struct PorchSocket {
     /// reads completely under the same load, which is section 3's original
     /// anti-starvation complaint.
     poll_recv_prefer_socket: std::sync::atomic::AtomicBool,
+    /// The synthetic destination of each connection driver task's most
+    /// recent relayed transmit, which is how a [`PorchPoller`] learns which
+    /// peer it is polling for.
+    ///
+    /// **Why this indirection exists.** A full shaper queue has to reach
+    /// quinn as `poll_writable` returning `Pending` (section 1), but
+    /// `poll_writable` is called before quinn knows a transmit's
+    /// destination (`quinn/src/connection.rs:1031`), and a `UdpPoller` is
+    /// per connection while `try_send` is per socket, so nothing quinn
+    /// hands us says which peer a given poller is for. What is true is that
+    /// one connection's driver calls both from its own task
+    /// (`drive_transmit`, `:1031-1052`), so the task id ties them together
+    /// exactly, with no chance of one connection's poller adopting
+    /// another's queue.
+    ///
+    /// An entry is removed as soon as the poller adopts it, and a
+    /// non-relayed transmit removes its task's entry, so this holds at most
+    /// one address per live connection driver.
+    relay_intent: Mutex<HashMap<tokio::task::Id, SocketAddr>>,
 }
 
 impl fmt::Debug for PorchSocket {
@@ -206,8 +299,10 @@ impl PorchSocket {
             local_is_ipv6,
             relay: Mutex::new(RelayRoutes {
                 gate: None,
+                gate_lease: None,
                 by_synthetic: HashMap::new(),
                 by_session: HashMap::new(),
+                drained: HashSet::new(),
             }),
             paths: Mutex::new(PathTable::new()),
             inbound_synthetic: Mutex::new(VecDeque::new()),
@@ -216,12 +311,14 @@ impl PorchSocket {
             probes_unauthenticated: AtomicU64::new(0),
             inbound_probes_dropped: AtomicU64::new(0),
             probe_waker: Mutex::new(None),
-            allowed_sources: Mutex::new(HashSet::new()),
+            allowed_sources: Mutex::new(AllowedSources::default()),
+            next_source_lease: AtomicU64::new(0),
             armed: std::sync::atomic::AtomicBool::new(false),
             unknown_source_dropped: AtomicU64::new(0),
             waker: Mutex::new(None),
             inbound_relay_dropped: AtomicU64::new(0),
             poll_recv_prefer_socket: std::sync::atomic::AtomicBool::new(false),
+            relay_intent: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -236,12 +333,44 @@ impl PorchSocket {
     /// through, and spawns the background task that demultiplexes its
     /// inbound `Relay` datagrams by session into the registered synthetic
     /// addresses.
+    ///
+    /// **The gate's address enters the live set here and leaves when this
+    /// connection closes** (section 3: "an address entering it at its
+    /// connection's registration and leaving when that connection
+    /// closes"). The leaving half is what this reader task does on its way
+    /// out: until it did, a closed gate connection's address stayed
+    /// admissible for the life of the process, so anything that later
+    /// answered from that address, an unrelated service on the reused port
+    /// or a host that took it over, was still shown to quinn.
     pub fn attach_gate(self: &Arc<Self>, gate: quinn::Connection) {
-        self.allow_source(gate.remote_address());
+        let gate_addr = gate.remote_address();
+        let gate_lease = self.allow_source(gate_addr);
         self.arm();
-        {
+        // Sessions registered before a gate was attached have a shaper
+        // queue but no drain task, since there was nothing to drain onto;
+        // they get one here, so the order the two calls are made in cannot
+        // leave a queue that fills and never empties.
+        let undrained: Vec<SocketAddr> = {
             let mut routes = self.relay.lock_or_recover();
             routes.gate = Some(gate.clone());
+            routes.gate_lease = Some(gate_lease);
+            routes
+                .by_synthetic
+                .keys()
+                .copied()
+                .filter(|synthetic| !routes.drained.contains(synthetic))
+                .collect()
+        };
+        for synthetic in undrained {
+            let shaper = self
+                .paths
+                .lock_or_recover()
+                .ensure_by_synthetic(synthetic)
+                .egress()
+                .clone();
+            if self.relay.lock_or_recover().drained.insert(synthetic) {
+                self.spawn_relay_drain(gate.clone(), shaper);
+            }
         }
         let this = Arc::clone(self);
         tokio::spawn(async move {
@@ -252,20 +381,169 @@ impl PorchSocket {
                             this.deliver_synthetic(session, payload);
                         }
                     }
-                    Err(_) => return,
+                    Err(_) => {
+                        this.detach_gate(gate_addr);
+                        return;
+                    }
                 }
             }
         });
     }
 
+    /// Ends this socket's use of the gate connection at `gate_addr`: its
+    /// address leaves the live gate-address set, so a datagram arriving
+    /// from it afterwards is dropped and counted in
+    /// [`PorchSocket::unknown_source_dropped`], and no further relayed
+    /// transmit is accepted for it.
+    ///
+    /// Section 3's rule is a check on the packet and not a lifetime, and
+    /// the set stays armed: an emptied set fails closed.
+    pub fn detach_gate(&self, gate_addr: SocketAddr) {
+        let lease = {
+            let mut routes = self.relay.lock_or_recover();
+            if routes
+                .gate
+                .as_ref()
+                .is_none_or(|gate| gate.remote_address() != gate_addr)
+            {
+                return;
+            }
+            routes.gate = None;
+            // Every drain task for this gate exits with it, so the
+            // bookkeeping that stops a second one being started must be
+            // cleared too: without this, a later `attach_gate` on the same
+            // socket would leave those queues with no drainer at all, and a
+            // queue that fills and never empties parks `poll_writable`
+            // forever, which is issue #19's own shape (Konrad's finding 1).
+            routes.drained.clear();
+            routes.gate_lease.take()
+        };
+        if let Some(lease) = lease {
+            self.forget_source(lease);
+        }
+    }
+
+    /// Whether a QUIC packet arriving from `addr` would be admitted to
+    /// quinn unchanged, which is the live gate-address set of section 3.
+    #[must_use]
+    pub fn is_source_allowed(&self, addr: SocketAddr) -> bool {
+        self.allowed_sources
+            .lock_or_recover()
+            .contains(&unmap_v4(addr))
+    }
+
     /// Registers a live relay session: datagrams sent to `synthetic_peer`
-    /// leave as `Relay{session, ..}` over the attached gate connection, and
-    /// `Relay{session, ..}` datagrams received from the gate are delivered
-    /// to quinn tagged as arriving from `synthetic_peer`.
-    pub fn register_relay_session(&self, session: u32, synthetic_peer: SocketAddr) {
-        let mut routes = self.relay.lock_or_recover();
-        routes.by_synthetic.insert(synthetic_peer, session);
-        routes.by_session.insert(session, synthetic_peer);
+    /// go into that peer's shaped egress queue and leave it as
+    /// `Relay{session, ..}` over the attached gate connection at section
+    /// 1's rate, and `Relay{session, ..}` datagrams received from the gate
+    /// are delivered to quinn tagged as arriving from `synthetic_peer`.
+    ///
+    /// This is also where the queue's drain task starts, once per synthetic
+    /// address however often the session is re-registered.
+    pub fn register_relay_session(self: &Arc<Self>, session: u32, synthetic_peer: SocketAddr) {
+        let shaper = self
+            .paths
+            .lock_or_recover()
+            .ensure_by_synthetic(synthetic_peer)
+            .egress()
+            .clone();
+        // No gate attached yet means nothing to drain onto; `attach_gate`
+        // starts this queue's drain task when one arrives, so the two
+        // calls may be made in either order.
+        let gate = {
+            let mut routes = self.relay.lock_or_recover();
+            routes.by_synthetic.insert(synthetic_peer, session);
+            routes.by_session.insert(session, synthetic_peer);
+            match routes.gate.clone() {
+                Some(gate) if routes.drained.insert(synthetic_peer) => Some(gate),
+                _ => None,
+            }
+        };
+        if let Some(gate) = gate {
+            self.spawn_relay_drain(gate, shaper);
+        }
+    }
+
+    /// Records that the calling connection driver's latest transmit was
+    /// relayed to `destination`, or, with `None`, that it was not relayed
+    /// at all (see [`PorchSocket::relay_intent`]).
+    fn note_relay_intent(&self, destination: Option<SocketAddr>) {
+        let Some(task) = tokio::task::try_id() else {
+            return;
+        };
+        let mut intent = self.relay_intent.lock_or_recover();
+        match destination {
+            Some(destination) => {
+                intent.insert(task, destination);
+            }
+            None => {
+                intent.remove(&task);
+            }
+        }
+    }
+
+    /// Takes the calling task's noted relay destination, if it has one.
+    fn take_relay_intent(&self) -> Option<SocketAddr> {
+        let task = tokio::task::try_id()?;
+        self.relay_intent.lock_or_recover().remove(&task)
+    }
+
+    /// This peer's shaped egress queue, if it has a path table entry.
+    fn shaper_for(&self, synthetic_peer: SocketAddr) -> Option<RelayShaper> {
+        self.paths
+            .lock_or_recover()
+            .get_by_synthetic(&synthetic_peer)
+            .map(|entry| entry.egress().clone())
+    }
+
+    /// The shaper counters of every peer this socket relays for, folded
+    /// into one summary (section 7).
+    #[must_use]
+    pub fn relay_stats(&self) -> ShaperStats {
+        self.paths.lock_or_recover().shaper_stats()
+    }
+
+    /// Runs one session's shaped queue: waits for the rate to release a
+    /// batch, then writes it onto the gate connection.
+    ///
+    /// `send_datagram_wait` rather than `send_datagram`, because the latter
+    /// silently discards the *oldest* queued datagram when the connection's
+    /// own datagram buffer is full (`quinn/src/connection.rs:436`), which
+    /// is another invisible loss of exactly the kind issue #19 is about;
+    /// waiting instead lets the shaper's own bounded queue and its counters
+    /// be the one place a relayed datagram can be delayed or refused.
+    ///
+    /// Exit paths, since no task may run without one: the shaper closing
+    /// (`drain` returns `None`), the socket being dropped (the `Weak`
+    /// fails to upgrade), the gate connection being lost, or the gate
+    /// having been detached.
+    fn spawn_relay_drain(self: &Arc<Self>, gate: quinn::Connection, shaper: RelayShaper) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let Some(payloads) = shaper.drain().await else {
+                    return;
+                };
+                let Some(socket) = weak.upgrade() else {
+                    return;
+                };
+                let still_attached = socket.relay.lock_or_recover().gate.is_some();
+                drop(socket);
+                if !still_attached {
+                    return;
+                }
+                for payload in payloads {
+                    if gate.send_datagram_wait(payload.into()).await.is_err() {
+                        return;
+                    }
+                }
+                // A backlog leaves as several capped batches rather than
+                // one burst; yielding between them lets the gate
+                // connection's own driver, and every other session's
+                // drain, run in between.
+                tokio::task::yield_now().await;
+            }
+        });
     }
 
     /// Queues one inbound relayed datagram for delivery to quinn as if it
@@ -388,18 +666,27 @@ impl PorchSocket {
     /// property the rule exists for, since a stranger's address is one the
     /// house never dialled and never proved, while letting the two gate
     /// connections work. Recorded as a design gap in the pull request.
-    pub fn allow_source(&self, addr: SocketAddr) {
+    /// Returns the lease that connection must give back to
+    /// [`PorchSocket::forget_source`] when it closes; one call, one live
+    /// set, so two connections on one address are two entries and the
+    /// first close leaves the second's packets admitted.
+    pub fn allow_source(&self, addr: SocketAddr) -> SourceLease {
+        let lease = SourceLease(self.next_source_lease.fetch_add(1, Ordering::Relaxed));
         self.allowed_sources
             .lock_or_recover()
-            .insert(unmap_v4(addr));
+            .allow(lease, unmap_v4(addr));
+        lease
     }
 
-    /// Withdraws an address added by [`PorchSocket::allow_source`], for a
-    /// short-lived connection such as a `Reflect` that has finished.
-    pub fn forget_source(&self, addr: &SocketAddr) {
-        self.allowed_sources
-            .lock_or_recover()
-            .remove(&unmap_v4(*addr));
+    /// Withdraws one connection's set, for a short-lived connection such
+    /// as a `Reflect` that has finished.
+    ///
+    /// It takes the lease rather than an address on purpose: an address is
+    /// not a connection, and withdrawing by address withdrew it for
+    /// everyone. An address another live connection still holds stays in
+    /// the union.
+    pub fn forget_source(&self, lease: SourceLease) {
+        self.allowed_sources.lock_or_recover().forget(lease);
     }
 
     /// The number of inbound QUIC segments dropped for arriving from an
@@ -759,6 +1046,11 @@ enum SourceVerdict {
 
 struct PorchPoller {
     socket: Arc<PorchSocket>,
+    /// The synthetic peer address this poller's connection relays to, once
+    /// it has adopted one from [`LAST_RELAY_DESTINATION`]. `None` for a
+    /// connection that has never sent a relayed transmit, chiefly the gate
+    /// connection itself, which is therefore never gated on a shaper.
+    relay_destination: Option<SocketAddr>,
     /// The in-flight `writable()` future, kept across `poll_writable` calls
     /// so its waiter-list node stays registered, and dropped as soon as it
     /// resolves because polling a `Future` after it is ready is a logic
@@ -783,7 +1075,36 @@ impl UdpPoller for PorchPoller {
         // `Self` is `Unpin` (an `Arc` and a boxed future), so `get_mut` is
         // free of the pin gymnastics `UdpPollHelper` needs for an unboxed
         // future.
-        let Self { socket, writable } = self.get_mut();
+        let Self {
+            socket,
+            writable,
+            relay_destination,
+        } = self.get_mut();
+        if let Some(destination) = socket.take_relay_intent() {
+            *relay_destination = Some(destination);
+        }
+        // Section 1's back-pressure: a full queue is `Pending` here, not a
+        // `WouldBlock` out of `try_send`, which would clear write
+        // readiness endpoint-wide and spin the retry loop. A peer already
+        // upgraded to a direct path is not shaped at all, so its entry is
+        // asked whether it is still relayed first.
+        if let Some(destination) = *relay_destination {
+            let shaped = socket
+                .paths
+                .lock_or_recover()
+                .get_by_synthetic(&destination)
+                .filter(|entry| entry.direct_addr().is_none())
+                .map(|entry| entry.egress().clone());
+            // Room for a whole batch, not for one datagram: quinn may hand
+            // `try_send` a GSO transmit of up to `max_transmit_segments`
+            // segments, each of which is its own `Relay` datagram, and the
+            // shaper takes a transmit whole or not at all.
+            if let Some(shaper) = shaped
+                && !shaper.poll_room(socket.max_transmit_segments().max(1), cx.waker())
+            {
+                return Poll::Pending;
+            }
+        }
         let future = writable.get_or_insert_with(|| {
             let socket = Arc::clone(socket);
             Box::pin(async move { socket.udp.writable().await })
@@ -802,6 +1123,7 @@ impl AsyncUdpSocket for PorchSocket {
         Box::pin(PorchPoller {
             socket: self,
             writable: None,
+            relay_destination: None,
         })
     }
 
@@ -818,6 +1140,9 @@ impl AsyncUdpSocket for PorchSocket {
             .get_by_synthetic(&transmit.destination)
             .and_then(crate::path::PathEntry::direct_addr);
         if let Some(direct) = direct {
+            // Not relayed, so this poller's connection must not stay
+            // adopted onto a shaper queue.
+            self.note_relay_intent(None);
             let rewritten = Transmit {
                 destination: self.map_destination(direct),
                 ecn: transmit.ecn,
@@ -834,15 +1159,12 @@ impl AsyncUdpSocket for PorchSocket {
             routes.by_synthetic.get(&transmit.destination).copied()
         };
         if let Some(session) = session {
-            let gate = {
-                let routes = self.relay.lock_or_recover();
-                routes.gate.clone()
-            };
-            let Some(gate) = gate else {
+            let gate_attached = self.relay.lock_or_recover().gate.is_some();
+            if !gate_attached {
                 return Err(io::Error::other(
                     "no gate connection attached to relay through",
                 ));
-            };
+            }
             // Section 3: quinn sets `Transmit::segment_size` whenever it
             // wrote more than one datagram into `contents` (GSO), and each
             // segment is its own inner QUIC packet needing its own `Relay`
@@ -856,21 +1178,36 @@ impl AsyncUdpSocket for PorchSocket {
             if segment_size == 0 {
                 return Ok(());
             }
+            let mut payloads = Vec::new();
             for segment in transmit.contents.chunks(segment_size) {
-                let payload =
-                    encode_relay(session, segment).map_err(|e| io::Error::other(e.to_string()))?;
-                // `quinn::Connection::send_datagram` (unlike quinn-proto's
-                // lower-level API) has no `Blocked` case: it queues up to
-                // the connection's own datagram buffer and only ever
-                // reports `TooLarge`, `Disabled`, `UnsupportedByPeer` or the
-                // connection being lost, none of which are a transient "try
-                // again" condition this socket can usefully retry on.
-                if let Err(e) = gate.send_datagram(payload.into()) {
-                    return Err(io::Error::other(e.to_string()));
-                }
+                payloads.push(
+                    encode_relay(session, segment).map_err(|e| io::Error::other(e.to_string()))?,
+                );
             }
-            return Ok(());
+            // Section 1: the datagrams go into this session's shaped queue
+            // and leave it at the rate, rather than straight onto the gate
+            // connection. Nothing is dropped here; a full queue refuses the
+            // whole transmit, which quinn buffers and retries after the
+            // `poll_writable` above has gone `Pending` and been woken.
+            let shaper = self.shaper_for(transmit.destination);
+            self.note_relay_intent(Some(transmit.destination));
+            let Some(shaper) = shaper else {
+                return Err(io::Error::other(
+                    "no path table entry for a registered relay session",
+                ));
+            };
+            return match shaper.try_enqueue_all(payloads) {
+                Enqueued::Accepted => Ok(()),
+                // The last resort: a `WouldBlock` here clears write
+                // readiness endpoint-wide, so `poll_writable` going
+                // `Pending` above is what should have caught this.
+                Enqueued::Full => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                // Not transient, so not `WouldBlock`: retrying a queue
+                // whose session has ended would spin.
+                Enqueued::Closed => Err(io::Error::other("relay session closed")),
+            };
         }
+        self.note_relay_intent(None);
         self.udp.try_io(Interest::WRITABLE, || {
             self.state.send((&self.udp).into(), transmit)
         })
@@ -1093,6 +1430,149 @@ mod tests {
         let queue = socket.inbound_synthetic.lock_or_recover();
         assert_eq!(queue.len(), INBOUND_RELAY_QUEUE_CAP);
         assert_eq!(queue.front().unwrap().1, vec![0u8]);
+    }
+
+    /// Section 3's per-packet gate-address check, the leaving half: an
+    /// address is in the live gate-address set from its connection's
+    /// registration and leaves it when that connection closes, after which
+    /// a datagram from it is dropped and counted rather than shown to
+    /// quinn.
+    ///
+    /// This drives the real receive-path function, `demultiplex`, which is
+    /// what `poll_recv` calls, rather than the classification alone, so it
+    /// asserts both halves: dropped (the slot is emptied and the buffer
+    /// count excludes it) and counted (`unknown_source_dropped`).
+    ///
+    /// Deliberate break to fail this test: make `AllowedSources::forget` a
+    /// no-op, which is what an address staying admissible after its
+    /// connection closed looks like. The packet is then kept and both
+    /// assertions below fail.
+    #[test]
+    fn a_datagram_from_a_closed_gate_connections_address_is_dropped_and_counted() {
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let socket = PorchSocket::new(std_socket).unwrap();
+        let gate_addr: SocketAddr = "203.0.113.11:4433".parse().unwrap();
+
+        // Registration: the address enters the live set and the rule is
+        // armed.
+        let lease = socket.allow_source(gate_addr);
+        socket.arm();
+        assert!(socket.is_source_allowed(gate_addr));
+
+        // One QUIC-shaped packet (fixed bit set, so the probe filter
+        // leaves it alone) from that address, while the connection is
+        // live.
+        let mut storage = [0x40u8; 64];
+        let mut bufs = [IoSliceMut::new(&mut storage)];
+        let mut meta = [RecvMeta {
+            addr: gate_addr,
+            len: 64,
+            stride: 64,
+            ecn: None,
+            dst_ip: None,
+        }];
+        assert_eq!(socket.demultiplex(&mut bufs, &mut meta, 1), 1);
+        assert_eq!(meta[0].len, 64);
+        assert_eq!(socket.unknown_source_dropped(), 0);
+
+        // The connection closes. `detach_gate`, which `attach_gate`'s
+        // reader task runs on its way out, hands back exactly this
+        // connection's lease; that a real close reaches it is asserted in
+        // `gate::a_closed_gate_connections_address_leaves_the_live_set`,
+        // which has a real gate connection to close.
+        socket.forget_source(lease);
+        assert!(!socket.is_source_allowed(gate_addr));
+
+        meta[0] = RecvMeta {
+            addr: gate_addr,
+            len: 64,
+            stride: 64,
+            ecn: None,
+            dst_ip: None,
+        };
+        assert_eq!(
+            socket.demultiplex(&mut bufs, &mut meta, 1),
+            0,
+            "a datagram from a closed gate connection's address reaches nobody"
+        );
+        assert_eq!(meta[0].len, 0);
+        assert_eq!(
+            socket.unknown_source_dropped(),
+            1,
+            "and it is counted, never silently discarded"
+        );
+    }
+
+    /// Section 3's live gate-address set is "the union of the live sets",
+    /// one per connection, so two connections on one address are two
+    /// entries and closing the first leaves the second's packets admitted.
+    ///
+    /// This is the shape a gate naming a `secondary_port` equal to its
+    /// primary port produces: `reflect` dials the same address the
+    /// registration is already on, and its short connection closing used to
+    /// withdraw the address the live registration still needed.
+    ///
+    /// Deliberate break to fail this test: in `AllowedSources::forget`,
+    /// replace the refcount decrement with an unconditional
+    /// `self.refcounts.remove(&addr);`, which is the single-set behaviour
+    /// this replaced. The first close then blinds the survivor and the
+    /// middle assertion fails.
+    #[test]
+    fn one_connection_closing_does_not_withdraw_an_address_another_still_holds() {
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let socket = PorchSocket::new(std_socket).unwrap();
+        let shared: SocketAddr = "203.0.113.12:4433".parse().unwrap();
+        socket.arm();
+
+        // Two live connections, one address: the registration and a
+        // `Reflect` whose secondary port is the primary port.
+        let registration = socket.allow_source(shared);
+        let reflect = socket.allow_source(shared);
+        assert_eq!(
+            socket.allowed_sources.lock_or_recover().union_len(),
+            1,
+            "the union holds one address, however many connections named it"
+        );
+
+        let admitted = |socket: &Arc<PorchSocket>| {
+            let mut storage = [0x40u8; 32];
+            let mut bufs = [IoSliceMut::new(&mut storage)];
+            let mut meta = [RecvMeta {
+                addr: shared,
+                len: 32,
+                stride: 32,
+                ecn: None,
+                dst_ip: None,
+            }];
+            socket.demultiplex(&mut bufs, &mut meta, 1) == 1
+        };
+
+        assert!(admitted(&socket));
+
+        // The reflect connection closes. The registration is still live, so
+        // its packets must still be admitted.
+        socket.forget_source(reflect);
+        assert!(socket.is_source_allowed(shared));
+        assert!(
+            admitted(&socket),
+            "closing one connection must not blind the other"
+        );
+        assert_eq!(socket.unknown_source_dropped(), 0);
+
+        // The registration closes too, and now nothing holds the address.
+        socket.forget_source(registration);
+        assert!(!socket.is_source_allowed(shared));
+        assert!(!admitted(&socket));
+        assert_eq!(socket.unknown_source_dropped(), 1);
+        assert_eq!(socket.allowed_sources.lock_or_recover().union_len(), 0);
+
+        // Handing back a lease twice takes nothing extra out of the union.
+        socket.forget_source(registration);
+        assert_eq!(socket.allowed_sources.lock_or_recover().union_len(), 0);
     }
 
     /// A waker that counts how many times it was woken, for the
@@ -1435,15 +1915,15 @@ mod tests {
             let socket = porch();
             let gate: SocketAddr = "203.0.113.1:4433".parse().unwrap();
             let stranger: SocketAddr = "203.0.113.99:4433".parse().unwrap();
-            socket.allow_source(gate);
+            let lease = socket.allow_source(gate);
             socket.arm();
             assert!(socket.is_armed());
 
             // The exact shape of the hole: a gate naming a `secondary_port`
             // equal to its primary port would have `reflect` withdraw the
             // only allowed address when that short connection closed.
-            socket.forget_source(&gate);
-            assert!(socket.allowed_sources.lock_or_recover().is_empty());
+            socket.forget_source(lease);
+            assert_eq!(socket.allowed_sources.lock_or_recover().union_len(), 0);
             assert!(socket.is_armed(), "nothing clears the armed flag");
 
             let mut storage = [0xC3u8; 40];
@@ -1500,7 +1980,7 @@ mod tests {
             socket.arm();
             let dialled: SocketAddr = "203.0.113.1:4433".parse().unwrap();
             let stranger: SocketAddr = "203.0.113.99:4433".parse().unwrap();
-            socket.allow_source(dialled);
+            let lease = socket.allow_source(dialled);
 
             for (source, expected_len) in [(dialled, 40usize), (stranger, 0usize)] {
                 let mut storage = [0xC3u8; 40];
@@ -1521,7 +2001,7 @@ mod tests {
             // it back outside the rule, and emptying the allow-list
             // altogether does not reopen it: the rule is keyed on the armed
             // flag, not on the set being non-empty.
-            socket.forget_source(&dialled);
+            socket.forget_source(lease);
             let mut storage = [0xC3u8; 40];
             let mut bufs = [IoSliceMut::new(&mut storage)];
             let mut meta = [RecvMeta {
