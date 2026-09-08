@@ -72,9 +72,13 @@ jobs:
 
       # Same toolchain-pin comment as the check job above: dtolnay/rust-toolchain
       # does not read rust-toolchain.toml itself; keep the @stable rev and
-      # components list in sync with that file by hand.
+      # components list in sync with that file by hand. `targets:` adds the
+      # musl target to this same toolchain for the static leg below, so
+      # there is still only one toolchain-install step to keep in sync.
       - name: Install Rust toolchain (kept in sync with rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache cargo registry and target directory
         uses: Swatinem/rust-cache@v2
@@ -102,4 +106,59 @@ jobs:
             dist/mosschat
             dist/spike
             dist/SHA256SUMS
+          retention-days: 14
+
+      # Second, fully static leg: hewn-pc (Toby's Hewn test box) is
+      # musl-only with no glibc at all, so the dynamic build above fails
+      # there with "cannot execute: required file not found" (no
+      # /lib64/ld-linux-x86-64.so.2 present to satisfy the interpreter).
+      # musl-tools gives the `musl-gcc` wrapper the `cc`-crate build deps of
+      # ring and blake3 need to cross-compile their C/asm for the musl
+      # target (SQLite is not in this workspace's dependency tree today --
+      # see crates/*/Cargo.toml -- so it needs no accommodation here yet).
+      # Static linking itself is forced by .cargo/config.toml's
+      # [target.x86_64-unknown-linux-musl] rustflags, not a RUSTFLAGS env
+      # var here, so `cargo build --target x86_64-unknown-linux-musl` stays
+      # reproducible identically outside CI.
+      - name: Install musl-tools (musl-gcc, for ring/blake3's cc build deps)
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build mosschat (release, musl static)
+        run: nice -n 10 env CARGO_BUILD_JOBS=3 cargo build --release --target x86_64-unknown-linux-musl -p mosschat --bin mosschat
+
+      - name: Build spike example (release, musl static)
+        run: nice -n 10 env CARGO_BUILD_JOBS=3 cargo build --release --target x86_64-unknown-linux-musl -p mosschat-net --example spike
+
+      - name: Stage musl artifact and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist-musl
+          cp target/x86_64-unknown-linux-musl/release/mosschat dist-musl/mosschat
+          cp target/x86_64-unknown-linux-musl/release/examples/spike dist-musl/spike
+          ( cd dist-musl && sha256sum mosschat spike > SHA256SUMS )
+          cat dist-musl/SHA256SUMS
+
+      # Fails the job outright rather than silently uploading a binary that
+      # still needs a dynamic linker hewn-pc doesn't have. `--version` is a
+      # real execution, not just a link check, and only succeeds at all
+      # because the runner's kernel can exec a static musl binary that
+      # carries no interpreter.
+      - name: Verify static linking and binary execution
+        run: |
+          set -euo pipefail
+          file dist-musl/mosschat
+          if ! file dist-musl/mosschat | grep -q 'statically linked'; then
+            echo "verify: FAIL: dist-musl/mosschat is not statically linked" >&2
+            exit 1
+          fi
+          dist-musl/mosschat --version
+
+      - name: Upload musl artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosschat-linux-x86_64-musl-${{ steps.vars.outputs.sha_short }}
+          path: |
+            dist-musl/mosschat
+            dist-musl/spike
+            dist-musl/SHA256SUMS
           retention-days: 14
