@@ -1,0 +1,33 @@
+{"detail":"house 659ec7498f49778ba340db1b53eab01c63fa5c746668383499161dc59bc45aed, gate 203.0.113.1:443, observed 203.0.113.12:38639, secondary port 444","event":"registered","peer":null,"ts_ms":1788901484377}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"28456c1b","ts_ms":1788901484620}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"28456c1b","ts_ms":1788901484623}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"28456c1b","ts_ms":1788901489653}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"a3bd9deb","ts_ms":1788901489721}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"a3bd9deb","ts_ms":1788901489724}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"a3bd9deb","ts_ms":1788901579747}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"c99460be","ts_ms":1788901579815}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"c99460be","ts_ms":1788901579818}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"c99460be","ts_ms":1788901669851}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"8eeb1f2f","ts_ms":1788901670972}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"8eeb1f2f","ts_ms":1788901670989}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"8eeb1f2f","ts_ms":1788901761015}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"63d02d61","ts_ms":1788901761452}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"63d02d61","ts_ms":1788901761546}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"63d02d61","ts_ms":1788901851569}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"7e7e454e","ts_ms":1788901852686}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"7e7e454e","ts_ms":1788901853108}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"7e7e454e","ts_ms":1788901943133}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"070339b9","ts_ms":1788901948248}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"070339b9","ts_ms":1788901950232}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"070339b9","ts_ms":1788902040319}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"a536483a","ts_ms":1788902041271}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"a536483a","ts_ms":1788902041296}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"a536483a","ts_ms":1788902131306}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"74a9763a","ts_ms":1788902131417}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"74a9763a","ts_ms":1788902131421}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"74a9763a","ts_ms":1788902221425}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"670b9f22","ts_ms":1788902221986}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"670b9f22","ts_ms":1788902222074}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"670b9f22","ts_ms":1788902312073}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"cfcdfb4e","ts_ms":1788902312210}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"cfcdfb4e","ts_ms":1788902312213}

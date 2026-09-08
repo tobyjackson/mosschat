@@ -1,0 +1,15 @@
+== fault-matrix.sh: report card (from docs/measurements/2026-09-08-hewn-mini-run3/faults) ==
+row                  condition                                                  verdict    exit  note
+loss-1pct            Packet loss 1%                                             FAIL       0     failed at the probe burst: no probe answered in time
+loss-5pct            Packet loss 5%                                             FAIL       0     failed at the probe burst: no probe answered in time
+loss-20pct           Packet loss 20%                                            FAIL       0     failed at the probe burst: no probe answered in time
+delay-50ms           Delay 50ms plus jitter                                     FAIL       0     failed at the probe burst: no probe answered in time
+delay-200ms          Delay 200ms plus jitter                                    FAIL       0     failed at the probe burst: no probe answered in time
+delay-1000ms         Delay 1000ms plus jitter                                   FAIL       0     failed at the probe burst: no probe answered in time
+reorder              Reorder                                                    FAIL       0     failed at the probe burst: no probe answered in time
+duplicate            Duplicate                                                  FAIL       0     failed at the probe burst: no probe answered in time
+bandwidth-256kbit    Bandwidth cap 256kbit                                      FAIL       0     failed at the probe burst: no probe answered in time
+blackout-60s         Total blackout, both directions, 60s, applied 10s after the command starts FAIL       0     failed at the probe burst: no probe answered in time
+asymmetric-loss      Asymmetric loss, 10 percent A to B and 2 percent B to A    FAIL       0     failed at the introduction: no introduction arrived in time
+gatehouse-killed     Gatehouse killed mid-visit, by its recorded pid, 5s after the command starts FAIL       0     failed at the introduction: no introduction arrived in time
+totals: 0 PASS, 12 FAIL, 0 SUSPECT, 0 NOT TESTED
