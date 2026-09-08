@@ -1721,10 +1721,14 @@ mod tests {
     /// Konrad's must 1: section 6 names an IPv6 link-local group as well,
     /// so this house joins it and an announce sent to it is received.
     ///
-    /// Same skip rule as the IPv4 test: a failed join is a platform that
-    /// will not carry this, and on [`multicast_must_work`] even that is a
-    /// failure only if it happens after a successful bind, which is the
-    /// same shape as v4's. The interface index is 0, the system default.
+    /// The same rule as the IPv4 test, and for the same reason (Konrad's
+    /// must 2): where [`multicast_must_work`] holds, a failed join, a
+    /// failed send and five silent seconds are all failures, so this test
+    /// can fail. It skips with a printed reason elsewhere, which is what
+    /// the macOS runner does. The interface index is 0, the system
+    /// default. Measured on this branch's own CI before the strictness was
+    /// applied: ubuntu-latest joins the group and delivers, the announce
+    /// arriving from an `fe80::` source.
     ///
     /// Deliberate break to fail this test: in `DiscoverySocket::bind_v6`,
     /// delete the `set_multicast_loop_v6(true)` call. The join and the
@@ -1749,6 +1753,10 @@ mod tests {
             match (bind(alice_port, bob_port), bind(bob_port, alice_port)) {
                 (Ok(alice_socket), Ok(bob_socket)) => (alice_socket, bob_socket),
                 (Err(error), _) | (_, Err(error)) => {
+                    assert!(
+                        !multicast_must_work(),
+                        "this platform must be able to join {DISCOVERY_GROUP_V6}: {error}"
+                    );
                     note(&format!(
                         "discovery v6: SKIPPED, will not join {DISCOVERY_GROUP_V6} ({error})"
                     ));
@@ -1770,6 +1778,10 @@ mod tests {
             .announce(&alice_discovery.announce(&alice, sent, [7u8; 4]))
             .await
         {
+            assert!(
+                !multicast_must_work(),
+                "this platform joined {DISCOVERY_GROUP_V6} and must be able to send to it: {error}"
+            );
             note(&format!(
                 "discovery v6: SKIPPED, will not send to {DISCOVERY_GROUP_V6} ({error})"
             ));
@@ -1792,6 +1804,10 @@ mod tests {
             }
         };
         let Some(heard) = heard else {
+            assert!(
+                !multicast_must_work(),
+                "this platform joined and sent to {DISCOVERY_GROUP_V6} and must deliver: no multicast datagram was delivered"
+            );
             note("discovery v6: SKIPPED, no multicast datagram was delivered");
             return;
         };
