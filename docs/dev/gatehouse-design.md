@@ -530,3 +530,39 @@ rather than a share of it, so one `doctor` run costs one connection on each port
 one key gets 8 reflections a minute. `Register`'s own bucket is not that bound and never was, its bucket being on the
 primary port while a key that never registers can reach the reflection port regardless; before this amendment the
 secondary port had no per-key connection limit at all.
+
+**Amendment 4, 2026-09-08: what a held visit adds** (WO-1.5a, Konrad). Nothing above described a visit that is still open a
+minute later, because nothing could run one: `doctor --friend` is one-shot and always the caller, and no role stayed running and
+answered a knock. WO-1.5 asks for RTT median and p95, recovery after a 60 second drop, and case (f)'s detection and fall-back
+times, and every one of those is a property of a visit under way. Five changes, each stated where it touches this design.
+
+- **Section 1's keepalive is now sent.** A registration expires 90 s after its last keepalive and nothing sent frame 9, which was
+  invisible while every run finished in seconds and fatal the moment one held a visit open: at 90 s the gate deregisters the
+  house and closes the connection, taking the relay session under the visit with it. The gate client now sends frame 9 every
+  `Registered.keepalive_s` for as long as it is registered.
+- **Section 4 is driven by `live.rs` on every visit.** The doorbell's own monitor counted misses beside `PeerLiveness` rather
+  than through it, so a visit reached the fall-back but never stale, dead or the goodbye. It now drives `PeerLiveness` with
+  `Activity::Visit`, which is the same policy this section already specifies; the numbers did not change.
+- **A fall-back is mutual.** This section says `PathUp` and `PathDown` describe the sender's own choice and say nothing about
+  whether this house can still reach it. That is true of liveness and false of reachability: section 3's porch socket drops a
+  datagram whose source is in no peer's candidate table, so a peer that has fallen back can no longer receive anything sent to
+  its direct address either. A `PathDown` naming the current attempt therefore moves this house back to the relay too. Without
+  it an asymmetric fall-back leaves the porch stream one way and the rerun that follows never completes, which is a real defect
+  this order found and fixed rather than a preference.
+- **A rerun is the initiator's to start, and supersedes the attempt it replaces.** Section 2 step 7 reruns gathering, exchange
+  and probing with a fresh attempt id on the same porch stream. Both sides detect a dead path, but only role 1 writes the next
+  `Candidates`; role 2 falls back and waits for it, because two sides opening an attempt at once would put two `Candidates`
+  frames on one stream with no rule for which is the attempt. A path a rerun supersedes is dropped, which is section 4's own
+  `dead` reached by its second route rather than by the grace elapsing, and the record says so in those words. Recovery is
+  bounded by this section's own budget of 4 `StartRequest`s per session: past it a visit stays relayed and its record says which
+  step ran out.
+- **Section 7's record gains four fields and one reason.** `events[]`, one entry per visit event (`visit_open`, `upgraded`,
+  `path_stale`, `path_dead`, `fell_back`, `recovered`, `goodbye`) with the same `at_ms` clock `steps[]` uses, because two of
+  section 4's transitions are both `path_lost` and a reader cannot tell them apart in a step list that names the same step three
+  times; and `rtt_median_us`, `rtt_p95_us`, `rtt_samples` and `rtt_source`, the round trip over the hold, sampled once a second
+  from the probe pongs on a direct path and from `Connection::rtt()` on a relayed one, which is the only end to end number a
+  relayed visit has. Both lists are capped at 512 entries, because a house holds one attempt open for the length of a visit.
+  The new reason is `punch_disabled`, for a run told not to probe (`--no-punch`, WO-1.5 case (e)): `probe_timeout` and
+  `no_candidates` name failures that did not happen, and `internal` is this design's catch-all for a failure it cannot name,
+  which is the opposite of a path taken on purpose. A record written before this amendment still reads: every new field is
+  optional on the way in.

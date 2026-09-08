@@ -10,6 +10,7 @@ pub mod authed;
 pub mod diag;
 pub mod discovery;
 pub mod gate;
+pub mod house;
 pub mod live;
 pub(crate) mod lockext;
 pub mod path;

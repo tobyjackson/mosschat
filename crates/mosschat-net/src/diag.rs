@@ -190,13 +190,24 @@ pub enum Reason {
     PeerGoodbye,
     /// A relay session's byte or datagram cap was exceeded.
     CapExceeded,
+    /// Hole punching was switched off for this attempt (`--no-punch`), so
+    /// the visit stayed relayed by instruction rather than by failure.
+    ///
+    /// **Not in section 7's own list; added by WO-1.5a** (design amendment
+    /// 4). WO-1.5 case (e) is "the same with the gate reachable but hole
+    /// punching forced off", and its record has to say why it relayed in a
+    /// word its reader can act on. Every existing reason would have lied:
+    /// `probe_timeout` and `no_candidates` name failures that did not
+    /// happen, and `internal` is this design's catch-all for a failure it
+    /// cannot name, which is the opposite of a path taken on purpose.
+    PunchDisabled,
     /// Any failure not named by one of the above.
     Internal,
 }
 
 impl Reason {
     /// All variants, in section 7's declared order.
-    pub const ALL: [Reason; 20] = [
+    pub const ALL: [Reason; 21] = [
         Reason::Ok,
         Reason::GateUnreachable,
         Reason::GateRefusedNotMember,
@@ -216,6 +227,7 @@ impl Reason {
         Reason::LocalAddressChanged,
         Reason::PeerGoodbye,
         Reason::CapExceeded,
+        Reason::PunchDisabled,
         Reason::Internal,
     ];
 
@@ -242,6 +254,7 @@ impl Reason {
             Reason::LocalAddressChanged => "local_address_changed",
             Reason::PeerGoodbye => "peer_goodbye",
             Reason::CapExceeded => "cap_exceeded",
+            Reason::PunchDisabled => "punch_disabled",
             Reason::Internal => "internal",
         }
     }
@@ -321,6 +334,179 @@ impl PathChoice {
     pub fn addr(self) -> Addr {
         match self {
             PathChoice::Relay(addr) | PathChoice::Direct(addr) => addr,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Visit events (WO-1.5a, design amendment 4)
+// ---------------------------------------------------------------------
+
+/// One thing that happened to a live visit, in the vocabulary a house
+/// prints and a record keeps.
+///
+/// **Why the record needs these beside `steps`** (WO-1.5a). A step says
+/// how far one attempt got; WO-1.5 asks what happened to a visit *while it
+/// was held open*: when the direct path died, how long detection took, how
+/// long the fall-back took after it, and whether the path came back. Two
+/// of those are section 4 transitions with no step of their own (stale and
+/// dead are both `path_lost`), and none of them can be told apart in a
+/// `steps` list that names the same step three times. So an attempt with a
+/// held visit carries both: `steps` for how it connected, `events` for
+/// what the visit then did.
+///
+/// The same names are what a headless house prints on stdout, one JSON
+/// line each, so a two-machine run's two sides can be read against each
+/// other without a translation table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisitEventKind {
+    /// A house registered at its gate. House stdout only: a record is per
+    /// attempt, and registration precedes every attempt.
+    Registered,
+    /// A knock arrived from a friend and was accepted. House stdout only,
+    /// for the same reason.
+    Knock,
+    /// The visit is open and carrying traffic, on the path named in the
+    /// detail (section 2 step 2: relayed from the first packet).
+    VisitOpen,
+    /// A candidate proved itself and traffic moved to it (section 2 step
+    /// 6), with the winning address and its round trip.
+    Upgraded,
+    /// Section 4: three consecutive probes unanswered. This is the
+    /// *detection*, and the moment the fall-back is decided from.
+    PathStale,
+    /// Section 4: the stale grace elapsed with no answer, so the path is
+    /// dropped and the doorbell reruns.
+    PathDead,
+    /// Traffic is back on the relay session (section 2 step 7). It follows
+    /// [`VisitEventKind::PathStale`] immediately, because section 4 moves
+    /// traffic at stale and not at dead; the gap between the two is the
+    /// fall-back time the Phase 1 criterion bounds at 1 s on the side that
+    /// moved.
+    FellBack,
+    /// A rerun of the doorbell upgraded again after a fall-back.
+    Recovered,
+    /// The visit ended cleanly: frame 19 out, in, or both.
+    Goodbye,
+}
+
+impl VisitEventKind {
+    /// All variants, in the order a visit produces them.
+    pub const ALL: [VisitEventKind; 9] = [
+        VisitEventKind::Registered,
+        VisitEventKind::Knock,
+        VisitEventKind::VisitOpen,
+        VisitEventKind::Upgraded,
+        VisitEventKind::PathStale,
+        VisitEventKind::PathDead,
+        VisitEventKind::FellBack,
+        VisitEventKind::Recovered,
+        VisitEventKind::Goodbye,
+    ];
+
+    /// The `snake_case` spelling used in the record and on a house's
+    /// stdout.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VisitEventKind::Registered => "registered",
+            VisitEventKind::Knock => "knock",
+            VisitEventKind::VisitOpen => "visit_open",
+            VisitEventKind::Upgraded => "upgraded",
+            VisitEventKind::PathStale => "path_stale",
+            VisitEventKind::PathDead => "path_dead",
+            VisitEventKind::FellBack => "fell_back",
+            VisitEventKind::Recovered => "recovered",
+            VisitEventKind::Goodbye => "goodbye",
+        }
+    }
+
+    /// Parses the `snake_case` spelling back.
+    ///
+    /// # Errors
+    /// Returns [`DiagError::Malformed`] if `s` names no known event.
+    pub fn parse_str(s: &str) -> Result<Self, DiagError> {
+        VisitEventKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == s)
+            .ok_or_else(|| DiagError::Malformed(format!("unknown visit event: {s:?}")))
+    }
+}
+
+/// One entry of [`DiagRecord::events`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisitEvent {
+    /// What happened.
+    pub event: VisitEventKind,
+    /// Milliseconds since the attempt started, the same clock
+    /// [`StepRecord::at_ms`] uses, so the two lists interleave.
+    pub at_ms: u64,
+    /// Free text: the path, the winning address, the round trip. Capped at
+    /// [`MAX_FREE_TEXT_LEN`] bytes when written, exactly as a step's is.
+    pub detail: String,
+}
+
+/// Where a visit's round trip samples came from, so a median is read as
+/// what it is.
+///
+/// The two sources are not interchangeable and are deliberately not
+/// averaged into one nameless number: a probe round trip is this design's
+/// own measurement of one path (section 3, "RTT, out of quinn's hands"),
+/// while quinn's is the end to end connection's smoothed estimate over
+/// whatever path carries it, updated by its own 15 s keepalive rather than
+/// once a second, so consecutive samples of it repeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RttSource {
+    /// No sample was taken: the visit was never held open.
+    #[default]
+    NotSampled,
+    /// Every sample is a probe pong round trip on a direct path.
+    Probe,
+    /// Every sample is `quinn::Connection::rtt()` on a relayed visit,
+    /// which is the only end to end number a relayed path has: probes go
+    /// to a candidate address, and a relayed peer has none.
+    Quic,
+    /// Both, because the path changed during the hold. The events say
+    /// when.
+    Mixed,
+}
+
+impl RttSource {
+    /// The JSON representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RttSource::NotSampled => "not_sampled",
+            RttSource::Probe => "probe",
+            RttSource::Quic => "quic",
+            RttSource::Mixed => "mixed",
+        }
+    }
+
+    /// Parses the JSON representation back.
+    ///
+    /// # Errors
+    /// Returns [`DiagError::Malformed`] if `s` names no known source.
+    pub fn parse_str(s: &str) -> Result<Self, DiagError> {
+        match s {
+            "not_sampled" => Ok(RttSource::NotSampled),
+            "probe" => Ok(RttSource::Probe),
+            "quic" => Ok(RttSource::Quic),
+            "mixed" => Ok(RttSource::Mixed),
+            other => Err(DiagError::Malformed(format!(
+                "unknown rtt source: {other:?}"
+            ))),
+        }
+    }
+
+    /// The source of a set of samples that already had `self` and then
+    /// took one from `next`.
+    #[must_use]
+    pub fn joined(self, next: RttSource) -> RttSource {
+        match (self, next) {
+            (RttSource::NotSampled, other) | (other, RttSource::NotSampled) => other,
+            (a, b) if a == b => a,
+            _ => RttSource::Mixed,
         }
     }
 }
@@ -439,6 +625,24 @@ impl InstallSalt {
             }
             Err(e) => Err(DiagError::Io(e)),
         }
+    }
+
+    /// A salt for this process alone: 16 bytes from the OS CSPRNG,
+    /// written nowhere.
+    ///
+    /// For a caller with no state directory to persist one in (a headless
+    /// house told to keep no diagnostics log). It keeps the property that
+    /// matters within one run, one peer being named consistently, and
+    /// gives up the one that needs a file, the same peer being named the
+    /// same way after a restart. Still no caller-supplied bytes: the only
+    /// two ways to obtain an [`InstallSalt`] are this and
+    /// [`InstallSalt::load_or_create`], and neither takes any.
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        use rand::RngExt;
+        let mut bytes = [0u8; 16];
+        rand::rng().fill(&mut bytes);
+        Self(bytes)
     }
 
     /// The salt's raw bytes, for [`PeerFingerprint::from_key`] alone.
@@ -575,6 +779,10 @@ pub struct DiagRecord {
     pub ended_at_ms: u64,
     /// Every step tried, in order.
     pub steps: Vec<StepRecord>,
+    /// Every visit event, in order (WO-1.5a, design amendment 4). Empty
+    /// for an attempt that never held a visit open, which is every
+    /// attempt written before that order landed.
+    pub events: Vec<VisitEvent>,
     /// The step that failed, if any.
     pub failed_step: Option<Step>,
     /// The two gate reflections: primary port, then secondary port.
@@ -612,6 +820,18 @@ pub struct DiagRecord {
     pub path: PathChoice,
     /// The chosen path's round trip time in microseconds.
     pub path_rtt_us: u32,
+    /// The median round trip over a held visit, in microseconds, `0` when
+    /// nothing was sampled (WO-1.5a). Nearest-rank over the samples this
+    /// visit took, one a second; see [`DiagRecord::rtt_source`] for what
+    /// they measure.
+    pub rtt_median_us: u32,
+    /// The 95th percentile of the same samples, nearest-rank
+    /// (`ceil(0.95 * n)`), in microseconds.
+    pub rtt_p95_us: u32,
+    /// How many samples the two percentiles above are over.
+    pub rtt_samples: u32,
+    /// What those samples measure.
+    pub rtt_source: RttSource,
     /// Why the attempt ended the way it did.
     pub reason: Reason,
     /// The running mosschat version. Truncated at [`MAX_FREE_TEXT_LEN`]
@@ -714,6 +934,23 @@ mod rfc3339 {
 /// section 7's own wire caps (`Error.detail` 64 bytes, `Introduce.sealed`
 /// 512 bytes): an ordinary error message or version string is never cut.
 const MAX_FREE_TEXT_LEN: usize = 256;
+
+/// The cap on how many `steps` or `events` one record holds (WO-1.5a).
+///
+/// Chosen, not measured. Section 7 has one record per connection attempt
+/// and says nothing about its size, which was safe while an attempt was a
+/// connect and a probe burst; a headless house holds one attempt open for
+/// the life of a visit, and a flapping path writes an entry per
+/// transition, so the list would otherwise grow with uptime. 512 is well
+/// past what any run this design measures produces (a 90 s hold with two
+/// fall-backs writes about 20 entries) and bounds one record at a few tens
+/// of kilobytes with [`MAX_FREE_TEXT_LEN`] on every detail.
+pub const MAX_RECORD_ENTRIES: usize = 512;
+
+/// What the last entry of a truncated `steps` or `events` list says, so a
+/// record that stopped recording says so rather than appearing to end
+/// where the run did.
+const TRUNCATION_MARKER: &str = "further entries dropped";
 
 /// Truncates `s` to at most [`MAX_FREE_TEXT_LEN`] bytes on a `char`
 /// boundary, appending a marker so truncation is visible in the record
@@ -821,6 +1058,16 @@ fn optional_field_u64(value: &serde_json::Value, key: &str) -> Result<u64, DiagE
     }
 }
 
+/// [`optional_field_u64`] narrowed to a `u32`.
+///
+/// # Errors
+/// Returns [`DiagError::Malformed`] if `key` is present and is not an
+/// unsigned integer inside `u32`'s range.
+fn optional_field_u32(value: &serde_json::Value, key: &str) -> Result<u32, DiagError> {
+    u32::try_from(optional_field_u64(value, key)?)
+        .map_err(|_| DiagError::Malformed(format!("field {key:?} is out of range for u32")))
+}
+
 /// [`field`] plus a bool type check.
 fn field_bool(value: &serde_json::Value, key: &str) -> Result<bool, DiagError> {
     field(value, key)?
@@ -865,6 +1112,18 @@ impl DiagRecord {
 
         let [local_first, local_second] = self.local_observed;
 
+        let events: Vec<serde_json::Value> = self
+            .events
+            .iter()
+            .map(|event| {
+                serde_json::json!({
+                    "event": event.event.as_str(),
+                    "at_ms": event.at_ms,
+                    "detail": cap_text(&event.detail),
+                })
+            })
+            .collect();
+
         let value = serde_json::json!({
             "attempt": hex_encode(&self.attempt),
             "session": self.session,
@@ -874,6 +1133,7 @@ impl DiagRecord {
             "ended_at": rfc3339::format(self.ended_at_ms),
             "steps": steps,
             "failed_step": self.failed_step.map(Step::as_str),
+            "events": events,
             "local_observed": [
                 addr_to_json_string(local_first),
                 addr_to_json_string(local_second),
@@ -889,6 +1149,10 @@ impl DiagRecord {
             "path": self.path.kind_str(),
             "path_addr": addr_to_json_string(self.path.addr()),
             "path_rtt_us": self.path_rtt_us,
+            "rtt_median_us": self.rtt_median_us,
+            "rtt_p95_us": self.rtt_p95_us,
+            "rtt_samples": self.rtt_samples,
+            "rtt_source": self.rtt_source.as_str(),
             "reason": self.reason.as_str(),
             "version": cap_text(&self.version),
             "platform": cap_text(&self.platform),
@@ -940,6 +1204,24 @@ impl DiagRecord {
             });
         }
 
+        // `events` and the four `rtt_*` fields arrived in WO-1.5a, after
+        // WO-1.4's writer had a released format, so an absent one is a
+        // record written before them rather than a malformed line: the
+        // same rule, and the same reason, as the shaper counters below.
+        let mut events = Vec::new();
+        if let Some(raw) = value.get("events") {
+            let raw = raw
+                .as_array()
+                .ok_or_else(|| DiagError::Malformed("field \"events\" is not an array".into()))?;
+            for item in raw {
+                events.push(VisitEvent {
+                    event: VisitEventKind::parse_str(field_str(item, "event")?)?,
+                    at_ms: field_u64(item, "at_ms")?,
+                    detail: field_str(item, "detail")?.to_string(),
+                });
+            }
+        }
+
         let failed_step = match field(&value, "failed_step")? {
             serde_json::Value::Null => None,
             other => Some(Step::parse_str(as_str(other)?)?),
@@ -985,6 +1267,13 @@ impl DiagRecord {
 
         let path_rtt_us = u32::try_from(field_u64(&value, "path_rtt_us")?)
             .map_err(|_| DiagError::Malformed("path_rtt_us out of range".to_string()))?;
+        let rtt_median_us = optional_field_u32(&value, "rtt_median_us")?;
+        let rtt_p95_us = optional_field_u32(&value, "rtt_p95_us")?;
+        let rtt_samples = optional_field_u32(&value, "rtt_samples")?;
+        let rtt_source = match value.get("rtt_source") {
+            None | Some(serde_json::Value::Null) => RttSource::NotSampled,
+            Some(present) => RttSource::parse_str(as_str(present)?)?,
+        };
         let reason = Reason::parse_str(field_str(&value, "reason")?)?;
         let version = field_str(&value, "version")?.to_string();
         let platform = field_str(&value, "platform")?.to_string();
@@ -997,6 +1286,7 @@ impl DiagRecord {
             started_at_ms,
             ended_at_ms,
             steps,
+            events,
             failed_step,
             local_observed,
             peer_observed,
@@ -1009,6 +1299,10 @@ impl DiagRecord {
             relay_dropped_at_full,
             path,
             path_rtt_us,
+            rtt_median_us,
+            rtt_p95_us,
+            rtt_samples,
+            rtt_source,
             reason,
             version,
             platform,
@@ -1426,6 +1720,7 @@ struct RecorderState {
     session: u32,
     gate_ms: u64,
     steps: Vec<StepRecord>,
+    events: Vec<VisitEvent>,
     failed_step: Option<Step>,
     local_observed: [Option<Addr>; 2],
     peer_observed: Option<Addr>,
@@ -1440,6 +1735,10 @@ struct RecorderState {
     relay_dropped_at_full: u64,
     path: PathChoice,
     path_rtt_us: u32,
+    rtt_median_us: u32,
+    rtt_p95_us: u32,
+    rtt_samples: u32,
+    rtt_source: RttSource,
     /// The record as it was written, once [`Recorder::finish`] has run.
     /// Held rather than a bare flag so a second caller (`doctor`, after the
     /// doorbell it started has already settled the attempt) is handed the
@@ -1494,6 +1793,7 @@ impl Recorder {
                     session: 0,
                     gate_ms: 0,
                     steps: Vec::new(),
+                    events: Vec::new(),
                     failed_step: None,
                     local_observed: [None, None],
                     peer_observed: None,
@@ -1511,6 +1811,10 @@ impl Recorder {
                     // records the truth rather than a default direct path.
                     path: PathChoice::Relay(Addr::default()),
                     path_rtt_us: 0,
+                    rtt_median_us: 0,
+                    rtt_p95_us: 0,
+                    rtt_samples: 0,
+                    rtt_source: RttSource::NotSampled,
                     finished: None,
                 }),
             }),
@@ -1536,18 +1840,67 @@ impl Recorder {
     /// `doctor` exits naming, and a later failure is usually a consequence
     /// of the first (a probe burst that never fired because the start
     /// signal never came).
+    ///
+    /// **Bounded** (WO-1.5a): a house holds one attempt open for as long
+    /// as a visit lasts, and a path that flaps writes two entries a
+    /// flap, so an unbounded list here is a record that grows with
+    /// uptime. Past [`MAX_RECORD_ENTRIES`] one marker entry is written
+    /// and the rest are dropped, so a truncated record says it was
+    /// truncated instead of quietly ending mid-visit. `failed_step` is
+    /// still taken from a dropped failure, since it is one value and
+    /// costs nothing to keep true.
     pub fn step(&self, step: Step, outcome: StepOutcome, detail: impl Into<String>) {
         let at_ms = self.elapsed_ms();
         let mut state = self.inner.state.lock_or_recover();
         if outcome == StepOutcome::Fail && state.failed_step.is_none() {
             state.failed_step = Some(step);
         }
-        state.steps.push(StepRecord {
-            step,
-            at_ms,
-            outcome,
-            detail: detail.into(),
-        });
+        match state.steps.len() {
+            len if len < MAX_RECORD_ENTRIES => state.steps.push(StepRecord {
+                step,
+                at_ms,
+                outcome,
+                detail: detail.into(),
+            }),
+            len if len == MAX_RECORD_ENTRIES => state.steps.push(StepRecord {
+                step,
+                at_ms,
+                outcome,
+                detail: format!("{TRUNCATION_MARKER} (at {MAX_RECORD_ENTRIES} steps)"),
+            }),
+            _ => {}
+        }
+    }
+
+    /// Records one visit event, section 7's `events[]` entry (WO-1.5a).
+    ///
+    /// Bounded exactly as [`Recorder::step`] is, and for the same reason:
+    /// a visit held open for a day is one attempt.
+    pub fn event(&self, event: VisitEventKind, detail: impl Into<String>) {
+        let at_ms = self.elapsed_ms();
+        let mut state = self.inner.state.lock_or_recover();
+        match state.events.len() {
+            len if len < MAX_RECORD_ENTRIES => state.events.push(VisitEvent {
+                event,
+                at_ms,
+                detail: detail.into(),
+            }),
+            len if len == MAX_RECORD_ENTRIES => state.events.push(VisitEvent {
+                event,
+                at_ms,
+                detail: format!("{TRUNCATION_MARKER} (at {MAX_RECORD_ENTRIES} events)"),
+            }),
+            _ => {}
+        }
+    }
+
+    /// The round trip percentiles measured over a held visit (WO-1.5a).
+    pub fn set_rtt(&self, median_us: u32, p95_us: u32, samples: u32, source: RttSource) {
+        let mut state = self.inner.state.lock_or_recover();
+        state.rtt_median_us = median_us;
+        state.rtt_p95_us = p95_us;
+        state.rtt_samples = samples;
+        state.rtt_source = source;
     }
 
     /// The attempt id of frame 16, once the porch stream has named it.
@@ -1693,6 +2046,7 @@ impl Recorder {
             started_at_ms: self.inner.started_at_ms,
             ended_at_ms: self.inner.started_at_ms.saturating_add(self.elapsed_ms()),
             steps: state.steps.clone(),
+            events: state.events.clone(),
             failed_step: state.failed_step,
             local_observed: [
                 state.local_observed[0].unwrap_or_default(),
@@ -1708,6 +2062,10 @@ impl Recorder {
             relay_dropped_at_full: state.relay_dropped_at_full,
             path: state.path,
             path_rtt_us: state.path_rtt_us,
+            rtt_median_us: state.rtt_median_us,
+            rtt_p95_us: state.rtt_p95_us,
+            rtt_samples: state.rtt_samples,
+            rtt_source: state.rtt_source,
             reason,
             version: env!("CARGO_PKG_VERSION").to_string(),
             platform: host_platform_name().to_string(),
@@ -1924,6 +2282,27 @@ impl DiagRecord {
                 detail = step.detail,
             ));
         }
+        for event in &self.events {
+            out.push_str(&format!(
+                "   event {name:<18} {at_ms:>6} ms  {detail}\n",
+                name = event.event.as_str(),
+                at_ms = event.at_ms,
+                detail = event.detail,
+            ));
+        }
+        if let Some(line) = self.path_change_summary() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        if self.rtt_samples > 0 {
+            out.push_str(&format!(
+                "rtt over the visit: median {} us, p95 {} us over {} samples ({})\n",
+                self.rtt_median_us,
+                self.rtt_p95_us,
+                self.rtt_samples,
+                self.rtt_source.as_str(),
+            ));
+        }
         out.push_str(&format!("mapping {}\n", self.mapping.as_str()));
         out.push_str(&format!(
             "path {} {} rtt {} us\n",
@@ -1949,6 +2328,47 @@ impl DiagRecord {
             out.push_str(&format!("failed step {}\n", failed.as_str()));
         }
         out
+    }
+
+    /// The one line WO-1.5 case (f) is read off: when a live direct path
+    /// was detected as gone, how long after that traffic was back on the
+    /// relay, when the path was declared dead, and when a rerun got it
+    /// back.
+    ///
+    /// Derived from [`DiagRecord::events`] rather than stored, so it can
+    /// never disagree with them, and `None` when the visit never lost a
+    /// path, which is the ordinary run.
+    ///
+    /// The first of each event is the one taken: a visit that flapped
+    /// twice has its numbers in the event list itself, and a summary line
+    /// that silently averaged two flaps would be worse than no line.
+    #[must_use]
+    pub fn path_change_summary(&self) -> Option<String> {
+        let at = |kind: VisitEventKind| {
+            self.events
+                .iter()
+                .find(|event| event.event == kind)
+                .map(|event| event.at_ms)
+        };
+        let stale = at(VisitEventKind::PathStale)?;
+        let mut line = format!("path change: detected at {stale} ms");
+        if let Some(fell_back) = at(VisitEventKind::FellBack) {
+            line.push_str(&format!(
+                ", back on the relay {} ms later",
+                fell_back.saturating_sub(stale)
+            ));
+        }
+        if let Some(dead) = at(VisitEventKind::PathDead) {
+            line.push_str(&format!(", dead at {dead} ms"));
+        }
+        match at(VisitEventKind::Recovered) {
+            Some(recovered) => line.push_str(&format!(
+                ", recovered at {recovered} ms ({} ms after detection)",
+                recovered.saturating_sub(stale)
+            )),
+            None => line.push_str(", not recovered"),
+        }
+        Some(line)
     }
 }
 
@@ -1994,6 +2414,18 @@ mod tests {
                 outcome: StepOutcome::Ok,
                 detail: "connected".to_string(),
             }],
+            events: vec![
+                VisitEvent {
+                    event: VisitEventKind::VisitOpen,
+                    at_ms: 12,
+                    detail: "relay 203.0.113.1:443".to_string(),
+                },
+                VisitEvent {
+                    event: VisitEventKind::Upgraded,
+                    at_ms: 512,
+                    detail: "direct 203.0.113.5:51823 at 15000 us".to_string(),
+                },
+            ],
             failed_step,
             local_observed: [sample_addr(51_820), sample_addr(51_821)],
             peer_observed: sample_addr(51_822),
@@ -2006,6 +2438,10 @@ mod tests {
             relay_dropped_at_full: 0,
             path: PathChoice::Direct(sample_addr(51_823)),
             path_rtt_us: 15_000,
+            rtt_median_us: 15_000,
+            rtt_p95_us: 22_000,
+            rtt_samples: 88,
+            rtt_source: RttSource::Probe,
             reason,
             version: "0.1.0".to_string(),
             platform: "linux".to_string(),
@@ -2328,6 +2764,146 @@ mod tests {
         let older = DiagRecord::from_json_line(&serde_json::to_string(&value).unwrap()).unwrap();
         assert_eq!(older.relay_queued, 0);
         assert_eq!(older.gate_bytes, record.gate_bytes);
+    }
+
+    /// WO-1.5a: the visit events and the round trip percentiles travel
+    /// into the record, a record written before they existed still reads,
+    /// and the derived summary line says what WO-1.5 case (f) asks for.
+    ///
+    /// Deliberate break to fail this test: read `"events"` with `field`
+    /// rather than `value.get`, which refuses every record written before
+    /// this order as malformed.
+    #[test]
+    fn visit_events_and_rtt_round_trip_and_an_older_record_still_reads() {
+        let mut record = sample_record(Reason::PathIdleTimeout, Some(Step::PathLost));
+        record.events.push(VisitEvent {
+            event: VisitEventKind::PathStale,
+            at_ms: 6_100,
+            detail: "3 consecutive probes unanswered".to_string(),
+        });
+        record.events.push(VisitEvent {
+            event: VisitEventKind::FellBack,
+            at_ms: 6_101,
+            detail: "traffic moved back to the relay session".to_string(),
+        });
+        record.events.push(VisitEvent {
+            event: VisitEventKind::PathDead,
+            at_ms: 11_200,
+            detail: "the stale grace elapsed".to_string(),
+        });
+
+        let parsed = DiagRecord::from_json_line(&record.to_json_line()).unwrap();
+        assert_eq!(parsed, record);
+        assert_eq!(parsed.rtt_median_us, 15_000);
+        assert_eq!(parsed.rtt_p95_us, 22_000);
+        assert_eq!(parsed.rtt_samples, 88);
+        assert_eq!(parsed.rtt_source, RttSource::Probe);
+
+        let summary = parsed.path_change_summary().unwrap();
+        assert!(summary.contains("detected at 6100 ms"), "{summary}");
+        assert!(
+            summary.contains("back on the relay 1 ms later"),
+            "{summary}"
+        );
+        assert!(summary.contains("dead at 11200 ms"), "{summary}");
+        assert!(summary.contains("not recovered"), "{summary}");
+        assert!(record.to_human_report().contains("path change:"));
+        assert!(
+            record
+                .to_human_report()
+                .contains("rtt over the visit: median 15000 us, p95 22000 us over 88 samples")
+        );
+
+        let mut value: serde_json::Value = serde_json::from_str(&record.to_json_line()).unwrap();
+        for key in [
+            "events",
+            "rtt_median_us",
+            "rtt_p95_us",
+            "rtt_samples",
+            "rtt_source",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        let older = DiagRecord::from_json_line(&serde_json::to_string(&value).unwrap()).unwrap();
+        assert!(older.events.is_empty());
+        assert_eq!(older.rtt_samples, 0);
+        assert_eq!(older.rtt_source, RttSource::NotSampled);
+        assert!(older.path_change_summary().is_none());
+    }
+
+    /// A visit that never lost a path has no summary line at all, so the
+    /// ordinary report does not carry an empty one.
+    #[test]
+    fn a_visit_that_never_lost_its_path_has_no_path_change_line() {
+        let record = sample_record(Reason::Ok, None);
+        assert!(record.path_change_summary().is_none());
+        assert!(!record.to_human_report().contains("path change:"));
+    }
+
+    /// Every visit event name round trips, so a house's stdout and a
+    /// record are the one vocabulary.
+    #[test]
+    fn every_visit_event_name_round_trips() {
+        for kind in VisitEventKind::ALL {
+            assert_eq!(VisitEventKind::parse_str(kind.as_str()).unwrap(), kind);
+        }
+        assert!(VisitEventKind::parse_str("no_such_event").is_err());
+        for source in [
+            RttSource::NotSampled,
+            RttSource::Probe,
+            RttSource::Quic,
+            RttSource::Mixed,
+        ] {
+            assert_eq!(RttSource::parse_str(source.as_str()).unwrap(), source);
+        }
+        assert!(RttSource::parse_str("guessed").is_err());
+        assert_eq!(
+            RttSource::Probe.joined(RttSource::Quic),
+            RttSource::Mixed,
+            "a hold that changed path says so"
+        );
+        assert_eq!(
+            RttSource::NotSampled.joined(RttSource::Quic),
+            RttSource::Quic
+        );
+        assert_eq!(RttSource::Probe.joined(RttSource::Probe), RttSource::Probe);
+    }
+
+    /// [`MAX_RECORD_ENTRIES`]: a visit long enough to fill the list stops
+    /// appending and says so, rather than growing a record with uptime.
+    ///
+    /// Deliberate break to fail this test: push unconditionally in
+    /// `Recorder::step` and `Recorder::event`.
+    #[test]
+    fn a_record_stops_growing_at_the_entry_cap_and_says_so() {
+        let recorder = Recorder::new(PeerFingerprint::from_key(&test_salt(), &[3u8; 32]), None);
+        for _ in 0..(MAX_RECORD_ENTRIES + 10) {
+            recorder.step(Step::Live, StepOutcome::Ok, "on the direct path");
+            recorder.event(VisitEventKind::Upgraded, "direct");
+        }
+        let (record, _) = recorder.finish(Reason::Ok);
+        assert_eq!(record.steps.len(), MAX_RECORD_ENTRIES + 1);
+        assert_eq!(record.events.len(), MAX_RECORD_ENTRIES + 1);
+        assert!(
+            record
+                .steps
+                .last()
+                .unwrap()
+                .detail
+                .contains("further entries dropped"),
+            "{:?}",
+            record.steps.last()
+        );
+        assert!(
+            record
+                .events
+                .last()
+                .unwrap()
+                .detail
+                .contains("further entries dropped"),
+            "{:?}",
+            record.events.last()
+        );
     }
 
     // --- reader skips malformed lines ---------------------------------------
