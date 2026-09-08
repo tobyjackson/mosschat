@@ -23,7 +23,7 @@ mod gate {
     };
     use mosschat_net::gate::server::{GateServer, GateServerConfig};
     use mosschat_net::gate::wire::{self, Addr, Frame};
-    use mosschat_net::gate::{ErrorCode, GateError, MemberList};
+    use mosschat_net::gate::{ErrorCode, GateError, MemberList, limits};
     use rand::RngExt;
 
     const LOCALHOST_ANY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
@@ -107,6 +107,34 @@ mod gate {
             }),
             other => Err(format!("expected Registered, got {other:?}").into()),
         }
+    }
+
+    /// A raw connection to the gate's secondary (reflection) port, for the
+    /// one test that needs more than one `Reflect` exchange on a single
+    /// connection.
+    async fn raw_secondary(
+        secondary_addr: SocketAddr,
+        identity_seed: [u8; 32],
+    ) -> Result<quinn::Connection, Box<dyn std::error::Error>> {
+        authed::install_crypto_provider();
+        let (cert, key) = authed::self_signed_cert(&identity_seed)?;
+        let tls = authed::client_tls_config(cert, key, b"moss-gate")?;
+        let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
+        let client_config = quinn::ClientConfig::new(Arc::new(quic_client));
+        let mut endpoint = quinn::Endpoint::client(LOCALHOST_ANY)?;
+        endpoint.set_default_client_config(client_config);
+        let connection = endpoint.connect(secondary_addr, "gate")?.await?;
+        Ok(connection)
+    }
+
+    /// One `Reflect` exchange on `connection`, returning whatever the gate
+    /// answered: `Reflected` or the `Error` frame refusing it.
+    async fn raw_reflect(
+        connection: &quinn::Connection,
+    ) -> Result<Frame, Box<dyn std::error::Error>> {
+        let (mut send, mut recv) = connection.open_bi().await?;
+        wire::write_frame(&mut send, &Frame::Reflect { v: 1 }).await?;
+        Ok(wire::read_frame(&mut recv, Duration::from_secs(5)).await?)
     }
 
     // ------------------------------------------------------------------
@@ -907,18 +935,49 @@ mod gate {
         );
     }
 
-    /// A third `Reflect` inside the same minute is refused (section 1: "2
-    /// per minute").
+    /// A third `Reflect` on one connection is refused, and a new
+    /// connection for the same key may reflect at once (amendment 3,
+    /// 2026-09-08: "2 per connection; reconnecting resets it").
     ///
-    /// Deliberate break to fail this test: in
-    /// `server.rs::handle_secondary_connection`, remove the
-    /// `reflect_attempts` rate-limit block. The third `reflect` call then
-    /// succeeds instead of erroring.
+    /// `GateClient::reflect` dials its own short-lived connection every
+    /// call, so three exchanges on one connection is something only a raw
+    /// client can do, and the per-connection cap is exactly what needs it.
+    ///
+    /// Deliberate break to fail this test, run for real: in
+    /// `server.rs::handle_secondary_connection`, drop the
+    /// `reflections_served >= limits::REFLECT_PER_CONNECTION` block. The
+    /// third `Reflect` on the one connection is then answered `Reflected`
+    /// instead of `Error`. Making the counter per key again fails the
+    /// second half instead: the reconnecting reflections stop at two.
     #[tokio::test]
-    async fn reflect_rate_limit_is_enforced() {
+    async fn a_third_reflect_on_one_connection_is_refused_but_reconnecting_resets_it() {
         let community = random_seed();
         let seed = random_seed();
         let server = start_gate(&[public_key_of(&seed)], community, 256);
+
+        let connection = raw_secondary(server.secondary_addr(), seed).await.unwrap();
+        for exchange in 1..=2 {
+            let reply = raw_reflect(&connection).await.unwrap();
+            assert!(
+                matches!(reply, Frame::Reflected { .. }),
+                "exchange {exchange} on one connection must be answered: {reply:?}"
+            );
+        }
+        match raw_reflect(&connection).await.unwrap() {
+            Frame::Error { code, .. } => assert_eq!(code, ErrorCode::RateLimited as u8),
+            other => panic!("the third Reflect on one connection must be refused: {other:?}"),
+        }
+        assert_eq!(
+            server
+                .counters()
+                .reflect_rate_limited
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // Reconnecting resets it, with no wait at all: three reflections
+        // back to back, each on its own connection, which is what
+        // `mosschat doctor` run three times inside a minute does.
         let member = connect_client(
             &server,
             seed,
@@ -928,15 +987,101 @@ mod gate {
         )
         .await
         .unwrap();
-
-        member.reflect(server.secondary_addr()).await.unwrap();
-        member.reflect(server.secondary_addr()).await.unwrap();
-        let third = member.reflect(server.secondary_addr()).await;
-        assert!(third.is_err());
+        for run in 1..=3 {
+            member
+                .reflect(server.secondary_addr())
+                .await
+                .unwrap_or_else(|e| panic!("reflection {run} on a fresh connection: {e}"));
+        }
         assert_eq!(
             server
                 .counters()
                 .reflect_rate_limited
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a fresh connection is never rate limited for reflecting"
+        );
+    }
+
+    /// A fifth secondary-port connection for one key inside a minute is
+    /// refused, while a different key connects and reflects untouched
+    /// (amendment 3: the secondary port carries its own 4 connection
+    /// attempts per key per minute, its own bucket).
+    ///
+    /// The refusal is the connection close carrying section 7's
+    /// `gate_rate_limited` code, not frame 12: the limit is charged as soon
+    /// as the handshake completes, before any stream is awaited, because a
+    /// limit on connections that waits for a frame does not bound
+    /// connections that never send one. That is the primary port's own
+    /// shape for the identical refusal.
+    ///
+    /// Deliberate break to fail this test, run for real: in
+    /// `server.rs::handle_secondary_connection`, remove the
+    /// `secondary_attempts` block. The fifth connection then reflects like
+    /// the first four.
+    #[tokio::test]
+    async fn a_fifth_secondary_connection_for_one_key_is_refused_but_another_key_is_not() {
+        let community = random_seed();
+        let busy_seed = random_seed();
+        let other_seed = random_seed();
+        let server = start_gate(
+            &[public_key_of(&busy_seed), public_key_of(&other_seed)],
+            community,
+            256,
+        );
+
+        // Four connections, one reflection each, which is four `mosschat
+        // doctor` runs' worth of secondary-port traffic in a minute.
+        for attempt in 1..=limits::SECONDARY_ATTEMPTS_PER_MINUTE {
+            let connection = raw_secondary(server.secondary_addr(), busy_seed)
+                .await
+                .unwrap();
+            let reply = raw_reflect(&connection).await.unwrap();
+            assert!(
+                matches!(reply, Frame::Reflected { .. }),
+                "connection {attempt} of {} must be served: {reply:?}",
+                limits::SECONDARY_ATTEMPTS_PER_MINUTE
+            );
+        }
+
+        let fifth = raw_secondary(server.secondary_addr(), busy_seed)
+            .await
+            .unwrap();
+        assert!(
+            raw_reflect(&fifth).await.is_err(),
+            "the fifth connection inside the minute must not be served"
+        );
+        let closed = tokio::time::timeout(Duration::from_secs(5), fifth.closed())
+            .await
+            .expect("the gate closes a refused connection rather than holding it");
+        match closed {
+            quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
+                u64::from(close.error_code),
+                ErrorCode::RateLimited as u64,
+                "the close must carry section 7's code, which is how the house names the reason"
+            ),
+            other => panic!("expected an application close naming the refusal: {other:?}"),
+        }
+        assert_eq!(
+            server
+                .counters()
+                .secondary_attempts_rate_limited
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // The bucket is per key: another member is untouched by it.
+        let other = raw_secondary(server.secondary_addr(), other_seed)
+            .await
+            .unwrap();
+        assert!(
+            matches!(raw_reflect(&other).await.unwrap(), Frame::Reflected { .. }),
+            "a different key's first connection is not charged for this one"
+        );
+        assert_eq!(
+            server
+                .counters()
+                .secondary_attempts_rate_limited
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );

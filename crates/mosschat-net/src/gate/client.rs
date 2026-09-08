@@ -979,19 +979,42 @@ impl GateClient {
         // record with no failed step and `doctor --gate` exited 0 on a
         // reflection that never happened.
         let reflect_step = |e: GateError| {
+            // The lease goes back on every exit, not only the happy one.
+            // These three paths used to return without it, leaving the
+            // gate's secondary address in the porch socket's live source
+            // set (section 3) for the life of the process, so packets from
+            // that address stayed admissible long after the short
+            // connection that justified them had gone.
+            self.inner.porch.forget_source(lease);
             record_gate_close(rec, Step::ReflectSecondary, &e, &connection);
             e
         };
-        let (mut send, mut recv) = connection
-            .open_bi()
+        // One budget of section 5's deadline for the whole exchange, for
+        // the reason `goodbye` has one (Yseult's M1 on PR 69, which named
+        // these lines too): only the reply read carried a deadline, while
+        // opening the stream and writing to it block with no deadline of
+        // their own, `write_all` on stream flow control. `doctor` calls
+        // this with no timeout of its own around it, so a gate that stops
+        // issuing `MAX_STREAM_DATA` here hangs the run exactly as it could
+        // at the goodbye.
+        let deadline = tokio::time::Instant::now() + authed::control_read_deadline();
+        let (mut send, mut recv) = tokio::time::timeout_at(deadline, connection.open_bi())
             .await
+            .map_err(|_| reflect_step(GateError::Timeout))?
             .map_err(|e| reflect_step(e.into()))?;
-        wire::write_frame(&mut send, &Frame::Reflect { v: 1 })
-            .await
-            .map_err(reflect_step)?;
-        let reply = wire::read_frame(&mut recv, authed::control_read_deadline())
-            .await
-            .map_err(reflect_step)?;
+        tokio::time::timeout_at(
+            deadline,
+            wire::write_frame(&mut send, &Frame::Reflect { v: 1 }),
+        )
+        .await
+        .map_err(|_| reflect_step(GateError::Timeout))?
+        .map_err(reflect_step)?;
+        let reply = wire::read_frame(
+            &mut recv,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await
+        .map_err(reflect_step)?;
         // Closes promptly so the gate's secondary-port handler (which waits
         // for this before dropping its own `Connection`, see `server.rs`)
         // does not sit on its bounded wait for no reason.
@@ -1285,9 +1308,15 @@ fn gate_close_reason(connection: &quinn::Connection) -> Option<Reason> {
 /// the house can read it. Without it the record's detail was "stream read
 /// error: connection lost" for a refusal the gate had named.
 fn closed_detail(e: &GateError, connection: &quinn::Connection) -> String {
+    // Both halves go through `gate_text`, not only the close reason: a
+    // `GateError` carries gate-authored text too, `Protocol` most of all
+    // ("expected Registered or Error, got {other:?}" prints a decoded
+    // frame, `Error.detail` inside it). Whichever half a hostile gate
+    // reaches the report through, it reaches it stripped and capped.
+    let error = gate_text(&e.to_string());
     match connection.close_reason() {
-        Some(reason) => format!("{e} ({})", gate_text(&reason.to_string())),
-        None => e.to_string(),
+        Some(reason) => format!("{error} ({})", gate_text(&reason.to_string())),
+        None => error,
     }
 }
 

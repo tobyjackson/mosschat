@@ -68,9 +68,15 @@ pub struct ServerCounters {
     /// A control frame dropped because the connection's frame rate limit
     /// (section 1: 32/s, burst 64) was exceeded.
     pub frame_rate_limited: AtomicU64,
-    /// A `Reflect` request refused because that key's `Reflect` rate limit
-    /// (section 1: 2/minute) was exceeded.
+    /// A `Reflect` request refused because its connection had already been
+    /// served [`limits::REFLECT_PER_CONNECTION`] of them (amendment 3).
     pub reflect_rate_limited: AtomicU64,
+    /// A secondary-port connection refused because that key had already
+    /// made [`limits::SECONDARY_ATTEMPTS_PER_MINUTE`] of them inside the
+    /// minute (amendment 3), counted separately from
+    /// `reflect_rate_limited`: one bounds how many connections a key may
+    /// make, the other how many reflections one connection may have.
+    pub secondary_attempts_rate_limited: AtomicU64,
     /// A `Keepalive` dropped because the connection's keepalive rate limit
     /// (section 1: 3/s tolerated) was exceeded.
     pub keepalive_rate_limited: AtomicU64,
@@ -197,10 +203,15 @@ struct ServerState {
     /// separately from [`limits::MAX_CONNECTIONS_PER_KEY`], which bounds
     /// concurrent connections rather than the rate of new ones.
     register_attempts: StdMutex<HashMap<[u8; 32], RateLimiter>>,
-    /// Section 1: "`Reflect`: ... 2 per minute", tracked per key since each
-    /// `Reflect` rides its own short-lived secondary-port connection rather
-    /// than a long-lived registration.
-    reflect_attempts: StdMutex<HashMap<[u8; 32], RateLimiter>>,
+    /// Amendment 3: the secondary port's own "4 connection attempts per key
+    /// per minute", a separate bucket from `register_attempts` rather than
+    /// a share of it. One `mosschat doctor` run costs one connection on
+    /// each port, so two buckets of 4 give four runs a minute and keep the
+    /// two ports symmetrical, where one shared bucket would halve it to
+    /// two. Before this the secondary port had no per-key connection limit
+    /// at all: `Reflect`'s own limit made a flood of connections useless
+    /// rather than stopping it.
+    secondary_attempts: StdMutex<HashMap<[u8; 32], RateLimiter>>,
     counters: ServerCounters,
 }
 
@@ -372,7 +383,7 @@ impl GateServer {
             sessions: StdMutex::new(HashMap::new()),
             pending_handshakes: AtomicUsize::new(0),
             register_attempts: StdMutex::new(HashMap::new()),
-            reflect_attempts: StdMutex::new(HashMap::new()),
+            secondary_attempts: StdMutex::new(HashMap::new()),
             counters: ServerCounters::default(),
         });
 
@@ -479,7 +490,7 @@ fn sweep_once(state: &Arc<ServerState>) {
         attempts.retain(|_, limiter| !limiter.is_full());
     }
     {
-        let mut attempts = state.reflect_attempts.lock_or_recover();
+        let mut attempts = state.secondary_attempts.lock_or_recover();
         attempts.retain(|_, limiter| !limiter.is_full());
     }
     let expired: Vec<([u8; 32], Registration)> = {
@@ -538,53 +549,103 @@ async fn handle_secondary_connection(
         return Ok(());
     }
 
-    // Section 1: "`Reflect`: ... 2 per minute", tracked per key.
-    let reflect_allowed = {
-        let mut attempts = state.reflect_attempts.lock_or_recover();
+    // Amendment 3: the secondary port's own connection attempt limit, 4 per
+    // key per minute, its own bucket. Charged here, as soon as the
+    // handshake completes and before any stream is awaited, for the same
+    // reason the primary port charges its own here: a limit on connections
+    // that waits for a frame does not bound connections that never send
+    // one. That is also why the refusal cannot be frame 12, which needs a
+    // stream to ride; it is the close, carrying the same `ErrorCode`
+    // (`close_refused`), which is how the primary port's identical refusal
+    // reaches a house too.
+    let attempt_allowed = {
+        let mut attempts = state.secondary_attempts.lock_or_recover();
         let limiter = attempts.entry(authed.peer_key()).or_insert_with(|| {
-            RateLimiter::per_minute(limits::REFLECT_PER_MINUTE, limits::REFLECT_PER_MINUTE)
+            RateLimiter::per_minute(
+                limits::SECONDARY_ATTEMPTS_PER_MINUTE,
+                limits::SECONDARY_ATTEMPTS_PER_MINUTE,
+            )
         });
         limiter.try_take()
     };
-    if !reflect_allowed {
+    if !attempt_allowed {
         state
             .counters
-            .reflect_rate_limited
+            .secondary_attempts_rate_limited
             .fetch_add(1, Ordering::Relaxed);
         close_refused(&authed, ErrorCode::RateLimited, b"gate_rate_limited");
         return Ok(());
     }
 
-    let observed = authed.connection().remote_address();
-    let (mut send, mut recv) = tokio::time::timeout(
-        authed::control_read_deadline(),
-        authed.connection().accept_bi(),
-    )
-    .await
-    .map_err(|_| GateError::Timeout)??;
-    let frame = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
-    if !matches!(frame, Frame::Reflect { .. }) {
-        return Err(GateError::Protocol(
-            "expected Reflect as the first frame".into(),
-        ));
+    // Amendment 3 (2026-09-08): the `Reflect` cap is per connection, so its
+    // whole state is this counter, which lives exactly as long as the
+    // connection it bounds and needs no map, no key and no sweep. It was a
+    // per-key token bucket, which made it stricter than the connection rate
+    // it sits under: a member allowed 4 connection attempts a minute could
+    // reflect on only 2 of them, so `mosschat doctor` run twice in a minute
+    // failed the second time. The per-key brake is this port's own
+    // `SECONDARY_ATTEMPTS_PER_MINUTE` below, which bounds one key at 8
+    // reflections a minute; not `Register`'s, whose bucket is on the
+    // primary port and gates nothing here.
+    let mut reflections_served = 0u32;
+    // One `Reflect` per connection is the intended use, and the house
+    // closes as soon as it has its answer; the loop is what makes the cap
+    // of 2 real rather than a number nothing could reach, and what keeps
+    // this connection alive between answers. Dropping the last `Connection`
+    // handle closes it at once (quinn's `ConnectionRef::drop`), which would
+    // race the reply reaching the house, so the wait for the next stream is
+    // also the wait for the house to close.
+    loop {
+        let accepted = tokio::time::timeout(
+            authed::control_read_deadline(),
+            authed.connection().accept_bi(),
+        )
+        .await;
+        // A house that has closed, or one that opens nothing at all inside
+        // the deadline, is simply let go: it has had every answer it asked
+        // for, and neither case is an error to report.
+        let Ok(Ok((mut send, mut recv))) = accepted else {
+            return Ok(());
+        };
+        let frame = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
+        if !matches!(frame, Frame::Reflect { .. }) {
+            return Err(GateError::Protocol(
+                "expected Reflect as the first frame".into(),
+            ));
+        }
+        if reflections_served >= limits::REFLECT_PER_CONNECTION {
+            state
+                .counters
+                .reflect_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
+            // A hard cap, so the gate closes rather than keeping the
+            // connection (section 1: "over a rate limit the gate answers
+            // `Error{gate_rate_limited}` and keeps the registration; over a
+            // hard cap it closes"). The house is told which, either way.
+            send_error_and_close(
+                &mut send,
+                &authed,
+                ErrorCode::RateLimited,
+                "gate_rate_limited",
+            )
+            .await;
+            return Ok(());
+        }
+        reflections_served += 1;
+        // Sampled per answer, not once for the connection (Yseult's I1 on
+        // PR 73): `remote_address` follows a completed migration, and frame
+        // 4's `observed` is defined as the source address the gate saw, so
+        // a connection that migrates between its two reflections must get
+        // the address behind the second one. It is what section 7's mapping
+        // inference compares. Before amendment 3 every answer came from a
+        // fresh connection, so a single sample was always current.
+        let reply = Frame::Reflected {
+            v: 1,
+            observed: Addr::from_socket_addr(authed.connection().remote_address()),
+        };
+        wire::write_frame(&mut send, &reply).await?;
+        send.finish().ok();
     }
-    let reply = Frame::Reflected {
-        v: 1,
-        observed: Addr::from_socket_addr(observed),
-    };
-    wire::write_frame(&mut send, &reply).await?;
-    send.finish().ok();
-    // Dropping the last `Connection` handle closes it at once (quinn's
-    // `ConnectionRef::drop`), which can race the reply actually reaching
-    // the house if this task returns immediately. Wait for the house to
-    // close its side first (it does, right after reading the reply),
-    // bounded so a house that never closes cannot hang this task forever.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        authed.connection().closed(),
-    )
-    .await;
-    Ok(())
 }
 
 async fn accept_loop_primary(endpoint: quinn::Endpoint, state: Arc<ServerState>) {

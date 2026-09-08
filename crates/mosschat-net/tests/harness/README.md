@@ -302,25 +302,29 @@ lists every row id if you want to run a subset with `--rows`.
 
 `mosschat doctor` is a real house session: it registers on the gate's
 primary port and then reflects off the secondary one, on a second
-connection. Section 1 of `docs/dev/gatehouse-design.md` rate limits both
-**per key**, and the matrix runs twelve rows back to back, so pointing
-every row at one `--identity-file` hits those limits from the third row
-on, whatever netem is doing:
+connection. Section 1 of `docs/dev/gatehouse-design.md` limits `Register`
+to **4 connection attempts per key per minute**, and the matrix runs
+twelve rows back to back, so pointing every row at one `--identity-file`
+runs out of attempts partway through: from the fifth run the registration
+is refused, and that run exits 1 with reason `gate_rate_limited` and
+`failed_step gate_register`. That is not the row's fault condition, and it
+is not netem.
 
-- `Reflect`, 2 per minute per key: from the third run the secondary
-  reflection is refused, and the run exits 1 with reason
-  `gate_rate_limited` and `failed_step reflect_secondary`.
-- `Register`, 4 connection attempts per key per minute: from the fifth
-  run the registration itself is refused, same reason, `failed_step
-  gate_register`.
+(The `Reflect` cap is 2 **per connection** since amendment 3, and every
+run dials its own, so reflections themselves are not what runs out.
+Before that amendment it was 2 per key per minute, which is why the
+2026-09-08 run also failed at `reflect_secondary` from its third row. The
+secondary port has its own 4 connection attempts per key per minute, a
+separate bucket, so it runs out at the same fifth run the primary port
+does rather than earlier.)
 
-Neither is the row's own fault condition. Give each row its own identity
-(one seed file per row, every one of those public keys in the gate's
-members file), or pace the rows at least 60 seconds apart, and say which
-you did beside the results. The 2026-09-08 run did neither: its rows 3 to
-10 ran inside four seconds on one identity and measured the gate's per-key
-limits, not netem, and rows 11 and 12 passed only because the
-`blackout-60s` row's own 60 second hold had let the buckets refill.
+Give each row its own identity (one seed file per row, every one of those
+public keys in the gate's members file), or pace the rows at least 60
+seconds apart, and say which you did beside the results. The 2026-09-08
+run did neither: its rows 3 to 10 ran inside four seconds on one identity
+and measured the gate's per-key limits rather than netem, and rows 11 and
+12 passed only because the `blackout-60s` row's own 60 second hold had let
+the buckets refill.
 
 Every row is bounded by `timeout --kill-after=5 <row-timeout>` (default
 180 seconds, `--row-timeout` to change it), and `timeout` kills its
