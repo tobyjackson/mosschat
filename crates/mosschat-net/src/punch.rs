@@ -716,12 +716,15 @@ pub struct Winner {
 pub struct Attempt {
     id: [u8; 16],
     key: [u8; 32],
-    /// The peer's address as the gate observed it for this attempt (frame
-    /// 6's `peer_observed`), which is the one address a peer may name that
-    /// is not globally routable: the gate saw the packet come from it, so
-    /// it is not a third party this peer picked. See
-    /// [`Attempt::add_candidate`].
-    gate_reflected_peer: Option<SocketAddr>,
+    /// The addresses something other than this peer's own say-so vouches
+    /// for **in this attempt**, and so the only addresses outside the
+    /// globally routable range its `Candidates` frame may name: the gate's
+    /// reflection of that peer (frame 6's `peer_observed`), and every
+    /// address this house heard that peer announce from on its own network
+    /// (section 6). Held unmapped, so one address has one spelling here
+    /// and cannot be vouched for in a form the classifier does not read
+    /// (issue #37). See [`Attempt::add_candidate`].
+    vouched: Vec<SocketAddr>,
     fire_at: Option<Instant>,
     candidates: Vec<Candidate>,
     winner: Option<Winner>,
@@ -744,17 +747,20 @@ impl Attempt {
     /// A fresh attempt with no candidates and no start signal yet.
     ///
     /// `gate_reflected_peer` is the peer's address as the gate observed it
-    /// for this attempt (frame 6's `peer_observed`). It is the one
-    /// non-globally-routable address the peer is allowed to name, because
-    /// the gate saw a packet arrive from it rather than taking the peer's
-    /// word; `None` means the peer may name only globally routable
-    /// addresses.
+    /// for this attempt (frame 6's `peer_observed`). It is one of the
+    /// non-globally-routable addresses the peer is allowed to name,
+    /// because the gate saw a packet arrive from it rather than taking the
+    /// peer's word; the others are whatever [`Attempt::add_discovered`]
+    /// puts in. `None` means the gate vouches for nothing here.
     #[must_use]
     pub fn new(id: [u8; 16], key: [u8; 32], gate_reflected_peer: Option<SocketAddr>) -> Self {
         Self {
             id,
             key,
-            gate_reflected_peer,
+            vouched: gate_reflected_peer
+                .map(crate::sock::unmap_v4)
+                .into_iter()
+                .collect(),
             fire_at: None,
             candidates: Vec::new(),
             winner: None,
@@ -771,16 +777,21 @@ impl Attempt {
     /// [`MAX_CANDIDATES`] cap is already reached, or the address is one a
     /// peer may not point this house at.
     ///
-    /// **What a peer may name** (Yseult's Medium). An address this house
-    /// gathered for itself, or discovered on its own network, is trusted
-    /// because this house found it. An address the *peer* named is trusted
-    /// only if the wider internet could have routed it here, or if it is
-    /// exactly the address the gate observed that peer at for this attempt,
-    /// which is the same-LAN case section 6 exists for and which the gate,
-    /// not the peer, vouches for. Anything else, a peer naming
-    /// `127.0.0.1:631` or a router on this house's LAN, is refused: 16
-    /// candidates at about 37 probes each is a scan, and a keyed hash does
-    /// not make it not one.
+    /// **What a peer may name** (Yseult's Medium, issue #37). An address
+    /// this house gathered for itself, or discovered on its own network,
+    /// is trusted because this house found it. An address the *peer* named
+    /// is trusted only if the wider internet could have routed it here, or
+    /// if it is one of this attempt's vouched addresses: the address the
+    /// gate observed that peer at, or an address this house itself heard
+    /// that peer announce from on its own network (section 6). That
+    /// second one is the relaxation issue #37 asks for, and it is exactly
+    /// as wide as the design allows: a private-range, link-local or
+    /// IPv4-mapped LAN address is admissible when local discovery or the
+    /// gate's reflection produced it **for this attempt**, and never
+    /// because a peer's candidate list said so. Anything else, a peer
+    /// naming `127.0.0.1:631` or a router on this house's LAN, is refused:
+    /// 16 candidates at about 37 probes each is a scan, and a keyed hash
+    /// does not make it not one.
     pub fn add_candidate(&mut self, addr: SocketAddr, source: CandidateSource) -> bool {
         // Unmapped first, and before anything classifies it (Yseult's
         // remaining Medium). `Addr` family 6 decodes `::ffff:a.b.c.d`
@@ -801,7 +812,7 @@ impl Attempt {
         }
         if source == CandidateSource::PeerReported
             && !is_globally_routable(addr)
-            && self.gate_reflected_peer != Some(addr)
+            && !self.vouched.contains(&addr)
         {
             return false;
         }
@@ -818,10 +829,77 @@ impl Attempt {
         true
     }
 
+    /// Adds an address this house heard the peer announce from on its own
+    /// network (section 6), which both makes it a [`CandidateSource::Discovery`]
+    /// candidate and vouches for it for the rest of this attempt.
+    ///
+    /// Vouching and adding are one call on purpose (issue #37): the whole
+    /// relaxation rests on the address having come from a multicast
+    /// announce this house received itself, whose source address the
+    /// kernel wrote and whose key `mosschat_core::identity::verify`
+    /// checked, so there is no way to vouch for an address without also
+    /// naming where it came from. A peer's `Candidates` frame reaches
+    /// [`Attempt::add_peer_candidates`] instead, which cannot produce a
+    /// `Discovery` candidate and cannot vouch for anything.
+    ///
+    /// Returns `false` on a duplicate or past the cap, exactly as
+    /// [`Attempt::add_candidate`] does; the address is vouched for either
+    /// way, since a peer naming an address this house already discovered
+    /// is naming a discovered address.
+    pub fn add_discovered(&mut self, addr: SocketAddr) -> bool {
+        self.vouch(addr);
+        self.add_candidate(addr, CandidateSource::Discovery)
+    }
+
+    /// Records that something other than the peer's own say-so vouches for
+    /// `addr` in this attempt, without adding it as a candidate.
+    ///
+    /// The two halves are separable because they can genuinely come apart:
+    /// an announce that arrives once the table is already at
+    /// [`MAX_CANDIDATES`] still means this house heard the peer at that
+    /// address, so the peer naming it is not the peer inventing it. The
+    /// address is unmapped first, so one address is vouched for in one
+    /// spelling and cannot slip through the classifier in the other
+    /// (Yseult, issue #37).
+    pub fn vouch(&mut self, addr: SocketAddr) {
+        let addr = crate::sock::unmap_v4(addr);
+        if !self.vouched.contains(&addr) {
+            self.vouched.push(addr);
+        }
+    }
+
+    /// Adds every address a peer's `Candidates` frame (frame 16) named, as
+    /// [`CandidateSource::PeerReported`] and nothing else.
+    ///
+    /// The one entry point the porch stream's decoded frame takes, so
+    /// "never from a peer's candidate list" (issue #37) is a property of
+    /// the type rather than of a call site remembering to pass the right
+    /// source: nothing a peer sends can reach this house's candidate table
+    /// as `Discovery`, `Local` or `GateReflected`, and so nothing a peer
+    /// sends can vouch for a private-range address.
+    ///
+    /// Returns how many were accepted.
+    pub fn add_peer_candidates(&mut self, addrs: &[Addr]) -> usize {
+        addrs
+            .iter()
+            .filter_map(|addr| addr.to_socket_addr())
+            .filter(|addr| self.add_candidate(*addr, CandidateSource::PeerReported))
+            .count()
+    }
+
     /// How many candidates are under probe.
     #[must_use]
     pub fn candidate_count(&self) -> usize {
         self.candidates.len()
+    }
+
+    /// Whether this attempt holds something other than the peer's word for
+    /// `addr`, which is the whole of the test [`Attempt::add_candidate`]
+    /// applies to a peer-named address outside the globally routable range
+    /// (issue #37). Either spelling of one address answers the same.
+    #[must_use]
+    pub fn vouched_for(&self, addr: SocketAddr) -> bool {
+        self.vouched.contains(&crate::sock::unmap_v4(addr))
     }
 
     /// The source recorded for `addr`, if it is a candidate.
@@ -1123,6 +1201,16 @@ pub struct DoorbellParams {
     /// 6's `peer_observed`), which is the one address outside the globally
     /// routable range the peer may name. See [`Attempt::add_candidate`].
     pub peer_observed: Option<SocketAddr>,
+    /// The addresses this house has heard this peer announce from on its
+    /// own network (section 6), each already verified there against
+    /// `mosschat_core::identity::verify` and each carrying the source
+    /// address the kernel wrote rather than one the peer chose.
+    ///
+    /// They enter the attempt as [`CandidateSource::Discovery`] and vouch
+    /// for themselves for the length of the attempt, which is what lets a
+    /// same-LAN pair upgrade to a private-range address at all (issue
+    /// #37). Empty is the ordinary case: no discovery, no relaxation.
+    pub peer_discovered: Vec<SocketAddr>,
 }
 
 /// A live doorbell's one control: whether it still answers pings.
@@ -1314,11 +1402,15 @@ pub async fn run_doorbell(
     let _attempt_guard = AttemptGuard::arm(porch, gate, attempt, key, params.session);
 
     let mut state = Attempt::new(attempt, key, params.peer_observed);
-    for addr in peer_addrs {
-        if let Some(addr) = addr.to_socket_addr() {
-            state.add_candidate(addr, CandidateSource::PeerReported);
-        }
+    // Discovery first, so an address this house heard the peer announce on
+    // its own network is already vouched for by the time that peer's own
+    // list is read (issue #37): the same LAN address then arrives as one
+    // candidate this house found, not as a private range a peer talked it
+    // into probing.
+    for addr in &params.peer_discovered {
+        state.add_discovered(*addr);
     }
+    state.add_peer_candidates(&peer_addrs);
 
     // Step 4. Either side may ask; the initiator does, so exactly one
     // request is sent for the ordinary case and the 4 per session budget
@@ -2063,6 +2155,125 @@ mod tests {
         // globally routable addresses.
         let mut bare = Attempt::new(ID, KEY, None);
         assert!(!bare.add_candidate(reflected, CandidateSource::PeerReported));
+    }
+
+    /// Issue #37, the relaxation and its limit in one test. A private-range
+    /// LAN address is admissible from a peer's `Candidates` frame when, and
+    /// only when, this house itself heard that peer announce from it on
+    /// this network for this attempt (section 6) or the gate reflected it
+    /// for this attempt. The same address named by a peer this house has
+    /// discovered nothing about is still refused.
+    ///
+    /// Deliberate break to fail this test: in `Attempt::add_discovered`,
+    /// delete the `self.vouch(addr)` line, keeping the `add_candidate`
+    /// call. The discovered address is still a candidate,
+    /// so the first half passes, and the peer's own naming of it is refused
+    /// again, so the second assertion fails.
+    #[test]
+    fn a_discovered_lan_address_is_vouched_for_and_an_undiscovered_one_is_not() {
+        let announced: SocketAddr = "192.168.4.21:4433".parse().unwrap();
+        let unheard: SocketAddr = "192.168.4.99:4433".parse().unwrap();
+
+        let mut attempt = Attempt::new(ID, KEY, None);
+        assert!(attempt.add_discovered(announced));
+        assert_eq!(
+            attempt.source_of(announced),
+            Some(CandidateSource::Discovery),
+            "a discovered address is a discovery-sourced candidate, never a peer-reported one"
+        );
+
+        // The peer naming the same address adds nothing new (it is already
+        // a candidate) but is not refused for being private: discovery
+        // vouched for it.
+        assert!(
+            attempt.vouched_for(announced),
+            "hearing the announce is what vouches for the address"
+        );
+        assert_eq!(
+            attempt.add_peer_candidates(&[Addr::from_socket_addr(announced)]),
+            0,
+            "already a candidate, so the peer naming it adds nothing"
+        );
+        // A duplicate, not a rejection: on a fresh attempt with the same
+        // vouching, the peer's own naming of it is accepted outright.
+        let mut fresh = Attempt::new(ID, KEY, None);
+        fresh.vouch(announced);
+        assert_eq!(
+            fresh.add_peer_candidates(&[Addr::from_socket_addr(announced)]),
+            1,
+            "a vouched private address is admissible from the peer's list"
+        );
+        assert_eq!(
+            fresh.source_of(announced),
+            Some(CandidateSource::PeerReported)
+        );
+
+        // Nothing vouched for this one, so it is refused exactly as before.
+        assert_eq!(
+            fresh.add_peer_candidates(&[Addr::from_socket_addr(unheard)]),
+            0,
+            "an undiscovered private address is still refused from a peer"
+        );
+
+        // And link-local and IPv4-mapped LAN forms travel the same road:
+        // vouched, admissible; unvouched, refused.
+        let link_local: SocketAddr = "169.254.7.7:4433".parse().unwrap();
+        let mut mapped = Attempt::new(ID, KEY, None);
+        assert_eq!(
+            mapped.add_peer_candidates(&[Addr::from_socket_addr(link_local)]),
+            0
+        );
+        assert!(mapped.add_discovered("[::ffff:169.254.7.7]:4433".parse().unwrap()));
+        assert!(
+            mapped.vouched_for(link_local),
+            "the mapped spelling vouches for the IPv4 form and no other"
+        );
+        assert_eq!(
+            mapped.source_of(link_local),
+            Some(CandidateSource::Discovery),
+            "vouched and stored in its IPv4 form, so one address has one verdict"
+        );
+    }
+
+    /// The other direction of issue #37, and the invariant the relaxation
+    /// rests on: nothing arriving in a peer's `Candidates` frame can enter
+    /// the table as anything but [`CandidateSource::PeerReported`], so a
+    /// peer cannot vouch for its own private-range address by claiming it
+    /// was discovered.
+    ///
+    /// Deliberate break to fail this test: in
+    /// `Attempt::add_peer_candidates`, change `CandidateSource::PeerReported`
+    /// to `CandidateSource::Discovery`. Every refused address is then
+    /// accepted and the count assertion fails on the first line.
+    #[test]
+    fn a_peer_candidate_list_can_only_produce_peer_reported_candidates() {
+        let mut attempt = Attempt::new(ID, KEY, None);
+        let named: Vec<Addr> = [
+            "127.0.0.1:631",
+            "192.168.1.1:53",
+            "[fd00::1]:4433",
+            "[::ffff:10.0.0.1]:53",
+        ]
+        .iter()
+        .map(|a| Addr::from_socket_addr(a.parse().unwrap()))
+        .collect();
+        assert_eq!(
+            attempt.add_peer_candidates(&named),
+            0,
+            "a peer's list vouches for nothing"
+        );
+        assert_eq!(attempt.candidate_count(), 0);
+
+        // A globally routable one from the same list is accepted, and as
+        // peer-reported.
+        assert_eq!(
+            attempt.add_peer_candidates(&[Addr::from_socket_addr(addr(4433))]),
+            1
+        );
+        assert_eq!(
+            attempt.source_of(addr(4433)),
+            Some(CandidateSource::PeerReported)
+        );
     }
 
     /// Yseult's remaining Medium: one address, two spellings, one verdict.
