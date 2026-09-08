@@ -1,0 +1,9 @@
+# hewn-mini 7.0.0-31-generic 2026-09-08T16:22:45Z
+community: f733993a7ed3f79b9aeceb87bf726323c9879a0f61b1415c882b81bc4467b706
+house-a: d58cf7d9108dd3253f4874ee9827bb9358a95af4fba0086acb3faa411795cd3b
+house-b: 6ea261bd1e2794a0612d6e01b5c3a3c473f8c1cac9239e158b81a57606f4f457
+{"attempt":"00000000000000000000000000000000","ended_at":"2026-09-08T16:22:47.714Z","failed_step":null,"gate_bytes":0,"gate_carried_traffic":false,"gate_ms":0,"local_observed":["203.0.113.11:36101","203.0.113.11:36101"],"mapping":"endpoint_independent","path":"relay","path_addr":"family=0 bytes=00000000000000000000000000000000 port=0","path_rtt_us":0,"peer":"00000000","peer_observed":"family=0 bytes=00000000000000000000000000000000 port=0","platform":"linux","reason":"ok","relay_dropped_at_full":0,"relay_queued":0,"relay_shaped_delay_max_us":0,"relay_shaped_delay_p50_us":0,"session":0,"started_at":"2026-09-08T16:22:47.711Z","steps":[{"at_ms":1,"detail":"gate at 203.0.113.1:443","outcome":"ok","step":"gate_dial"},{"at_ms":2,"detail":"registered, secondary port 444","outcome":"ok","step":"gate_register"},{"at_ms":2,"detail":"gate saw 203.0.113.11:36101","outcome":"ok","step":"reflect_primary"},{"at_ms":3,"detail":"gate saw 203.0.113.11:36101","outcome":"ok","step":"reflect_secondary"}],"version":"0.1.0"}
+doctor exit: 0
+matrix exit: 0
+mosschat gatehouse: community=f733993a7ed3f79b9aeceb87bf726323c9879a0f61b1415c882b81bc4467b706
+mosschat gatehouse: primary=203.0.113.1:443 secondary=203.0.113.1:444
