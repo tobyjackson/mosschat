@@ -342,6 +342,12 @@ the reason section 3 gives.
   loss that is a 1 in 8000 false alarm, and at 500 ms it lands in about 1.5 s. Stale means stop sending on that path,
   move traffic to the relay at once, keep probing. **Dead** is stale plus a grace of `4 * srtt + 5 s` at one probe per
   second (Reticulum's shape): drop the path, rerun the doorbell.
+- **On the relay path too** (amendment 5). Everything above is written about a direct path, and a relayed visit had no
+  liveness at all until this: it died in silence. The same probe, the same three-unanswered rule and the same grace now
+  run against the relay session, the probe going to the peer's synthetic address so the porch socket wraps it as a
+  `Relay` payload. The one difference is what stale means, because there is nowhere to move to: on the relay, stale and
+  dead are reported and nothing else happens, and the visit ends when its connection does, with `path_idle_timeout` as
+  its reason.
 - **Goodbye.** Frame 19 to the peer, frame 11 to the gate. The receiver marks dead at once and skips stale, and each
   friend's last seen records which of the two it was (D8).
 - **Local address change** is the fast path for case (f): the interface list is polled every 1 s and a send error
@@ -573,8 +579,9 @@ times, and every one of those is a property of a visit under way. Five changes, 
   which is the opposite of a path taken on purpose. A record written before this amendment still reads: every new field is
   optional on the way in.
 
-**Amendment 4, continued: what review changed in it** (Yseult and Wystan on PRs 79 and 80, same day). Six corrections, each
-against the bullet above it that was wrong or thin.
+**Amendment 4, continued: what review changed in it** (Yseult and Wystan on PRs 79 and 80, same day). Seven corrections,
+each against the bullet above it that was wrong or thin. (Seven, not the six this said until run 3: the count was one
+short of its own list when it was written, and Yseult caught it reading PR 89.)
 
 - **`--no-punch` is on the wire**, as frame 16's `no_upgrade` above. It was local to the side that held the flag, so the peer
   waited out the 10 second start window for a `Start` nobody had asked for and recorded `start_signal` failed and `internal`
@@ -606,3 +613,31 @@ against the bullet above it that was wrong or thin.
   text already gets: a peer's QUIC close reason is bytes it chose, and it reached an operator's log through a visit that
   ended before it opened. The `goodbye` event is also stamped when the frame is sent rather than after its acknowledgement,
   which inflated it by up to a second in exactly the case a reader correlates two logs for: a peer that had already gone.
+
+**Amendment 5, 2026-09-08: section 4 covers the relay path, and a house says when it loses its gate** (run 3 of the
+WO-1.6 harness, issue 84, Konrad). Two silences, both found by reading a matrix that ran to completion and reported
+nothing.
+
+- **A relayed visit had no liveness.** Section 4 is written about a direct path, and the doorbell ran it only after an
+  upgrade; a visit that stayed on the relay was watched by nothing. Run 3's `blackout-60s` row is what that looks like:
+  the visit died inside the blackout and neither side recorded `path_stale`, `path_dead` or a goodbye, and the record's
+  `reason` said `probe_timeout`, which was true of an upgrade that had failed 35 seconds earlier and false of what
+  ended the visit. The relay path now carries the same section 4 policy, as the bullet in that section says, and the
+  record's `reason` names the path death ahead of whatever the attempt had given up on. What this deliberately does not
+  do is notice a relay that comes back after `dead`: probing stops there, and re-establishing a visit across a dead
+  relay is the redial question issue 84 asks. Amended once more by review before merging: probing does not stop at
+  dead after all, because dead arrives in about 9 seconds and quinn takes 30 to close, so an outage between those two
+  numbers would have left a live visit with no liveness at all. One probe a second through the dead state, which is what
+  this section already spends through the stale grace, and an answer rebuilds the watch and says `recovered`.
+- **What the relay leg now carries.** Section 1's "what the gate learns, plainly" gains one line: a relayed probe is an
+  81 byte payload the gate forwards opaquely, and what is readable in it is the discriminator, the attempt id and
+  whether it is a ping or a pong. Nothing else: the `observed` field of a pong answering a relayed ping is left all
+  zero, because the source of one is a synthetic address and section 3 says those never leave the machine. Reading the
+  attempt lifecycle off the relay (a new id is a rerun, probes ceasing is an upgrade) is the cost of putting section 4
+  on this path, and it is stated here rather than left to be discovered.
+- **A house that lost its gate said nothing and kept running.** When the gate connection hit its idle timeout the
+  reader and keepalive tasks returned and nothing else noticed, so the process went on as a callee no knock could
+  reach: in run 3 the two rows after the blackout both failed at `introduce` against a house that was still in the
+  process table. `gate_lost` is an eleventh name in section 7's event vocabulary, house stdout only for the same reason
+  `registered` is, and a house that emits it exits non-zero so a harness row cannot keep measuring against a callee
+  that is gone. Redialling instead of leaving is the separate decision, and it is not taken here.

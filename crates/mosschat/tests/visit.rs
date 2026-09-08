@@ -142,9 +142,25 @@ struct Community {
 }
 
 impl Community {
-    /// Starts a gatehouse on an ephemeral port and a headless house
-    /// registered at it.
+    /// Starts a gatehouse on loopback and a headless house registered at
+    /// it. Nothing upgrades in this shape: see [`Community::start_on`].
     fn start(name: &str, house_no_punch: bool) -> Self {
+        Self::start_on(name, house_no_punch, "127.0.0.1")
+    }
+
+    /// The same, with the gatehouse bound to `bind_ip`.
+    ///
+    /// **Which address the gate binds decides whether anything can
+    /// upgrade**, which is not obvious and cost a whole fault matrix to
+    /// learn. Section 2 step 1 drops loopback from what a house *offers*
+    /// (telling a peer to probe 127.0.0.1 tells it to probe itself), so
+    /// with the gate on loopback the only candidate either side offers is
+    /// its own private LAN address, which the other refuses because
+    /// nothing vouches for it, and the exchange settles at "0 probed" with
+    /// reason `no_candidates`. With the gate on a routed address the
+    /// reflection is that address, `peer_observed` vouches for it, and the
+    /// pair probes and upgrades exactly as two houses behind NATs do.
+    fn start_on(name: &str, house_no_punch: bool, bind_ip: &str) -> Self {
         let dir = work_dir(name);
         let mut community = [0u8; 32];
         {
@@ -177,9 +193,9 @@ impl Community {
             .args([
                 "gatehouse",
                 "--bind",
-                "127.0.0.1:0",
+                &format!("{bind_ip}:0"),
                 "--secondary-bind",
-                "127.0.0.1:0",
+                &format!("{bind_ip}:0"),
                 "--community",
                 &community,
                 "--identity-file",
@@ -294,6 +310,30 @@ impl Community {
             });
         let record = DiagRecord::from_json_line(line).unwrap();
         (out.status, record)
+    }
+
+    /// Kills the gatehouse by its pid and reaps it, which is WO-1.6's
+    /// `gatehouse-killed` row in one call.
+    fn kill_gatehouse(&mut self) {
+        self._gatehouse.child.kill().unwrap();
+        let _ = self._gatehouse.child.wait();
+    }
+
+    /// Waits up to `within` for the house process to exit, returning its
+    /// status.
+    fn wait_for_house_exit(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + within;
+        loop {
+            match self._house.child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     /// Every JSON line the house has printed so far.
@@ -416,5 +456,149 @@ fn no_punch_from_the_command_line_stays_relayed_and_says_why() {
             .iter()
             .any(|line| string_field(line, "event") == Some("upgraded")),
         "the house upgraded a visit nobody probed"
+    );
+}
+
+/// Run 3, finding 2 of issue 84: a headless house whose gate is killed
+/// says `gate_lost` on its own stdout and exits non-zero, rather than
+/// running on as a callee no knock can ever reach.
+///
+/// This is the silence the run 3 matrix hit. After the `blackout-60s` row,
+/// house-b's log stopped dead at that row's `visit_open`: no goodbye, no
+/// path event, nothing ever again, and the two rows after it failed at
+/// `introduce` against a process that was still running and no longer
+/// registered anywhere. A run cannot be allowed to keep measuring against
+/// a callee that is gone.
+///
+/// **It takes about half a minute, and that is the mechanism, not
+/// slack.** A killed gatehouse sends no close frame, so the house learns
+/// of it through QUIC's own 30 second idle timeout
+/// (`live::MAX_IDLE_TIMEOUT`), which is the same way the blackout row's
+/// house learned of it. Shortening the wait would test something else.
+///
+/// Deliberate break to fail this test: delete the `gate_connection.closed()`
+/// arm from `house::run`'s select, which is the code this fixes. The house
+/// then sits in its loop with nothing to wake it, prints no `gate_lost`,
+/// never exits, and both assertions below fail on a house that is, as far
+/// as anything can tell, fine.
+#[test]
+fn a_house_whose_gate_is_killed_says_gate_lost_and_exits_non_zero() {
+    let mut community = Community::start("gatelost", false);
+    community.kill_gatehouse();
+
+    let lost = wait_for_line(&community.house_lines, Duration::from_secs(60), |line| {
+        line.contains("\"event\":\"gate_lost\"")
+    })
+    .expect("the house must say it lost its gate");
+    assert!(
+        lost.contains("no longer reachable"),
+        "the line says what it means for anyone reading the log: {lost}"
+    );
+
+    let status = community
+        .wait_for_house_exit(Duration::from_secs(20))
+        .expect("the house must leave rather than run on unreachable");
+    assert!(
+        !status.success(),
+        "a run must not be able to keep going against a dead callee: {status:?}"
+    );
+}
+
+/// This machine's own routed address, the one `punch::local_addresses`
+/// gathers and the gate reflects, or `None` on a machine with no route for
+/// IPv4 at all.
+///
+/// The same route lookup the library does, repeated here rather than
+/// exported: a `connect`ed UDP socket sends nothing, it only resolves a
+/// route, and its local address is the source the kernel would use.
+fn routed_ipv4() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let local = socket.local_addr().ok()?;
+    if local.ip().is_loopback() || local.ip().is_unspecified() {
+        return None;
+    }
+    Some(local.ip().to_string())
+}
+
+/// Run 3, finding 1 of issue 84: two processes on a real address reach a
+/// **direct** path, and both say so.
+///
+/// This is the assertion nothing in this workspace made. Every existing
+/// three-process test binds the gate to loopback, where no candidate
+/// survives the exchange at all, so a run in which the probe burst answers
+/// nothing and the visit relays for its whole hold passed every test and
+/// exited 0. Twelve fault-matrix rows on a real two-NAT lab then did
+/// exactly that, twelve times, and the matrix reported success.
+///
+/// What this covers is section 2 steps 4 to 6 end to end between separate
+/// processes: the gate fires both sides, each probes the address the gate
+/// reflected for the other, and the first to answer three consecutive
+/// probes wins. It does not cover a NAT, which needs the harness.
+///
+/// **This one test opens a LAN reachable port** (Yseult's Low 3 on PR 89),
+/// where every other test in this file binds loopback. It has to: section
+/// 2 step 1 drops loopback from what a house offers, so with the gate on
+/// `127.0.0.1` the reflection is loopback, the exchange settles at "0
+/// probed", and there is nothing to upgrade. That is not a defect of the
+/// test, it is why the workspace had no upgrade assertion at all until run
+/// 3 went looking for one. For the few seconds it runs, a gatehouse
+/// listens on this machine's routed address on two ephemeral ports.
+/// Anything reaching it is refused before a slot is touched unless its
+/// proven key is on a member list this test generated at random moments
+/// earlier, and the community id is random per run, so what is exposed is
+/// a QUIC handshake that ends in a refusal. It panics rather than skipping
+/// on a machine with no default route, so a runner that cannot support it
+/// says so instead of passing quietly.
+///
+/// Deliberate break to fail this test: in `Attempt::add_candidate`, drop
+/// the `|| self.vouched.contains(&addr)` from the peer-reported check. The
+/// peer's reflected private address is then refused, the table is empty,
+/// and the record comes back relayed with `no_candidates` rather than
+/// direct. That is the shape of every row of run 3.
+#[test]
+fn two_processes_on_a_routed_address_upgrade_to_a_direct_path() {
+    let Some(bind_ip) = routed_ipv4() else {
+        panic!(
+            "this test needs one routed IPv4 address to bind the gate to; a machine with no \
+             default route cannot punch a hole to itself and cannot run it"
+        );
+    };
+    let community = Community::start_on("direct", false, &bind_ip);
+    let (status, record) = community.doctor("caller", &["--hold", "4"]);
+
+    assert!(
+        status.success(),
+        "reason {}, failed step {:?}",
+        record.reason.as_str(),
+        record.failed_step
+    );
+    assert!(
+        matches!(record.path, PathChoice::Direct(_)),
+        "the visit must end on a direct path, not the relay: reason {}, steps {:?}",
+        record.reason.as_str(),
+        record.steps
+    );
+    assert_eq!(
+        record.reason,
+        Reason::Ok,
+        "a visit that upgraded and kept its path has nothing to explain: {:?}",
+        record.steps
+    );
+    assert!(
+        record
+            .events
+            .iter()
+            .any(|event| event.event == VisitEventKind::Upgraded),
+        "the caller records the upgrade as an event: {:?}",
+        record.events
+    );
+    assert!(
+        community
+            .house_events()
+            .iter()
+            .any(|line| string_field(line, "event") == Some("upgraded")),
+        "the callee upgraded too, which is what makes the path direct in both directions: {:?}",
+        community.house_events()
     );
 }
