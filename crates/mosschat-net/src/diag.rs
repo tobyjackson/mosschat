@@ -1945,6 +1945,13 @@ impl Recorder {
         self.inner.state.lock_or_recover().attempt = attempt;
     }
 
+    /// The attempt id this record is for, all zero until the candidate
+    /// exchange names one.
+    #[must_use]
+    pub fn attempt(&self) -> [u8; 16] {
+        self.inner.state.lock_or_recover().attempt
+    }
+
     /// The gate's session id (frame 6).
     pub fn set_session(&self, session: u32) {
         self.inner.state.lock_or_recover().session = session;

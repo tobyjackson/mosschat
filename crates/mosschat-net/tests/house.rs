@@ -302,6 +302,17 @@ mod house {
     impl Held<'_> {
         /// Starts the visit and returns a handle to the record it writes.
         fn spawn(self) -> tokio::task::JoinHandle<DiagRecord> {
+            self.spawn_with_recorder().0
+        }
+
+        /// The same, handing back the recorder as well, so a test can read
+        /// the attempt id this visit is running under while it runs.
+        fn spawn_with_recorder(
+            self,
+        ) -> (
+            tokio::task::JoinHandle<DiagRecord>,
+            mosschat_net::diag::Recorder,
+        ) {
             let salt = mosschat_net::diag::InstallSalt::load_or_create(self.diagnostics).unwrap();
             let recorder = mosschat_net::diag::Recorder::new(
                 mosschat_net::diag::PeerFingerprint::from_key(&salt, &self.peer_key),
@@ -329,12 +340,18 @@ mod house {
             let caller = Arc::clone(self.caller);
             let connection = self.connection.clone();
             let control = Arc::clone(self.control);
-            tokio::spawn(async move {
-                let _ = run_doorbell(&caller.porch(), &caller, &connection, params, &control).await;
-                // The doorbell settled the record itself; this is the copy
-                // it wrote, not a second one built from a different reason.
-                recorder.finish(Reason::Internal).0
-            })
+            let handle = {
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    let _ =
+                        run_doorbell(&caller.porch(), &caller, &connection, params, &control).await;
+                    // The doorbell settled the record itself; this is the
+                    // copy it wrote, not a second one built from a
+                    // different reason.
+                    recorder.finish(Reason::Internal).0
+                })
+            };
+            (handle, recorder)
         }
     }
 
@@ -595,17 +612,17 @@ mod house {
             })
         };
         let control = DoorbellControl::new();
-        let held = Held {
+        let (held, recorder) = Held {
             caller: &caller,
             connection: &connection,
             session,
             peer_key: fixture.house_key,
-            // Long enough for stale (about 2 s) and dead (5 s of grace
-            // after it) with room to spare, short enough that the record
-            // this asserts arrives without waiting out a QUIC idle
-            // timeout: the hold elapsing is what settles it, the relay it
-            // would say goodbye on being gone.
-            hold: Hold::For(Duration::from_secs(12)),
+            // Far longer than this test needs, because the ending is
+            // driven by `control.stop()` below once both sides have said
+            // what they saw. A hold short enough to expire on its own would
+            // be racing section 4's own 9 seconds on a runtime shared with
+            // the gate, the house and eleven other tests, and it did.
+            hold: Hold::For(Duration::from_secs(120)),
             no_punch: true,
             control: &control,
             diagnostics: &caller_diagnostics,
@@ -613,7 +630,7 @@ mod house {
             candidates: None,
             vouch_peer: true,
         }
-        .spawn();
+        .spawn_with_recorder();
 
         fixture
             .events
@@ -625,10 +642,31 @@ mod house {
             .await
             .expect("the caller must see its own visit open");
 
-        // The blackout, both directions at once.
-        caller
-            .porch()
-            .detach_gate(caller.gate_connection().remote_address());
+        // The blackout: every probe of this attempt is dropped at the
+        // caller's own porch socket, in both directions at once. Its pings
+        // still leave and are still answered, and the answers never reach
+        // it; the callee's pings still arrive and are never answered.
+        //
+        // Not `detach_gate`, which was the first version of this and is a
+        // worse instrument: with no gate attached `try_send` fails with a
+        // hard error rather than `WouldBlock`, quinn treats that as fatal,
+        // and the peer connection could die before either side's liveness
+        // had said anything. It passed here and failed on CI twice, on
+        // both platforms, which is what a race looks like. Dropping the
+        // probes leaves the transport under the visit completely healthy,
+        // so what this measures is section 4 and nothing else.
+        let attempt = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let attempt = recorder.attempt();
+                if attempt != [0u8; 16] {
+                    return attempt;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the candidate exchange must name an attempt");
+        caller.porch().disarm_probe_key(&attempt);
 
         for (whose, events) in [("callee", &fixture.events), ("caller", &caller_events)] {
             let stale = events
@@ -655,10 +693,13 @@ mod house {
             );
         }
 
-        // The caller's own record, settled when its hold elapses.
+        // Both sides have now said what they saw, so the visit is ended on
+        // purpose rather than by a clock: the caller says goodbye, which
+        // reaches the callee over the relay its probes were never on.
+        control.stop();
         let caller_record = tokio::time::timeout(Duration::from_secs(30), held)
             .await
-            .expect("the caller's hold must end")
+            .expect("the caller's visit must end when it is asked to")
             .unwrap();
         assert_eq!(
             caller_record.reason,
@@ -675,8 +716,17 @@ mod house {
             caller_record.events
         );
 
-        // The callee's, settled on its way out: its relay is gone, so
-        // nothing else will end its visit.
+        // The callee's. Its goodbye is waited for first, and not only for
+        // the ordering: a goodbye arriving over the relay this house had
+        // just declared dead is the whole of the point being made here.
+        // Without the wait, the house's own shutdown races the frame, and
+        // the visit settles on whichever got there first, which is two
+        // legitimate reasons from one run.
+        fixture
+            .events
+            .wait_for(VisitEventKind::Goodbye, Duration::from_secs(20))
+            .await
+            .expect("the caller's goodbye must reach the callee over the relay");
         let house_diagnostics = fixture.house_diagnostics.clone();
         fixture.ask_to_stop();
         let house_record = tokio::time::timeout(Duration::from_secs(30), async {
@@ -693,9 +743,27 @@ mod house {
         .await
         .expect("the house must settle its record once its visit ends");
         assert_eq!(
+            house_record
+                .steps
+                .iter()
+                .filter(|step| step.step == mosschat_net::diag::Step::PathLost)
+                .count(),
+            2,
+            "the callee's record carries both of section 4's transitions: {:?}",
+            house_record.steps
+        );
+        // And its reason is the goodbye's, not the dead watch's, which is
+        // the resolution of Yseult's Medium 2 rather than a hole in it. The
+        // caller's transport was never touched here, only its answers, so
+        // its goodbye reached the callee over the very relay the callee had
+        // given up on. A frame that arrived is proof the path works, and it
+        // outranks a watch that concluded otherwise; the caller, whose own
+        // relay really was one-way to the end, says `path_idle_timeout`
+        // above. Two exits, two true statements about the same visit.
+        assert_eq!(
             house_record.reason,
-            Reason::PathIdleTimeout,
-            "the callee's reason names the same thing from its own side: {:?}",
+            Reason::PunchDisabled,
+            "a goodbye that arrived outranks a watch that had given up: {:?}",
             house_record.steps
         );
 
@@ -717,62 +785,54 @@ mod house {
     /// connection, and its record would say `path_idle_timeout` whatever
     /// actually ended it.
     ///
+    /// The outage is the caller's doorbell not answering, which
+    /// `DoorbellControl` exists to express and can be undone, and which is
+    /// what a peer that has gone quiet looks like from the callee's end.
+    /// The callee is therefore the side asserted here.
+    ///
     /// Deliberate break to fail this test: make `RelayWatch::due_probe`
     /// return `self.liveness.due_probe(now)` unconditionally, so probing
     /// stops at dead. Nothing is ever answered again, no `recovered`
-    /// arrives, and the reason assertion reads `path_idle_timeout` on a
-    /// visit that spent its last 8 seconds on a working relay.
+    /// arrives, and the callee's reason stays `path_idle_timeout` on a
+    /// visit whose relay came back.
     #[tokio::test]
     async fn a_relay_that_comes_back_after_dead_is_recovered_and_the_reason_says_so() {
-        let (fixture, caller_seed) = Fixture::start("relayback", true).await;
+        let (mut fixture, caller_seed) = Fixture::start("relayback", true).await;
         let (caller, connection, session) = fixture.call(caller_seed).await;
 
         let caller_diagnostics = diag_dir("relayback-caller");
-        let caller_events = Collected::default();
-        let sink = {
-            let collected = Arc::clone(&caller_events.0);
-            VisitEventSink::new(move |kind, detail| {
-                collected.lock().unwrap().push(HouseEvent {
-                    at_ms: 0,
-                    kind,
-                    peer: None,
-                    detail: detail.to_string(),
-                });
-            })
-        };
         let control = DoorbellControl::new();
         let held = Held {
             caller: &caller,
             connection: &connection,
             session,
             peer_key: fixture.house_key,
-            hold: Hold::For(Duration::from_secs(18)),
+            hold: Hold::For(Duration::from_secs(120)),
             no_punch: true,
             control: &control,
             diagnostics: &caller_diagnostics,
-            events: Some(sink),
+            events: None,
             candidates: None,
             vouch_peer: true,
         }
         .spawn();
 
-        caller_events
+        fixture
+            .events
             .wait_for(VisitEventKind::VisitOpen, Duration::from_secs(10))
             .await
             .expect("the visit must open on the relay");
 
-        // Out, then back inside quinn's own 30 s idle timeout, so the
-        // connection under the visit survives the outage that the liveness
-        // above it declares dead.
-        let gate_addr = caller.gate_connection().remote_address();
-        caller.porch().detach_gate(gate_addr);
-        caller_events
-            .wait_for(VisitEventKind::PathDead, Duration::from_secs(20))
+        control.stop_answering_probes();
+        fixture
+            .events
+            .wait_for(VisitEventKind::PathDead, Duration::from_secs(30))
             .await
-            .expect("the caller must declare the relay dead first");
-        caller.porch().attach_gate(caller.gate_connection().clone());
+            .expect("the callee must declare the relay dead first");
+        control.resume_answering_probes();
 
-        let recovered = caller_events
+        let recovered = fixture
+            .events
             .wait_for(VisitEventKind::Recovered, Duration::from_secs(15))
             .await
             .expect("a relay that answers again must be seen answering again");
@@ -782,17 +842,32 @@ mod house {
             recovered.detail
         );
 
-        let record = tokio::time::timeout(Duration::from_secs(40), held)
-            .await
-            .expect("the caller's hold must end")
-            .unwrap();
+        // The callee's record, settled on its way out: the outage it
+        // survived is not what ended it.
+        let house_diagnostics = fixture.house_diagnostics.clone();
+        fixture.ask_to_stop();
+        let house_record = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(record) = records_in(&house_diagnostics)
+                    .into_iter()
+                    .find(|record| record.reason != Reason::Internal)
+                {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the house must settle its record once its visit ends");
         assert_eq!(
-            record.reason,
+            house_record.reason,
             Reason::PunchDisabled,
             "a visit that outlived its outage is not reported by it: {:?}",
-            record.steps
+            house_record.steps
         );
 
+        control.stop();
+        let _ = tokio::time::timeout(Duration::from_secs(20), held).await;
         connection.close(0u32.into(), b"test over");
         let _ = std::fs::remove_dir_all(&caller_diagnostics);
         fixture.stop().await;
