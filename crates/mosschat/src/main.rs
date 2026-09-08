@@ -269,8 +269,35 @@ impl HouseArgs {
     }
 }
 
+/// What `mosschat house --help` prints.
+const HOUSE_USAGE: &str = "\
+mosschat house --headless: stay home, answer knocks from friends, and hold visits open.
+
+  --headless              required: the terminal client role is a later work order
+  --gate <host:port>      the gatehouse to register at (required)
+  --community <64 hex>    the community id (required)
+  --gate-key <64 hex>     pin the gate's public key; without it the first key wins
+  --friends <path>        whose knocks to answer: one 64 hex character public key per
+                          line, blank lines and # comments ignored (required)
+  --identity-file <path>  this house's identity seed, 64 hex characters in a file
+  --identity <64 hex>     the same seed on the command line, where ps can see it
+  --no-punch              answer knocks and hold visits, but never probe a candidate, so
+                          every visit stays on the relay. For measurement only (WO-1.5
+                          case (e)): it removes the upgrade, not the relay, and every
+                          visit's record says punch_disabled so a reader can see it was
+                          asked for rather than inferred from a failure.
+
+Prints one JSON object per line on stdout, one per event: registered, knock, visit_open,
+upgraded, path_stale, path_dead, fell_back, recovered, goodbye. Stops on SIGTERM and on
+Ctrl-C, saying goodbye to every open visit and to the gate.";
+
 fn run_house(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = HouseArgs::parse(args)?;
+    let args: Vec<String> = args.collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{HOUSE_USAGE}");
+        return Ok(());
+    }
+    let parsed = HouseArgs::parse(args.into_iter())?;
     let gate = resolve_one(&parsed.gate)?;
     // The same loader as the gate's member list: one 64 hex character
     // ed25519 public key per line, blank lines and `#` comments ignored
@@ -369,6 +396,13 @@ struct DoctorArgs {
     friend: Option<String>,
     json: bool,
     last: bool,
+    /// How long to hold the visit open after it goes live, in seconds
+    /// (`--hold`, WO-1.5a). `0`, the default, is the one-shot run this
+    /// command has always done.
+    hold_s: u64,
+    /// Skips the probe burst entirely, so the visit stays relayed
+    /// (`--no-punch`, WO-1.5 case (e)).
+    no_punch: bool,
 }
 
 impl DoctorArgs {
@@ -381,6 +415,8 @@ impl DoctorArgs {
             friend: None,
             json: false,
             last: false,
+            hold_s: 0,
+            no_punch: false,
         };
         let mut identity_arg_given = false;
         let mut identity_file_given = false;
@@ -408,6 +444,13 @@ impl DoctorArgs {
                 }
                 "--json" => parsed.json = true,
                 "--last" => parsed.last = true,
+                "--hold" => {
+                    let seconds = value()?;
+                    parsed.hold_s = seconds.parse().map_err(|_| {
+                        format!("--hold takes a whole number of seconds, not {seconds:?}")
+                    })?;
+                }
+                "--no-punch" => parsed.no_punch = true,
                 other => return Err(format!("unknown flag {other}")),
             }
         }
@@ -421,6 +464,12 @@ impl DoctorArgs {
             if parsed.community.is_none() {
                 return Err("--community <64 hex chars> is required".into());
             }
+        }
+        if parsed.hold_s > 0 && parsed.friend.is_none() {
+            // There is nothing to hold open without a peer: a `--gate` run
+            // reflects twice and stops, and a flag that silently did
+            // nothing would be one a measurement quietly did without.
+            return Err("--hold needs --friend: a gate-only run opens no visit to hold".into());
         }
         Ok(parsed)
     }
@@ -451,8 +500,39 @@ fn friend_fingerprint(
     }
 }
 
+/// What `mosschat doctor --help` prints.
+const DOCTOR_USAGE: &str = "\
+mosschat doctor: run the connection steps against a friend or a gate, and say what happened.
+
+  --gate <host:port>      the gatehouse to use (required)
+  --community <64 hex>    the community id (required)
+  --gate-key <64 hex>     pin the gate's public key; without it the first key wins
+  --identity-file <path>  this run's identity seed, 64 hex characters in a file
+  --identity <64 hex>     the same seed on the command line, where ps can see it
+  --friend <key>          the friend to visit: their 64 hex character public key, or,
+                          with --last, the 8 hex character fingerprint the log uses
+  --hold <seconds>        once the visit is live, keep it open this long: keepalives per
+                          section 4, a round trip sample every second, and every path
+                          event recorded with its timestamp. 0, the default, is the one
+                          shot run this command has always done.
+  --no-punch              exchange candidates but never probe them, so the visit stays on
+                          the relay. For measurement only (WO-1.5 case (e)): it removes
+                          the upgrade, not the relay, and the record says punch_disabled
+                          so a reader can see it was asked for rather than inferred from
+                          a failure.
+  --json                  print the diagnostics record rather than the human report
+  --last                  print the last record for this peer without running anything
+
+Exit: 0 if the run reached live, 1 naming the step that failed otherwise. With --hold, 0
+for any visit that went live, because a path lost mid visit is what --hold measures.";
+
 fn run_doctor(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = DoctorArgs::parse(args)?;
+    let args: Vec<String> = args.collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{DOCTOR_USAGE}");
+        return Ok(());
+    }
+    let parsed = DoctorArgs::parse(args.into_iter())?;
     let dir = mosschat_net::diag::host_diagnostics_dir()?;
     let salt = mosschat_net::diag::InstallSalt::load_or_create(&dir)?;
 
@@ -476,6 +556,9 @@ fn run_doctor(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::err
     let runtime = tokio::runtime::Runtime::new()?;
     let record = runtime.block_on(run_doctor_steps(&parsed, dir, salt))?;
     print_record(&record, parsed.json);
+    if parsed.hold_s > 0 {
+        exit_for_held(&record);
+    }
     exit_for(&record);
 }
 
@@ -500,6 +583,31 @@ fn print_record(record: &mosschat_net::diag::DiagRecord, json: bool) {
 /// a `--friend` run. A `--gate` run has no peer and so can never reach
 /// `live`; for it the rule is the same one read as far as it goes, every
 /// step it ran having succeeded.
+/// The exit rule for a `--hold` run, which asks a different question.
+///
+/// A one-shot run asks "can this house reach that one and keep the path",
+/// so any failed step is the answer and [`exit_for`] reports it. A held
+/// run asks "what happened over the next N seconds", and a path lost mid
+/// visit is the thing being measured rather than the run failing: WO-1.5
+/// case (f) is a path that dies on purpose, and case (e) is a visit that
+/// is meant to stay relayed. So this exits 0 for any run whose visit
+/// reached `live`, and non-zero for one that never got that far, which is
+/// section 7's own rule read literally.
+fn exit_for_held(record: &mosschat_net::diag::DiagRecord) -> ! {
+    let reached_live = record.steps.iter().any(|step| {
+        step.step == mosschat_net::diag::Step::Live
+            && step.outcome == mosschat_net::diag::StepOutcome::Ok
+    });
+    if reached_live {
+        std::process::exit(0);
+    }
+    match record.failed_step {
+        Some(step) => eprintln!("mosschat doctor: failed at step {}", step.as_str()),
+        None => eprintln!("mosschat doctor: the visit never went live"),
+    }
+    std::process::exit(1);
+}
+
 fn exit_for(record: &mosschat_net::diag::DiagRecord) -> ! {
     match record.failed_step {
         Some(step) => {
@@ -715,6 +823,11 @@ async fn run_doctor_steps(
             .into_iter()
             .map(|(addr, _source)| addr)
             .collect();
+    let hold = if args.hold_s > 0 {
+        mosschat_net::punch::Hold::For(std::time::Duration::from_secs(args.hold_s))
+    } else {
+        mosschat_net::punch::Hold::UntilAttemptSettles
+    };
     let params = mosschat_net::punch::DoorbellParams {
         session,
         role: 1,
@@ -722,10 +835,12 @@ async fn run_doctor_steps(
         candidates,
         peer_observed: client.peer_observed_for(session),
         peer_discovered: Vec::new(),
-        // WO-1.5a's hold and its `--no-punch` are the next order's; this
-        // run is the one-shot `doctor --friend` has always been.
-        hold: mosschat_net::punch::Hold::UntilAttemptSettles,
-        no_punch: false,
+        // `--hold 0`, the default, is the one-shot run this command has
+        // always done: the doorbell settles as soon as the path it proved
+        // is lost. Anything else holds the visit open for that long and
+        // measures it (WO-1.5a).
+        hold,
+        no_punch: args.no_punch,
         events: None,
         recorder: Some(recorder.clone()),
     };
@@ -748,6 +863,41 @@ async fn run_doctor_steps(
             .await
         })
     };
+
+    if args.hold_s > 0 {
+        // A held visit ends on its own terms: the hold elapses, the peer
+        // says goodbye, or the connection dies. `run_doorbell` says
+        // goodbye, reads the shaper counters, writes the round trip
+        // percentiles and settles the record before it returns, so this
+        // waits for it rather than cutting the visit short by closing the
+        // connection underneath it.
+        //
+        // The budget is the hold plus the longest thing that can still be
+        // in flight inside it: one probe burst that has just started
+        // (`PROBE_GIVE_UP`) and the goodbye's own acknowledgement. A
+        // doorbell that overruns even that is not waited out, for the
+        // reason `main.rs` gives everywhere else: a doctor that does not
+        // return is not a doctor.
+        let budget = std::time::Duration::from_secs(args.hold_s)
+            + mosschat_net::punch::PROBE_GIVE_UP
+            + std::time::Duration::from_secs(10);
+        let settled = tokio::time::timeout(budget, doorbell).await;
+        peer_connection.close(0u32.into(), b"doctor done");
+        if settled.is_err() {
+            eprintln!(
+                "mosschat doctor: the visit did not settle inside {} s, so this record is \
+                 whatever it had reached",
+                budget.as_secs()
+            );
+        }
+        deregister(&client).await;
+        // The doorbell already settled this record; `finish` is idempotent
+        // and hands back the line that was written rather than building a
+        // second one from a different reason.
+        let (record, written) = recorder.finish(Reason::Ok);
+        report_write(written);
+        return Ok(record);
+    }
 
     // Section 2 step 5's own deadline: 3 s fast plus 7 s slow, after which
     // every candidate is given up. Waiting past it would report the wrong
