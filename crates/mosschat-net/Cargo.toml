@@ -49,6 +49,23 @@ rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pe
 # `VerifyingKey::to_montgomery()` output.
 curve25519-dalek = { version = "5.0.0", default-features = false, features = ["alloc"] }
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+# WO-1.4a, Konrad's review of PR #28: `time` was already in the tree
+# transitively (x509-parser, rcgen), so a 150 line hand-rolled UTC calendar
+# implementation duplicated a crate already compiled into the binary. Named
+# directly now for `diag.rs`'s RFC 3339 timestamps; "parsing"/"formatting"
+# are the two feature flags `time::OffsetDateTime::parse`/`::format` need
+# for `time::format_description::well_known::Rfc3339`. MIT OR Apache-2.0,
+# already on deny.toml's allow list.
+time = { version = "0.3.55", default-features = false, features = ["formatting", "parsing"] }
+# WO-1.4a, same review: replaces the hand-rolled recursive-descent JSON
+# parser diag.rs shipped with in PR #28, which recursed once per nesting
+# level with no depth cap (a deeply nested line could abort the process
+# with a stack overflow instead of `read_records` reporting it as a
+# malformed line). serde_json's `Value` deserializer caps recursion depth
+# at 128 and returns an error past it. MIT OR Apache-2.0, already on
+# deny.toml's allow list; `serde` itself was already in the tree
+# transitively (rcgen, x509-parser) at the same 1.0.229.
+serde_json = "1.0"
 
 [[bench]]
 name = "porch_socket"
