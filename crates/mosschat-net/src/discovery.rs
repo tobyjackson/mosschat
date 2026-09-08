@@ -635,20 +635,23 @@ impl Discovery {
         .encode(signer)
     }
 
-    /// Handles one received datagram, cheapest check first all the way
-    /// down: the packet ceiling, then the frame's shape and community,
-    /// then "is this key a friend", then the per-key gap, then the
-    /// signature, then the replay window, then the source address, then
-    /// the handoff.
+    /// Handles one received datagram: the packet ceiling, then the frame's
+    /// shape and community, then "is this key a friend", then "is this
+    /// us", then the signature, then the per-key gap, then the replay
+    /// window, then the source address, then the handoff.
     ///
-    /// **The signature is the expensive check and it is late on purpose**
-    /// (Konrad's should 4, research lesson 2). Everything above it is a
-    /// comparison or a hash lookup, so a captured announce replayed at the
-    /// 50 packet per second ceiling costs no scalar multiplication at all:
-    /// the per-key gap catches it first. Everything below it needs the
-    /// signature to have passed, because a replay window fed unverified
-    /// timestamps would let anyone poison [`ReplayGuard`] against a
-    /// friend's real announce.
+    /// **The dividing line is not cost, it is whether a check spends
+    /// something on the sender's behalf.** Before the signature sit only
+    /// the checks that consume nothing a later packet needs: the
+    /// per-second ceiling, which is the cheap defence against a flood and
+    /// costs one counter, and the free reads of the key at bytes 38..70
+    /// that drop a stranger before any scalar multiplication (research
+    /// lesson 2). The per-key gap and [`ReplayGuard`] both write state
+    /// keyed on the announcing house, so an unverified frame must not
+    /// reach either: an earlier revision ran the gap first, and one
+    /// unsigned packet per 10 seconds per key was then enough to silence a
+    /// friend's genuine announces entirely, which is a worse bargain than
+    /// the verification it saved.
     ///
     /// The address remembered is `from`'s IP with the **announced** port,
     /// never `from`'s port: the announce left a socket bound to
@@ -679,13 +682,17 @@ impl Discovery {
         if announce.key == self.own_key {
             return self.drop_with(AnnounceError::Ourselves);
         }
-        if !self.limiter.admit_key(announce.key, now) {
-            return self.drop_with(AnnounceError::RateLimited);
-        }
         if let Err(error) = announce.verify_signature(bytes) {
             return self.drop_with(error);
         }
-        // Only now is anything in `announce` this house's to believe.
+        // Only now is anything in `announce` this house's to believe, and
+        // only now may anything be *spent* on that key's behalf: the
+        // per-key gap is state an announce consumes, so an unsigned frame
+        // reaching it is one packet per 10 seconds that silences a friend
+        // (both reviewers, second round).
+        if !self.limiter.admit_key(announce.key, now) {
+            return self.drop_with(AnnounceError::RateLimited);
+        }
         if let Err(error) = self.replay.admit(&announce, now_unix) {
             return self.drop_with(error);
         }
@@ -1121,46 +1128,76 @@ mod tests {
         );
     }
 
-    /// Konrad's should 4: the per-key gap and the "is this us" check run
-    /// **before** the signature, so a replayed friend announce inside the
-    /// gap costs a hash lookup rather than a scalar multiplication. Pinned
-    /// by the error a datagram that would fail both checks comes back with.
+    /// Both reviewers, second round: an unsigned frame must not consume a
+    /// friend's per-key gap. Running the gap before the signature let one
+    /// forged packet per 10 seconds per key silence that friend's genuine
+    /// announces completely, since the gap is state written on the
+    /// announcing house's behalf and a forger writes it for free.
     ///
     /// Deliberate break to fail this test: in `Discovery::on_datagram`,
-    /// move the `verify_signature` call above the `admit_key` call. The
-    /// second datagram then returns `BadSignature` instead of
-    /// `RateLimited`.
+    /// move the `admit_key` call back above `verify_signature`. The forged
+    /// frame then takes the gap and the friend's real announce that
+    /// follows is dropped as `RateLimited`.
     #[test]
-    fn the_per_key_gap_is_checked_before_the_signature() {
+    fn an_unsigned_frame_does_not_consume_a_friends_per_key_gap() {
         let t0 = Instant::now();
         let (friend, friend_key) = house(1);
         let (_, own_key) = house(3);
         let is_friend = move |key: &[u8; 32]| *key == friend_key;
         let sent = u32::try_from(NOW_UNIX).unwrap();
-        let good = frame_from(&friend, friend_key, 4433, sent, [1u8; 4]);
-        // A second announce from the same key, fresh nonce, broken
-        // signature: it would fail verification, and the gap catches it
-        // first.
-        let mut bad = frame_from(&friend, friend_key, 4433, sent, [2u8; 4]);
-        bad[143] ^= 0x01;
+
+        // A frame carrying the friend's key that nobody could have signed.
+        let mut forged = frame_from(&friend, friend_key, 4433, sent, [1u8; 4]);
+        forged[143] ^= 0x01;
+        // The friend's own announce, one second later.
+        let genuine = frame_from(&friend, friend_key, 4433, sent + 1, [2u8; 4]);
 
         let mut discovery = Discovery::new(COMMUNITY, own_key, 4433, t0);
-        assert!(matches!(
-            discovery.on_datagram(&good, lan(), t0, NOW_UNIX, is_friend),
-            Heard::Discovered(..)
-        ));
         assert_eq!(
-            discovery.on_datagram(
-                &bad,
+            discovery.on_datagram(&forged, lan(), t0, NOW_UNIX, is_friend),
+            Heard::Dropped(AnnounceError::BadSignature),
+            "an unsigned frame is refused on its signature and nothing else"
+        );
+        assert!(
+            matches!(
+                discovery.on_datagram(
+                    &genuine,
+                    lan(),
+                    t0 + Duration::from_secs(1),
+                    NOW_UNIX + 1,
+                    is_friend
+                ),
+                Heard::Discovered(..)
+            ),
+            "the forgery consumed nothing, so the friend is still heard"
+        );
+
+        // And a whole second of forgeries at the per-second ceiling still
+        // leaves the friend audible: the ceiling is the flood defence, and
+        // it is the only thing that runs before verification.
+        let mut flooded = Discovery::new(COMMUNITY, own_key, 4433, t0);
+        for index in 0..ANNOUNCE_PACKETS_PER_SECOND {
+            let mut noise = frame_from(&friend, friend_key, 4433, sent, index.to_be_bytes());
+            noise[143] ^= 0x01;
+            assert_eq!(
+                flooded.on_datagram(&noise, lan(), t0, NOW_UNIX, is_friend),
+                Heard::Dropped(AnnounceError::BadSignature)
+            );
+        }
+        assert_eq!(
+            flooded.counters().bad_signature,
+            u64::from(ANNOUNCE_PACKETS_PER_SECOND)
+        );
+        assert!(matches!(
+            flooded.on_datagram(
+                &genuine,
                 lan(),
-                t0 + Duration::from_secs(1),
-                NOW_UNIX,
+                t0 + Duration::from_millis(1001),
+                NOW_UNIX + 1,
                 is_friend
             ),
-            Heard::Dropped(AnnounceError::RateLimited),
-            "the cheap per-key gap runs before the expensive signature"
-        );
-        assert_eq!(discovery.counters().bad_signature, 0);
+            Heard::Discovered(..)
+        ));
     }
 
     /// Yseult's High 1: an announce is a bearer token unless something
