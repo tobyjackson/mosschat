@@ -122,7 +122,7 @@ impl Addr {
 }
 
 /// A control-stream frame, WO-1.3a's subset.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Frame {
     /// Frame 1, house to gate.
     Register {
@@ -188,6 +188,122 @@ pub enum Frame {
     },
     /// Frame 15, house to gate.
     KnockAnswer { v: u8, tag: [u8; 32], accept: bool },
+}
+
+/// Redacted by hand rather than derived, exactly as [`crate::punch::PorchFrame`]
+/// is (Yseult's Medium on PR #49). Two call sites in `gate/client.rs`
+/// format an unexpected frame into an error string with `{other:?}`, and
+/// that string reaches a [`crate::diag::DiagRecord`]'s free text: a derived
+/// `Debug` would print `Introduce`/`Knock`'s `sealed` bytes and the 32 byte
+/// pair tag, which is deterministic across installs and so defeats the very
+/// cross-user correlation the record's salted fingerprint exists to
+/// prevent. The record's 256 byte cap truncates such a line; it does not
+/// stop it starting with the secret.
+///
+/// What is printed: frame type, version, addresses, ports, session ids,
+/// counts and the gate's own capped `Error.detail`. What is not: the pair
+/// tag, the sealed body, the community id, replaced by `<redacted>` or by
+/// a length, which is what a reader diagnosing a protocol error needs.
+impl std::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Register { v, .. } => f
+                .debug_struct("Register")
+                .field("v", v)
+                .field("community", &"<redacted>")
+                .finish(),
+            Self::Registered {
+                v,
+                observed,
+                keepalive_s,
+                secondary_port,
+            } => f
+                .debug_struct("Registered")
+                .field("v", v)
+                .field("observed", observed)
+                .field("keepalive_s", keepalive_s)
+                .field("secondary_port", secondary_port)
+                .finish(),
+            Self::Reflect { v } => f.debug_struct("Reflect").field("v", v).finish(),
+            Self::Reflected { v, observed } => f
+                .debug_struct("Reflected")
+                .field("v", v)
+                .field("observed", observed)
+                .finish(),
+            Self::Introduce {
+                v, ttl_s, sealed, ..
+            } => f
+                .debug_struct("Introduce")
+                .field("v", v)
+                .field("tag", &"<redacted>")
+                .field("ttl_s", ttl_s)
+                .field("sealed_len", &sealed.len())
+                .finish(),
+            Self::Introduction {
+                v,
+                session,
+                peer_observed,
+                role,
+                ..
+            } => f
+                .debug_struct("Introduction")
+                .field("v", v)
+                .field("tag", &"<redacted>")
+                .field("session", session)
+                .field("peer_observed", peer_observed)
+                .field("role", role)
+                .finish(),
+            Self::Start {
+                v,
+                session,
+                fire_in_ms,
+                gate_ms,
+            } => f
+                .debug_struct("Start")
+                .field("v", v)
+                .field("session", session)
+                .field("fire_in_ms", fire_in_ms)
+                .field("gate_ms", gate_ms)
+                .finish(),
+            Self::StartRequest { v, session } => f
+                .debug_struct("StartRequest")
+                .field("v", v)
+                .field("session", session)
+                .finish(),
+            Self::Keepalive { v } => f.debug_struct("Keepalive").field("v", v).finish(),
+            Self::KeepaliveAck { v, observed } => f
+                .debug_struct("KeepaliveAck")
+                .field("v", v)
+                .field("observed", observed)
+                .finish(),
+            Self::Goodbye { v, reason } => f
+                .debug_struct("Goodbye")
+                .field("v", v)
+                .field("reason", reason)
+                .finish(),
+            Self::Error { v, code, detail } => f
+                .debug_struct("Error")
+                .field("v", v)
+                .field("code", code)
+                .field("detail", detail)
+                .finish(),
+            Self::Knock {
+                v, ttl_s, sealed, ..
+            } => f
+                .debug_struct("Knock")
+                .field("v", v)
+                .field("tag", &"<redacted>")
+                .field("ttl_s", ttl_s)
+                .field("sealed_len", &sealed.len())
+                .finish(),
+            Self::KnockAnswer { v, accept, .. } => f
+                .debug_struct("KnockAnswer")
+                .field("v", v)
+                .field("tag", &"<redacted>")
+                .field("accept", accept)
+                .finish(),
+        }
+    }
 }
 
 const T_REGISTER: u8 = 1;
@@ -548,6 +664,52 @@ pub fn decode_relay(datagram: &[u8]) -> Result<(u32, &[u8]), GateError> {
 )]
 mod tests {
     use super::*;
+
+    /// Yseult's Medium on PR #49: `Frame`'s `Debug` reaches a diagnostics
+    /// record through `gate/client.rs`'s `{other:?}` error strings, so it
+    /// prints lengths where the frame holds a sealed body and never the
+    /// pair tag, which is deterministic across installs.
+    ///
+    /// Deliberate break to fail this test: put `Debug` back on `Frame`'s
+    /// `derive` list and delete the hand-written `impl`. The assertions on
+    /// the sealed bytes and the tag both fail.
+    #[test]
+    fn frame_debug_prints_lengths_and_never_a_sealed_body_or_a_pair_tag() {
+        let tag = [0xABu8; 32];
+        let sealed = vec![0xCDu8; 512];
+        let tag_hex: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+        for frame in [
+            Frame::Introduce {
+                v: 1,
+                tag,
+                ttl_s: 30,
+                sealed: sealed.clone(),
+            },
+            Frame::Knock {
+                v: 1,
+                tag,
+                ttl_s: 30,
+                sealed: sealed.clone(),
+            },
+        ] {
+            let printed = format!("{frame:?}");
+            assert!(printed.contains("sealed_len: 512"), "{printed}");
+            assert!(printed.contains("tag: \"<redacted>\""), "{printed}");
+            // Neither the bytes themselves nor any spelling of them.
+            assert!(!printed.contains("205"), "{printed}");
+            assert!(!printed.contains("171"), "{printed}");
+            assert!(!printed.contains(&tag_hex), "{printed}");
+        }
+        let printed = format!(
+            "{:?}",
+            Frame::Register {
+                v: 1,
+                community: [9u8; 32],
+            }
+        );
+        assert!(printed.contains("<redacted>"), "{printed}");
+        assert!(!printed.contains('9'), "{printed}");
+    }
 
     #[test]
     fn register_round_trips() {

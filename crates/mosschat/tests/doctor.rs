@@ -147,6 +147,14 @@ fn an_unreachable_gate_exits_non_zero_and_its_json_parses_back() {
     let parsed = DiagRecord::from_json_line(line).expect("--json output must parse back");
     assert_eq!(parsed.failed_step, Some(Step::GateDial));
     assert_eq!(parsed.reason, mosschat_net::diag::Reason::GateUnreachable);
+    // Konrad's must 1: `at_ms` is stamped when the step finished, so the
+    // dial that waited out the 10 s deadline is stamped past it and the
+    // report prints that as its duration rather than as 0 ms.
+    assert!(
+        parsed.steps[0].at_ms >= 9_000,
+        "the dial step's at_ms must carry the time it waited: {:?}",
+        parsed.steps[0]
+    );
     assert!(
         parsed
             .steps

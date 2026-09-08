@@ -1594,7 +1594,9 @@ pub async fn run_doorbell(
     // A relay path's address is the gate's: that is where this house's
     // traffic for this peer actually leaves to while it is relayed. The
     // peer's synthetic address (section 3) never leaves the machine and
-    // would tell a reader of the record nothing.
+    // would tell a reader of the record nothing, which is why the line
+    // below reads the gate connection's remote address (Konrad's nit 8:
+    // this comment used to say the opposite of what the code does).
     let relay_addr = Addr::from_socket_addr(gate.gate_connection().remote_address());
     if let Some(recorder) = rec {
         // Section 2 step 2: traffic is on the relay from before this

@@ -21,7 +21,7 @@ use rand::RngExt;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::authed::{self, AuthedConnection};
-use crate::diag::{self, Recorder, Step, StepOutcome};
+use crate::diag::{self, Reason, Recorder, Step, StepOutcome};
 use crate::gate::wire::{self, Addr, Frame};
 use crate::gate::{GateError, SeenSet, limits, now_ms, within_freshness_window};
 use crate::lockext::LockExt;
@@ -653,7 +653,13 @@ impl GateClient {
             Frame::Error { code, detail, .. } => {
                 // `detail` is the gate's own text, capped at 64 bytes on
                 // the wire (section 1) and capped again by the record's
-                // free-text limit; the code is section 7's reason enum.
+                // free-text limit; the code is section 7's reason enum on
+                // the wire, so it names the record's reason rather than
+                // leaving the caller to guess `internal` from the failed
+                // step (Konrad's should 3).
+                if let Some(recorder) = rec {
+                    recorder.set_reason_hint(reason_for_error_code(code));
+                }
                 diag::record(
                     rec,
                     Step::GateRegister,
@@ -1152,6 +1158,18 @@ impl GateClient {
     }
 }
 
+/// Section 7's reason for a gate refusal, from frame 12's `code`, which is
+/// [`crate::gate::ErrorCode`] and so is that same enum on the wire.
+fn reason_for_error_code(code: u8) -> Reason {
+    match code {
+        c if c == crate::gate::ErrorCode::RefusedNotMember as u8 => Reason::GateRefusedNotMember,
+        c if c == crate::gate::ErrorCode::AtCapacity as u8 => Reason::GateAtCapacity,
+        c if c == crate::gate::ErrorCode::RateLimited as u8 => Reason::GateRateLimited,
+        c if c == crate::gate::ErrorCode::CapExceeded as u8 => Reason::CapExceeded,
+        _ => Reason::Internal,
+    }
+}
+
 /// `BLAKE3("mosschat-gate-pair-v1" || community || min(kA,kB) || max(kA,kB))`
 /// (section 1), the pair tag.
 #[must_use]
@@ -1249,6 +1267,21 @@ async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
                         inner.remember_session(session, peer_observed.to_socket_addr());
                         inner.porch.register_relay_session(session, synthetic);
                         inner.porch.insert_relay_path(peer_key, synthetic);
+                        // The responder's relay leg opens here, and its
+                        // record must say so too (Konrad's should 5): only
+                        // the asker's `introduce` recorded it before, so
+                        // the accepting side's log showed no session at
+                        // all.
+                        if let Some(recorder) = inner.recorder.as_ref() {
+                            recorder.set_session(session);
+                            recorder.set_peer_observed(peer_observed);
+                        }
+                        diag::record(
+                            inner.recorder.as_ref(),
+                            Step::RelayOpen,
+                            StepOutcome::Ok,
+                            format!("relay session {session}, as the responder"),
+                        );
                     }
                 }
             }

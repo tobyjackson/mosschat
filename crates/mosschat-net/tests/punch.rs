@@ -222,21 +222,6 @@ mod punch {
         )
     }
 
-    /// Section 8's WO-1.3b case, over the real stream: the doorbell opens
-    /// relayed from the first packet, upgrades to a direct path once a
-    /// candidate has proved itself by the stated count, and falls back to
-    /// the relay when that path is killed, with the end to end connection
-    /// surviving all three.
-    ///
-    /// The kill is the peer no longer answering probes and dropping its own
-    /// side of the direct path, which is exactly what a dead path looks
-    /// like from the other end, and is the only honest way to kill one
-    /// in process.
-    ///
-    /// Deliberate break to fail this test: in `punch.rs::run_doorbell`,
-    /// change `if live_misses >= LIVE_PROBES_TO_STALE` to `if false`. The
-    /// upgrade and the relayed phases still pass; the fall-back assertion
-    /// times out with the path still `Direct`.
     /// A unique temporary diagnostics directory for one test.
     fn diag_dir(name: &str) -> std::path::PathBuf {
         let dir =
@@ -262,6 +247,21 @@ mod punch {
         out
     }
 
+    /// Section 8's WO-1.3b case, over the real stream: the doorbell opens
+    /// relayed from the first packet, upgrades to a direct path once a
+    /// candidate has proved itself by the stated count, and falls back to
+    /// the relay when that path is killed, with the end to end connection
+    /// surviving all three.
+    ///
+    /// The kill is the peer no longer answering probes and dropping its own
+    /// side of the direct path, which is exactly what a dead path looks
+    /// like from the other end, and is the only honest way to kill one
+    /// in process.
+    ///
+    /// Deliberate break to fail this test: in `punch.rs::run_doorbell`,
+    /// change `if live_misses >= LIVE_PROBES_TO_STALE` to `if false`. The
+    /// upgrade and the relayed phases still pass; the fall-back assertion
+    /// times out with the path still `Direct`.
     #[tokio::test]
     async fn the_doorbell_starts_relayed_upgrades_on_proof_and_falls_back_when_the_path_dies() {
         let community = random_seed();

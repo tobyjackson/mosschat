@@ -586,7 +586,10 @@ pub struct DiagRecord {
     /// Whether the relay session carried any traffic, recorded on every
     /// attempt, success or not (D3).
     pub gate_carried_traffic: bool,
-    /// Bytes the relay session carried, either direction.
+    /// Bytes this house handed to the relay leg for this peer: its own
+    /// egress, not both directions (Konrad's should 6 on PR #49). The
+    /// shaper counts what enters its queue, and only the sending side
+    /// queues; the other direction's bytes are in the peer's own record.
     pub gate_bytes: u64,
     /// Section 1's shaper, first counter: datagrams that waited in a relay
     /// queue. Added in WO-1.4b, which is the first order with a call site
@@ -1427,6 +1430,8 @@ struct RecorderState {
     local_observed: [Option<Addr>; 2],
     peer_observed: Option<Addr>,
     mapping: Option<Mapping>,
+    /// The reason the protocol itself named, if one did.
+    reason_hint: Option<Reason>,
     gate_carried_traffic: bool,
     gate_bytes: u64,
     relay_queued: u64,
@@ -1493,6 +1498,7 @@ impl Recorder {
                     local_observed: [None, None],
                     peer_observed: None,
                     mapping: None,
+                    reason_hint: None,
                     gate_carried_traffic: false,
                     gate_bytes: 0,
                     relay_queued: 0,
@@ -1601,6 +1607,23 @@ impl Recorder {
         state.relay_shaped_delay_p50_us = stats.relay_shaped_delay_p50_us;
         state.relay_shaped_delay_max_us = stats.relay_shaped_delay_max_us;
         state.relay_dropped_at_full = stats.relay_dropped_at_full;
+    }
+
+    /// Records the reason the protocol itself named, for a caller that
+    /// decides the record's `reason` later (Konrad's should 3 on PR #49).
+    ///
+    /// The gate's `Error.code` is section 7's reason enum on the wire, so a
+    /// refusal is `gate_refused_not_member`, `gate_at_capacity` or
+    /// `gate_rate_limited` and not the `internal` a caller guessing from
+    /// the failed step alone would write.
+    pub fn set_reason_hint(&self, reason: Reason) {
+        self.inner.state.lock_or_recover().reason_hint = Some(reason);
+    }
+
+    /// The reason the protocol named, if anything named one.
+    #[must_use]
+    pub fn reason_hint(&self) -> Option<Reason> {
+        self.inner.state.lock_or_recover().reason_hint
     }
 
     /// Overrides the inferred mapping, for a caller that knows better than
@@ -1830,6 +1853,16 @@ pub fn last_record(
 // The human-readable report (`doctor` without `--json`)
 // ---------------------------------------------------------------------
 
+/// An address for a person to read: `host:port`, or the plain words for
+/// one that was never observed, rather than the raw-field dump the JSON
+/// form needs in order to round trip (Konrad's nit 10 on PR #49).
+fn addr_for_humans(addr: Addr) -> String {
+    match addr.to_socket_addr() {
+        Some(socket_addr) => socket_addr.to_string(),
+        None => "(not observed)".to_string(),
+    }
+}
+
 /// The first line of every `doctor` report, section 7: "IP addresses are
 /// kept, because they are the thing being diagnosed, and the doctor command
 /// says so on its first line so nobody sends a file blind."
@@ -1842,23 +1875,24 @@ impl DiagRecord {
     /// answered`), then mapping, path and RTT, gate bytes and reason.
     ///
     /// The number opening a step line is that step's position in section
-    /// 7's step enum, which is what makes `probe_burst` the tenth. The
-    /// duration is derived rather than stored: the record holds each step's
-    /// `at_ms` from the start of the attempt, so a step's duration is the
-    /// distance to the next step, and the last step's is the distance to
-    /// `ended_at`.
+    /// 7's step enum, which is what makes `probe_burst` the tenth.
+    ///
+    /// The duration is derived rather than stored, and derived **backwards**
+    /// (Konrad's must 1 on PR #49): every call site stamps `at_ms` when the
+    /// step finishes, so a step's duration is the distance from the
+    /// previous step's `at_ms`, and the first step's is the distance from
+    /// the start of the attempt. Deriving it forwards, to the next step's
+    /// `at_ms`, printed each step's neighbour's duration and always 0 for
+    /// the last one, so a 10 s gate dial read `0 ms`.
     #[must_use]
     pub fn to_human_report(&self) -> String {
         let mut out = String::new();
         out.push_str(PRIVACY_NOTICE);
         out.push('\n');
-        let total_ms = self.ended_at_ms.saturating_sub(self.started_at_ms);
-        for (i, step) in self.steps.iter().enumerate() {
-            let next_ms = self
-                .steps
-                .get(i + 1)
-                .map_or(total_ms, |following| following.at_ms);
-            let duration_ms = next_ms.saturating_sub(step.at_ms);
+        let mut previous_ms = 0u64;
+        for step in &self.steps {
+            let duration_ms = step.at_ms.saturating_sub(previous_ms);
+            previous_ms = step.at_ms;
             let number = Step::ALL
                 .iter()
                 .position(|candidate| *candidate == step.step)
@@ -1874,7 +1908,7 @@ impl DiagRecord {
         out.push_str(&format!(
             "path {} {} rtt {} us\n",
             self.path.kind_str(),
-            addr_to_json_string(self.path.addr()),
+            addr_for_humans(self.path.addr()),
             self.path_rtt_us,
         ));
         out.push_str(&format!(
@@ -2216,28 +2250,32 @@ mod tests {
     fn the_human_report_has_section_sevens_shape() {
         let mut record = sample_record(Reason::ProbeTimeout, Some(Step::ProbeBurst));
         record.steps = vec![
+            // Both stamped the way every call site stamps: at the moment
+            // the step finished. The dial took 12 ms, the burst the 10 s
+            // between its own stamp and the dial's.
             StepRecord {
                 step: Step::GateDial,
-                at_ms: 0,
+                at_ms: 12,
                 outcome: StepOutcome::Ok,
                 detail: "gate at 198.51.100.7:443".to_string(),
             },
             StepRecord {
                 step: Step::ProbeBurst,
-                at_ms: 500,
+                at_ms: 10_012,
                 outcome: StepOutcome::Fail,
                 detail: "0 of 9 candidates answered".to_string(),
             },
         ];
-        record.ended_at_ms = record.started_at_ms + 10_500;
+        record.ended_at_ms = record.started_at_ms + 10_012;
         let report = record.to_human_report();
         let mut lines = report.lines();
         assert_eq!(lines.next(), Some(PRIVACY_NOTICE));
         let gate_dial = lines.next().unwrap();
         assert!(gate_dial.starts_with(" 1 ok   gate_dial"), "{gate_dial:?}");
+        assert!(gate_dial.contains("12 ms"), "{gate_dial:?}");
         let probe = lines.next().unwrap();
         // `probe_burst` is the tenth step of section 7's enum, and its
-        // duration runs to the end of the attempt: 10500 - 500.
+        // duration runs from the step before it: 10012 - 12.
         assert!(probe.starts_with("10 fail probe_burst"), "{probe:?}");
         assert!(probe.contains("10000 ms"), "{probe:?}");
         assert!(probe.ends_with("0 of 9 candidates answered"), "{probe:?}");

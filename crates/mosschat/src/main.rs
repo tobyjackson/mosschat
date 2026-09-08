@@ -300,10 +300,9 @@ fn run_doctor(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::err
             None => None,
         };
         let Some(record) = mosschat_net::diag::last_record(&dir, peer)? else {
-            eprintln!(
-                "mosschat doctor: no diagnostics record in {}",
-                dir.display()
-            );
+            // The directory is a path under the user's home, so it is not
+            // repeated back into output meant to be pasted (Yseult's Low).
+            eprintln!("mosschat doctor: no diagnostics record for that peer yet");
             std::process::exit(1);
         };
         print_record(&record, parsed.json);
@@ -321,6 +320,11 @@ fn run_doctor(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::err
 /// Prints `record` in the form `--json` asked for.
 fn print_record(record: &mosschat_net::diag::DiagRecord, json: bool) {
     if json {
+        // The JSON form is the one most likely pasted verbatim into an
+        // issue, so the notice goes out beside it rather than not at all
+        // (Yseult's Low on PR #49). On stderr, so `--json`'s stdout stays
+        // exactly one JSON object.
+        eprintln!("{}", mosschat_net::diag::PRIVACY_NOTICE);
         println!("{}", record.to_json_line());
     } else {
         print!("{}", record.to_human_report());
@@ -433,23 +437,22 @@ async fn run_doctor_steps(
     };
     let client = match dialled {
         Ok(client) => client,
-        Err(e) => {
-            // The steps themselves are already recorded inside `connect`;
-            // this only chooses which reason section 7 gives the record.
-            let reason = match recorder.failed_step() {
-                Some(Step::GateDial) => Reason::GateUnreachable,
-                _ => Reason::Internal,
-            };
-            mosschat_net::diag::record(
-                Some(&recorder),
-                Step::GateRegister,
-                StepOutcome::Fail,
-                format!(
-                    "{e}; a gate that does not answer on either port cannot be told from UDP \
-                     being blocked without a second gate or a TCP probe"
-                ),
-            );
-            let (record, _) = recorder.finish(reason);
+        Err(_) => {
+            // `connect` has already recorded the step that failed, so
+            // nothing is recorded a second time here (Konrad's should 4:
+            // a refusal printed two failure lines, the second carrying
+            // UDP-blocked wording that did not apply). This only chooses
+            // the record's reason: the one the gate itself named through
+            // frame 12's code where there is one, and otherwise what the
+            // failed step says.
+            let reason = recorder
+                .reason_hint()
+                .unwrap_or(match recorder.failed_step() {
+                    Some(Step::GateDial) => Reason::GateUnreachable,
+                    _ => Reason::Internal,
+                });
+            let (record, written) = recorder.finish(reason);
+            report_write(written);
             return Ok(record);
         }
     };
@@ -462,11 +465,7 @@ async fn run_doctor_steps(
     let Some(friend_key) = friend_key else {
         // A gate-only run stops here: there is no peer to introduce, and
         // the mapping is the answer it came for.
-        let reason = if reflected_ok {
-            Reason::Ok
-        } else {
-            Reason::UdpBlocked
-        };
+        let reason = gate_only_reason(reflected_ok);
         let (record, written) = recorder.finish(reason);
         report_write(written);
         return Ok(record);
@@ -565,6 +564,24 @@ async fn run_doctor_steps(
     Ok(record)
 }
 
+/// The reason a `--gate` run ends with, given whether the secondary port
+/// answered.
+///
+/// A secondary port that did not answer is **not** `udp_blocked` (Konrad's
+/// must 2 on PR #49): section 7 defines that reason as neither gate port
+/// being reachable, and a run that reaches this point registered on the
+/// primary. Section 7 names no reason for one port of two, so it is
+/// `internal`, its own stated catch-all, with the `reflect_secondary` step
+/// saying what failed and the mapping staying `unknown`, which is all one
+/// reflection can prove.
+fn gate_only_reason(reflected_ok: bool) -> mosschat_net::diag::Reason {
+    if reflected_ok {
+        mosschat_net::diag::Reason::Ok
+    } else {
+        mosschat_net::diag::Reason::Internal
+    }
+}
+
 /// Says so on stderr when the record could not be written, rather than
 /// letting a `doctor` run look like it filed a report it did not file.
 fn report_write(written: Result<(), mosschat_net::diag::DiagError>) {
@@ -585,4 +602,34 @@ fn resolve_one(target: &str) -> Result<std::net::SocketAddr, String> {
         .map_err(|e| e.to_string())?
         .next()
         .ok_or_else(|| format!("{target} resolved to no address"))
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
+mod tests {
+    use super::*;
+
+    /// Konrad's must 2: one port of two failing is not section 7's
+    /// `udp_blocked`, which means neither port was reachable.
+    ///
+    /// Deliberate break to fail this test: return
+    /// `mosschat_net::diag::Reason::UdpBlocked` from `gate_only_reason`'s
+    /// else arm, which is what this code did.
+    #[test]
+    fn a_failed_secondary_reflection_is_not_udp_blocked() {
+        assert_eq!(gate_only_reason(true), mosschat_net::diag::Reason::Ok);
+        assert_eq!(
+            gate_only_reason(false),
+            mosschat_net::diag::Reason::Internal
+        );
+        assert_ne!(
+            gate_only_reason(false),
+            mosschat_net::diag::Reason::UdpBlocked
+        );
+    }
 }
