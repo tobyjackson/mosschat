@@ -148,28 +148,36 @@ HOUSE_A_SEED=$(openssl rand -hex 32)
 HOUSE_B_SEED=$(openssl rand -hex 32)
 COMMUNITY=$(openssl rand -hex 32)
 
-sudo ip netns exec house-a ./target/debug/examples/spike \
-  listen --identity "$HOUSE_A_SEED" --bind 10.1.0.2:7777 >/tmp/spike-a-id.log 2>&1 &
-SPIKE_A_PID=$!
+sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/spike-a.pid; exec ip netns exec house-a ./target/debug/examples/spike listen --identity $HOUSE_A_SEED --bind 10.1.0.2:7777" >/tmp/spike-a-id.log 2>&1 &
 sleep 2
 HOUSE_A_PUB=$(grep -m1 'spike: identity' /tmp/spike-a-id.log | awk '{print $3}')
-kill -TERM "$SPIKE_A_PID" 2>/dev/null; wait "$SPIKE_A_PID" 2>/dev/null
+SPIKE_A_PID=$(cat crates/mosschat-net/tests/harness/.run/spike-a.pid)
+if tr '\0' ' ' </proc/$SPIKE_A_PID/cmdline 2>/dev/null | grep -q spike; then
+  kill -TERM "$SPIKE_A_PID" 2>/dev/null
+fi
+wait
 
-sudo ip netns exec house-b ./target/debug/examples/spike \
-  listen --identity "$HOUSE_B_SEED" --bind 10.2.0.2:7777 >/tmp/spike-b-id.log 2>&1 &
-SPIKE_B_PID=$!
+sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/spike-b.pid; exec ip netns exec house-b ./target/debug/examples/spike listen --identity $HOUSE_B_SEED --bind 10.2.0.2:7777" >/tmp/spike-b-id.log 2>&1 &
 sleep 2
 HOUSE_B_PUB=$(grep -m1 'spike: identity' /tmp/spike-b-id.log | awk '{print $3}')
-kill -TERM "$SPIKE_B_PID" 2>/dev/null; wait "$SPIKE_B_PID" 2>/dev/null
+SPIKE_B_PID=$(cat crates/mosschat-net/tests/harness/.run/spike-b.pid)
+if tr '\0' ' ' </proc/$SPIKE_B_PID/cmdline 2>/dev/null | grep -q spike; then
+  kill -TERM "$SPIKE_B_PID" 2>/dev/null
+fi
+wait
 
 printf '%s\n%s\n' "$HOUSE_A_PUB" "$HOUSE_B_PUB" > crates/mosschat-net/tests/harness/.run/members.txt
 echo "community: $COMMUNITY"
 cat crates/mosschat-net/tests/harness/.run/members.txt
 ```
 
-Each `kill -TERM` above stops that one `spike listen` by the exact pid
-this shell just started (`$!`), the same pattern the scripts use; there
-is no `pkill` anywhere in this harness. Save `$HOUSE_A_SEED` and
+Each `kill -TERM` above stops that one `spike listen` by the pid its own
+pidfile records, written from inside the process itself (same
+`sh -c 'echo $$ ...; exec ...'` pattern as the gatehouse below, issue
+#50's fix applied here too: `$!` right after `sudo ... &` can name
+sudo's own pid instead), and only after confirming `/proc/<pid>/cmdline`
+still says `spike` -- there is no `pkill` anywhere in this harness. Save
+`$HOUSE_A_SEED` and
 `$HOUSE_B_SEED` somewhere if you want either house's identity to be
 reproducible across runs; they are not written to disk by this snippet
 except as public keys inside `members.txt`, and `.run/` is gitignored.
