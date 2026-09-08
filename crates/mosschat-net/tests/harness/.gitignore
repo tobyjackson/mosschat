@@ -1,0 +1,6 @@
+# Runtime scratch state this harness creates on the box it actually runs
+# on: pidfiles it uses to kill its own processes by pid (never by
+# pkill -f), and the members file built from spike-printed identities.
+# Never committed; docs/measurements/ is the only output this harness
+# expects back in the repo.
+.run/
