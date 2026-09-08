@@ -311,9 +311,12 @@ is refused, and that run exits 1 with reason `gate_rate_limited` and
 is not netem.
 
 (The `Reflect` cap is 2 **per connection** since amendment 3, and every
-run dials its own, so reflections are not what runs out. Before that
-amendment it was 2 per key per minute, which is why the 2026-09-08 run
-also failed at `reflect_secondary`.)
+run dials its own, so reflections themselves are not what runs out.
+Before that amendment it was 2 per key per minute, which is why the
+2026-09-08 run also failed at `reflect_secondary` from its third row. The
+secondary port has its own 4 connection attempts per key per minute, a
+separate bucket, so it runs out at the same fifth run the primary port
+does rather than earlier.)
 
 Give each row its own identity (one seed file per row, every one of those
 public keys in the gate's members file), or pace the rows at least 60

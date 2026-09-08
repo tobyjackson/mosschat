@@ -162,6 +162,15 @@ pub mod limits {
     /// connection rate it sits under, so a member allowed 4 connection
     /// attempts a minute could reflect on only 2 of them.
     pub const REFLECT_PER_CONNECTION: u32 = 2;
+    /// The secondary (reflection) port's own connection attempt limit, 4
+    /// per key per minute (amendment 3, 2026-09-08): a separate bucket from
+    /// [`REGISTER_ATTEMPTS_PER_MINUTE`], not a share of it, so one
+    /// `mosschat doctor` run (one connection on each port) leaves both
+    /// ports at the same count and four runs a minute fit. The secondary
+    /// port had no per-key connection limit before it, which left the
+    /// per-connection `Reflect` cap bounding how useful a flood of
+    /// connections was rather than bounding the flood.
+    pub const SECONDARY_ATTEMPTS_PER_MINUTE: u32 = 4;
     /// `Keepalive`: one per `keepalive_s`, 3 per second tolerated, per
     /// connection.
     pub const KEEPALIVE_PER_SECOND: u32 = 3;

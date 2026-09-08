@@ -68,9 +68,15 @@ pub struct ServerCounters {
     /// A control frame dropped because the connection's frame rate limit
     /// (section 1: 32/s, burst 64) was exceeded.
     pub frame_rate_limited: AtomicU64,
-    /// A `Reflect` request refused because that key's `Reflect` rate limit
-    /// (section 1: 2/minute) was exceeded.
+    /// A `Reflect` request refused because its connection had already been
+    /// served [`limits::REFLECT_PER_CONNECTION`] of them (amendment 3).
     pub reflect_rate_limited: AtomicU64,
+    /// A secondary-port connection refused because that key had already
+    /// made [`limits::SECONDARY_ATTEMPTS_PER_MINUTE`] of them inside the
+    /// minute (amendment 3), counted separately from
+    /// `reflect_rate_limited`: one bounds how many connections a key may
+    /// make, the other how many reflections one connection may have.
+    pub secondary_attempts_rate_limited: AtomicU64,
     /// A `Keepalive` dropped because the connection's keepalive rate limit
     /// (section 1: 3/s tolerated) was exceeded.
     pub keepalive_rate_limited: AtomicU64,
@@ -197,6 +203,15 @@ struct ServerState {
     /// separately from [`limits::MAX_CONNECTIONS_PER_KEY`], which bounds
     /// concurrent connections rather than the rate of new ones.
     register_attempts: StdMutex<HashMap<[u8; 32], RateLimiter>>,
+    /// Amendment 3: the secondary port's own "4 connection attempts per key
+    /// per minute", a separate bucket from `register_attempts` rather than
+    /// a share of it. One `mosschat doctor` run costs one connection on
+    /// each port, so two buckets of 4 give four runs a minute and keep the
+    /// two ports symmetrical, where one shared bucket would halve it to
+    /// two. Before this the secondary port had no per-key connection limit
+    /// at all: `Reflect`'s own limit made a flood of connections useless
+    /// rather than stopping it.
+    secondary_attempts: StdMutex<HashMap<[u8; 32], RateLimiter>>,
     counters: ServerCounters,
 }
 
@@ -368,6 +383,7 @@ impl GateServer {
             sessions: StdMutex::new(HashMap::new()),
             pending_handshakes: AtomicUsize::new(0),
             register_attempts: StdMutex::new(HashMap::new()),
+            secondary_attempts: StdMutex::new(HashMap::new()),
             counters: ServerCounters::default(),
         });
 
@@ -473,6 +489,10 @@ fn sweep_once(state: &Arc<ServerState>) {
         let mut attempts = state.register_attempts.lock_or_recover();
         attempts.retain(|_, limiter| !limiter.is_full());
     }
+    {
+        let mut attempts = state.secondary_attempts.lock_or_recover();
+        attempts.retain(|_, limiter| !limiter.is_full());
+    }
     let expired: Vec<([u8; 32], Registration)> = {
         let registrations = state.registrations.lock_or_recover();
         registrations
@@ -526,6 +546,34 @@ async fn handle_secondary_connection(
     };
     if !is_member {
         close_refused(&authed, ErrorCode::RefusedNotMember, b"not a member");
+        return Ok(());
+    }
+
+    // Amendment 3: the secondary port's own connection attempt limit, 4 per
+    // key per minute, its own bucket. Charged here, as soon as the
+    // handshake completes and before any stream is awaited, for the same
+    // reason the primary port charges its own here: a limit on connections
+    // that waits for a frame does not bound connections that never send
+    // one. That is also why the refusal cannot be frame 12, which needs a
+    // stream to ride; it is the close, carrying the same `ErrorCode`
+    // (`close_refused`), which is how the primary port's identical refusal
+    // reaches a house too.
+    let attempt_allowed = {
+        let mut attempts = state.secondary_attempts.lock_or_recover();
+        let limiter = attempts.entry(authed.peer_key()).or_insert_with(|| {
+            RateLimiter::per_minute(
+                limits::SECONDARY_ATTEMPTS_PER_MINUTE,
+                limits::SECONDARY_ATTEMPTS_PER_MINUTE,
+            )
+        });
+        limiter.try_take()
+    };
+    if !attempt_allowed {
+        state
+            .counters
+            .secondary_attempts_rate_limited
+            .fetch_add(1, Ordering::Relaxed);
+        close_refused(&authed, ErrorCode::RateLimited, b"gate_rate_limited");
         return Ok(());
     }
 
