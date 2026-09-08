@@ -43,17 +43,49 @@ pub struct ServerCounters {
     /// [`limits::MAX_PENDING_CONNECTIONS`] handshaked-but-not-yet-registered
     /// connections were already outstanding.
     pub pending_connections_refused: AtomicU64,
+    /// A third connection for one key refused with `gate_at_capacity`
+    /// (amended section 1: the sub-cap refuses rather than evicting the
+    /// oldest of the two already seated).
+    pub connections_refused_at_key_capacity: AtomicU64,
+    /// An inbound `Relay` datagram dropped because it failed to decode
+    /// (chiefly an over-cap payload): previously silent (Konrad finding 5
+    /// remainder).
+    pub relay_oversized_dropped: AtomicU64,
+    /// A control frame dropped because the connection's frame rate limit
+    /// (section 1: 32/s, burst 64) was exceeded.
+    pub frame_rate_limited: AtomicU64,
+    /// A `Reflect` request refused because that key's `Reflect` rate limit
+    /// (section 1: 2/minute) was exceeded.
+    pub reflect_rate_limited: AtomicU64,
+    /// A `Keepalive` dropped because the connection's keepalive rate limit
+    /// (section 1: 3/s tolerated) was exceeded.
+    pub keepalive_rate_limited: AtomicU64,
+    /// A gate-to-house frame dropped because [`limits::FRAME_TX_QUEUE_CAP`]
+    /// was already full (Yseult finding 5 remainder: `frame_tx` was
+    /// previously unbounded).
+    pub frame_tx_dropped: AtomicU64,
 }
 
 struct RegistrationInner {
     key: [u8; 32],
     connection: quinn::Connection,
-    frame_tx: mpsc::UnboundedSender<Frame>,
+    /// Bounded at [`limits::FRAME_TX_QUEUE_CAP`] (Yseult finding 5
+    /// remainder); sent through [`send_frame`], which drops the newest
+    /// frame and counts it rather than blocking or growing without limit.
+    frame_tx: mpsc::Sender<Frame>,
     observed: std::net::SocketAddr,
     last_keepalive: StdMutex<Instant>,
     introduce_min: StdMutex<RateLimiter>,
     introduce_hour: StdMutex<RateLimiter>,
     sessions: StdMutex<HashSet<u32>>,
+    /// Section 1: "any control frame ... 32 frames per second per
+    /// connection with burst 64", checked on every frame the control loop
+    /// reads for this registration.
+    frame_rate: StdMutex<RateLimiter>,
+    /// Section 1: "`Keepalive`: one per `keepalive_s`, 3 per second
+    /// tolerated", tracked separately from the general frame rate so an
+    /// ordinary keepalive burst is not charged against it.
+    keepalive_rate: StdMutex<RateLimiter>,
 }
 
 type Registration = Arc<RegistrationInner>;
@@ -107,6 +139,10 @@ struct ServerState {
     /// separately from [`limits::MAX_CONNECTIONS_PER_KEY`], which bounds
     /// concurrent connections rather than the rate of new ones.
     register_attempts: StdMutex<HashMap<[u8; 32], RateLimiter>>,
+    /// Section 1: "`Reflect`: ... 2 per minute", tracked per key since each
+    /// `Reflect` rides its own short-lived secondary-port connection rather
+    /// than a long-lived registration.
+    reflect_attempts: StdMutex<HashMap<[u8; 32], RateLimiter>>,
     counters: ServerCounters,
 }
 
@@ -119,6 +155,19 @@ impl ServerState {
         input.extend_from_slice(lo);
         input.extend_from_slice(hi);
         *blake3::hash(&input).as_bytes()
+    }
+}
+
+/// Queues `frame` for `registration`'s writer task, dropping and counting it
+/// rather than blocking or growing the channel without limit if
+/// [`limits::FRAME_TX_QUEUE_CAP`] is already full (Yseult finding 5
+/// remainder: `frame_tx` was previously unbounded).
+fn send_frame(state: &Arc<ServerState>, registration: &Registration, frame: Frame) {
+    if registration.frame_tx.try_send(frame).is_err() {
+        state
+            .counters
+            .frame_tx_dropped
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -245,6 +294,7 @@ impl GateServer {
             sessions: StdMutex::new(HashMap::new()),
             pending_handshakes: AtomicUsize::new(0),
             register_attempts: StdMutex::new(HashMap::new()),
+            reflect_attempts: StdMutex::new(HashMap::new()),
             counters: ServerCounters::default(),
         });
 
@@ -336,6 +386,10 @@ fn sweep_once(state: &Arc<ServerState>) {
         let mut attempts = state.register_attempts.lock_or_recover();
         attempts.retain(|_, limiter| !limiter.is_full());
     }
+    {
+        let mut attempts = state.reflect_attempts.lock_or_recover();
+        attempts.retain(|_, limiter| !limiter.is_full());
+    }
     let expired: Vec<([u8; 32], Registration)> = {
         let registrations = state.registrations.lock_or_recover();
         registrations
@@ -391,6 +445,24 @@ async fn handle_secondary_connection(
         authed.connection().close(0u32.into(), b"not a member");
         return Ok(());
     }
+
+    // Section 1: "`Reflect`: ... 2 per minute", tracked per key.
+    let reflect_allowed = {
+        let mut attempts = state.reflect_attempts.lock_or_recover();
+        let limiter = attempts.entry(authed.peer_key()).or_insert_with(|| {
+            RateLimiter::per_minute(limits::REFLECT_PER_MINUTE, limits::REFLECT_PER_MINUTE)
+        });
+        limiter.try_take()
+    };
+    if !reflect_allowed {
+        state
+            .counters
+            .reflect_rate_limited
+            .fetch_add(1, Ordering::Relaxed);
+        authed.connection().close(0u32.into(), b"gate_rate_limited");
+        return Ok(());
+    }
+
     let observed = authed.connection().remote_address();
     let (mut send, mut recv) = tokio::time::timeout(
         authed::control_read_deadline(),
@@ -479,6 +551,20 @@ async fn handle_primary_connection(
     let observed = authed.connection().remote_address();
     let peer_key = authed.peer_key();
 
+    // Yseult finding 4 / amended section 1: membership is proven by the TLS
+    // handshake alone, so it is checked here, before the gate ever awaits a
+    // stream, not after `accept_bi` plus a `Register` read. Previously an
+    // off-list key held one of `MAX_PENDING_CONNECTIONS` slots for the full
+    // 10s control-read deadline before being refused.
+    let is_member = {
+        let members = state.members.lock_or_recover();
+        members.contains(&peer_key)
+    };
+    if !is_member {
+        authed.connection().close(0u32.into(), b"not a member");
+        return Ok(());
+    }
+
     let Some(pending) =
         PendingGuard::acquire(&state.pending_handshakes, limits::MAX_PENDING_CONNECTIONS)
     else {
@@ -531,22 +617,10 @@ async fn handle_primary_connection(
         .await;
         return Ok(());
     }
-    let is_member = {
-        let members = state.members.lock_or_recover();
-        members.contains(&peer_key)
-    };
-    if !is_member {
-        send_error_and_close(
-            &mut send,
-            &authed,
-            ErrorCode::RefusedNotMember,
-            "not a member",
-        )
-        .await;
-        return Ok(());
-    }
+    // Membership is already proven above, before any stream was opened; not
+    // re-checked here.
 
-    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Frame>();
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(limits::FRAME_TX_QUEUE_CAP);
     let registration = Arc::new(RegistrationInner {
         key: peer_key,
         connection: authed.connection().clone(),
@@ -562,39 +636,57 @@ async fn handle_primary_connection(
             limits::INTRODUCE_PER_HOUR,
         )),
         sessions: StdMutex::new(HashSet::new()),
+        frame_rate: StdMutex::new(RateLimiter::per_second(
+            limits::FRAME_RATE_BURST,
+            limits::FRAME_RATE_PER_SECOND,
+        )),
+        keepalive_rate: StdMutex::new(RateLimiter::per_second(
+            limits::KEEPALIVE_PER_SECOND,
+            limits::KEEPALIVE_PER_SECOND,
+        )),
     });
 
-    // Within one key, section 1 allows 2 live connections, a third evicting
-    // that key's oldest by last keepalive (Konrad finding 3 on the earlier
-    // draft: a second connection for the same key silently replaced the
-    // first in the map without closing it, leaving it orphaned rather than
-    // torn down).
-    let (evicted, at_capacity) = {
+    // Amended section 1: within one key, the sub-cap is 2 live connections;
+    // a third is refused with `gate_at_capacity` in the handshake, the two
+    // already seated left untouched. Never a silent displacement (Konrad
+    // finding 3 on an earlier draft, and amendment 1 rejecting this same
+    // WO's own earlier eviction-by-oldest-keepalive reading): a house
+    // evicted without being told would believe it is still registered
+    // while its knocks went nowhere. One whose mapping died comes back
+    // through expiry (`sweep_once`) instead.
+    enum Refusal {
+        GateAtCapacity,
+        KeyAtCapacity,
+    }
+    let refused = {
         let mut registrations = state.registrations.lock_or_recover();
         let is_new_key = !registrations.contains_key(&peer_key);
         if is_new_key && registrations.len() >= state.capacity {
-            (None, true)
+            Some(Refusal::GateAtCapacity)
         } else {
-            let list = registrations.entry(peer_key).or_default();
-            let evicted = if list.len() >= limits::MAX_CONNECTIONS_PER_KEY {
-                let oldest = list
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, r)| *r.last_keepalive.lock_or_recover())
-                    .map(|(i, _)| i);
-                oldest.map(|i| list.remove(i))
+            let current = registrations.get(&peer_key).map_or(0, Vec::len);
+            if current >= limits::MAX_CONNECTIONS_PER_KEY {
+                Some(Refusal::KeyAtCapacity)
             } else {
+                registrations
+                    .entry(peer_key)
+                    .or_default()
+                    .push(Arc::clone(&registration));
                 None
-            };
-            list.push(Arc::clone(&registration));
-            (evicted, false)
+            }
         }
     };
-    if at_capacity {
-        state
-            .counters
-            .registrations_refused_at_capacity
-            .fetch_add(1, Ordering::Relaxed);
+    if let Some(refusal) = refused {
+        match refusal {
+            Refusal::GateAtCapacity => state
+                .counters
+                .registrations_refused_at_capacity
+                .fetch_add(1, Ordering::Relaxed),
+            Refusal::KeyAtCapacity => state
+                .counters
+                .connections_refused_at_key_capacity
+                .fetch_add(1, Ordering::Relaxed),
+        };
         send_error_and_close(
             &mut send,
             &authed,
@@ -603,12 +695,6 @@ async fn handle_primary_connection(
         )
         .await;
         return Ok(());
-    }
-    if let Some(evicted) = evicted {
-        evicted
-            .connection
-            .close(0u32.into(), b"displaced: connection cap per key reached");
-        teardown_registration(&state, peer_key, &evicted);
     }
 
     let registered = Frame::Registered {
@@ -641,11 +727,20 @@ async fn handle_primary_connection(
     let relay_task = tokio::spawn(async move {
         loop {
             match relay_connection.read_datagram().await {
-                Ok(datagram) => {
-                    if let Ok((session, payload)) = decode_relay(&datagram) {
+                Ok(datagram) => match decode_relay(&datagram) {
+                    Ok((session, payload)) => {
                         forward_relay(&relay_state, session, peer_key, payload);
                     }
-                }
+                    Err(_) => {
+                        // An over-cap or otherwise malformed `Relay`
+                        // datagram (Konrad finding 5 remainder): previously
+                        // silently dropped, never counted.
+                        relay_state
+                            .counters
+                            .relay_oversized_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                },
                 Err(_) => return,
             }
         }
@@ -671,13 +766,59 @@ async fn control_loop(
             Err(GateError::Timeout) => continue,
             Err(e) => return Err(e),
         };
+
+        // Section 1: "any control frame ... 32 frames per second per
+        // connection with burst 64" (Konrad finding 5 remainder). Over the
+        // limit, the generic policy applies: answer `gate_rate_limited` and
+        // keep the registration, dropping only this frame.
+        if !registration.frame_rate.lock_or_recover().try_take() {
+            state
+                .counters
+                .frame_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
+            send_frame(
+                state,
+                registration,
+                Frame::Error {
+                    v: 1,
+                    code: ErrorCode::RateLimited as u8,
+                    detail: "frame rate limit exceeded".into(),
+                },
+            );
+            continue;
+        }
+
         match frame {
             Frame::Keepalive { .. } => {
+                // Section 1: "`Keepalive`: one per `keepalive_s`, 3 per
+                // second tolerated", tracked separately from the general
+                // frame rate so an ordinary keepalive burst is not charged
+                // against it.
+                if !registration.keepalive_rate.lock_or_recover().try_take() {
+                    state
+                        .counters
+                        .keepalive_rate_limited
+                        .fetch_add(1, Ordering::Relaxed);
+                    send_frame(
+                        state,
+                        registration,
+                        Frame::Error {
+                            v: 1,
+                            code: ErrorCode::RateLimited as u8,
+                            detail: "keepalive rate limit exceeded".into(),
+                        },
+                    );
+                    continue;
+                }
                 *registration.last_keepalive.lock_or_recover() = Instant::now();
-                let _ = registration.frame_tx.send(Frame::KeepaliveAck {
-                    v: 1,
-                    observed: Addr::from_socket_addr(registration.observed),
-                });
+                send_frame(
+                    state,
+                    registration,
+                    Frame::KeepaliveAck {
+                        v: 1,
+                        observed: Addr::from_socket_addr(registration.observed),
+                    },
+                );
             }
             Frame::Introduce {
                 tag, ttl_s, sealed, ..
@@ -711,11 +852,15 @@ fn handle_introduce(
         let mut minute = registration.introduce_min.lock_or_recover();
         let mut hour = registration.introduce_hour.lock_or_recover();
         if !minute.try_take() || !hour.try_take() {
-            let _ = registration.frame_tx.send(Frame::Error {
-                v: 1,
-                code: ErrorCode::RateLimited as u8,
-                detail: "introduce rate limit exceeded".into(),
-            });
+            send_frame(
+                state,
+                registration,
+                Frame::Error {
+                    v: 1,
+                    code: ErrorCode::RateLimited as u8,
+                    detail: "introduce rate limit exceeded".into(),
+                },
+            );
             return;
         }
     }
@@ -756,12 +901,16 @@ fn handle_introduce(
         );
     }
 
-    let _ = target.frame_tx.send(Frame::Knock {
-        v: 1,
-        tag,
-        ttl_s,
-        sealed,
-    });
+    send_frame(
+        state,
+        &target,
+        Frame::Knock {
+            v: 1,
+            tag,
+            ttl_s,
+            sealed,
+        },
+    );
 }
 
 fn handle_knock_answer(
@@ -841,20 +990,28 @@ fn handle_knock_answer(
     requester.sessions.lock_or_recover().insert(session_id);
     target.sessions.lock_or_recover().insert(session_id);
 
-    let _ = requester.frame_tx.send(Frame::Introduction {
-        v: 1,
-        tag,
-        session: session_id,
-        peer_observed: Addr::from_socket_addr(target.observed),
-        role: 1,
-    });
-    let _ = target.frame_tx.send(Frame::Introduction {
-        v: 1,
-        tag,
-        session: session_id,
-        peer_observed: Addr::from_socket_addr(requester.observed),
-        role: 2,
-    });
+    send_frame(
+        state,
+        requester,
+        Frame::Introduction {
+            v: 1,
+            tag,
+            session: session_id,
+            peer_observed: Addr::from_socket_addr(target.observed),
+            role: 1,
+        },
+    );
+    send_frame(
+        state,
+        target,
+        Frame::Introduction {
+            v: 1,
+            tag,
+            session: session_id,
+            peer_observed: Addr::from_socket_addr(requester.observed),
+            role: 2,
+        },
+    );
 }
 
 fn forward_relay(state: &Arc<ServerState>, session: u32, sender_key: [u8; 32], payload: &[u8]) {

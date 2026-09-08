@@ -25,6 +25,7 @@ use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -74,6 +75,22 @@ pub struct PorchSocket {
     relay: Mutex<RelayRoutes>,
     inbound_synthetic: Mutex<VecDeque<(SocketAddr, Vec<u8>)>>,
     waker: Mutex<Option<Waker>>,
+    /// Count of inbound relayed datagrams dropped because
+    /// [`crate::gate::limits::INBOUND_RELAY_QUEUE_CAP`] was already full
+    /// (amended section 3: the newest is dropped and counted, the queue
+    /// already holding as much as it is allowed to).
+    inbound_relay_dropped: AtomicU64,
+    /// Flipped on every `poll_recv` call that has only one buffer slot to
+    /// fill (no GRO batching available), so consecutive such calls
+    /// alternate which of the queue and the real socket goes first. Without
+    /// this, a fixed order starves one side outright rather than merely
+    /// slowing it: real-socket-always-first stalls the queue completely
+    /// under heavy relay volume (the real socket is never idle, since the
+    /// relay payloads themselves arrive as real-socket reads on the gate
+    /// connection), and queue-always-first stalls the gate connection's own
+    /// reads completely under the same load, which is section 3's original
+    /// anti-starvation complaint.
+    poll_recv_prefer_socket: std::sync::atomic::AtomicBool,
 }
 
 impl fmt::Debug for PorchSocket {
@@ -104,7 +121,16 @@ impl PorchSocket {
             }),
             inbound_synthetic: Mutex::new(VecDeque::new()),
             waker: Mutex::new(None),
+            inbound_relay_dropped: AtomicU64::new(0),
+            poll_recv_prefer_socket: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    /// The number of inbound relayed datagrams dropped because the queue was
+    /// full, for tests and diagnostics.
+    #[must_use]
+    pub fn inbound_relay_dropped(&self) -> u64 {
+        self.inbound_relay_dropped.load(Ordering::Relaxed)
     }
 
     /// Attaches the gate control connection this socket relays peer traffic
@@ -144,30 +170,74 @@ impl PorchSocket {
     /// Queues one inbound relayed datagram for delivery to quinn as if it
     /// arrived from `session`'s registered synthetic peer address.
     ///
-    /// **Drop policy** (Yseult finding 3: the queue was previously
-    /// unbounded, letting a session peer that sends faster than this
-    /// endpoint drains exhaust memory and starve the gate connection
+    /// **Drop policy** (Yseult finding 3, amended section 3: the queue was
+    /// previously unbounded, letting a session peer that sends faster than
+    /// this endpoint drains exhaust memory and starve the gate connection
     /// sharing this socket). Bounded at
     /// [`crate::gate::limits::INBOUND_RELAY_QUEUE_CAP`]; a full queue drops
-    /// its oldest entry to make room for the new one, since QUIC's own loss
-    /// recovery already treats an unacknowledged packet as retransmittable
-    /// and a stale queued packet is worth less than a fresh one.
+    /// the *newest* arrival and counts it in
+    /// [`Self::inbound_relay_dropped`], never the oldest queued entry: an
+    /// uncounted drop is invisible to an operator, and evicting the oldest
+    /// to make room for the newest lets a fast sender always win the queue,
+    /// which is the opposite of fair sharing between the relay path and the
+    /// gate connection's own reads (see `poll_recv`, which reads both in one
+    /// call for the same reason).
     fn deliver_synthetic(&self, session: u32, payload: &[u8]) {
         let addr = {
             let routes = self.relay.lock_or_recover();
             routes.by_session.get(&session).copied()
         };
         let Some(addr) = addr else { return };
-        {
+        let pushed = {
             let mut queue = self.inbound_synthetic.lock_or_recover();
             if queue.len() >= INBOUND_RELAY_QUEUE_CAP {
-                queue.pop_front();
+                false
+            } else {
+                queue.push_back((addr, payload.to_vec()));
+                true
             }
-            queue.push_back((addr, payload.to_vec()));
+        };
+        if !pushed {
+            self.inbound_relay_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
         }
         if let Some(waker) = self.waker.lock_or_recover().take() {
             waker.wake();
         }
+    }
+
+    /// Fills up to `budget` leading slots of `bufs`/`meta` from the inbound
+    /// relay queue, returning how many it filled.
+    fn drain_queue_into(
+        &self,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+        budget: usize,
+    ) -> usize {
+        let mut filled = 0usize;
+        let mut queue = self.inbound_synthetic.lock_or_recover();
+        while filled < budget {
+            let Some((addr, payload)) = queue.pop_front() else {
+                break;
+            };
+            #[allow(clippy::indexing_slicing)]
+            let buf = &mut bufs[filled];
+            let n = payload.len().min(buf.len());
+            #[allow(clippy::indexing_slicing)]
+            buf[..n].copy_from_slice(&payload[..n]);
+            #[allow(clippy::indexing_slicing)]
+            {
+                meta[filled] = RecvMeta {
+                    addr,
+                    len: n,
+                    stride: n,
+                    ecn: None,
+                    dst_ip: None,
+                };
+            }
+            filled += 1;
+        }
+        filled
     }
 }
 
@@ -243,59 +313,116 @@ impl AsyncUdpSocket for PorchSocket {
         })
     }
 
+    /// Amended section 3's anti-starvation rule: this call draws from the
+    /// inbound relay queue *and* the real socket, rather than draining
+    /// either one first regardless of the other. Two shapes were tried and
+    /// rejected during development, each starving one side completely
+    /// rather than merely slowing it, because the real socket is what
+    /// feeds the queue in the first place (every `Relay` datagram arrives
+    /// as a real-socket read on the gate connection, decoded and queued by
+    /// the background task `attach_gate` spawns): queue-always-first (the
+    /// original shape) can leave the real socket never polled while the
+    /// queue stays non-empty, which is the load-dependent stall a cold
+    /// `ci/check.sh` run reproduced; socket-always-first starves the queue
+    /// outright under real relay volume instead, since the real socket is
+    /// then essentially never idle, which failed
+    /// `relay_path_carries_10_mib_unchanged` outright (`ConnectionLost`)
+    /// when tried here. With more than one buffer slot available (GRO
+    /// batching), the queue fills every slot but the last, always leaving
+    /// the real socket a slot in the same call. With exactly one slot
+    /// available (no batching, the case on a platform without GRO), a
+    /// fixed order cannot serve both in one call, so consecutive calls
+    /// alternate which one goes first, and if the first choice has nothing,
+    /// the other is still tried before returning `Pending`.
     fn poll_recv(
         &self,
         cx: &mut Context,
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        {
-            let mut queue = self.inbound_synthetic.lock_or_recover();
-            if let Some((addr, payload)) = queue.pop_front() {
-                if let (Some(buf), Some(m)) = (bufs.first_mut(), meta.first_mut()) {
-                    let n = payload.len().min(buf.len());
-                    #[allow(clippy::indexing_slicing)]
-                    buf[..n].copy_from_slice(&payload[..n]);
-                    *m = RecvMeta {
-                        addr,
-                        len: n,
-                        stride: n,
-                        ecn: None,
-                        dst_ip: None,
-                    };
-                    return Poll::Ready(Ok(1));
-                }
-                return Poll::Ready(Err(io::Error::other("no receive buffer provided")));
-            }
+        if bufs.is_empty() {
+            return Poll::Ready(Ok(0));
         }
-        {
-            *self.waker.lock_or_recover() = Some(cx.waker().clone());
+        *self.waker.lock_or_recover() = Some(cx.waker().clone());
+
+        let queue_first = bufs.len() > 1
+            || !self
+                .poll_recv_prefer_socket
+                .fetch_xor(true, Ordering::Relaxed);
+        let queue_budget = if queue_first {
+            if bufs.len() > 1 { bufs.len() - 1 } else { 1 }
+        } else {
+            0
+        };
+
+        let mut filled = 0usize;
+        if queue_budget > 0 {
+            filled = self.drain_queue_into(bufs, meta, queue_budget);
         }
-        // `poll_recv_ready` can report ready and then have the non-blocking
-        // read turn up `WouldBlock` anyway (a spurious or already-consumed
-        // readiness event); the fix, matching `quinn`'s own tokio runtime
-        // (`quinn/src/runtime/tokio.rs:71-79`), is to loop back and call
-        // `poll_recv_ready` again immediately rather than returning
-        // `Pending` without re-arming it, since the latter can miss the
-        // next real wakeup. Observed directly: with a second connection
-        // sharing this socket, a bare `Pending` here stalled a fresh
-        // `connect()` for tens of seconds.
-        loop {
+        if filled == bufs.len() {
+            return Poll::Ready(Ok(filled));
+        }
+
+        #[allow(clippy::indexing_slicing)]
+        let remaining_bufs = &mut bufs[filled..];
+        #[allow(clippy::indexing_slicing)]
+        let remaining_meta = &mut meta[filled..];
+        let socket_result = loop {
             match self.udp.poll_recv_ready(cx) {
                 Poll::Ready(Ok(())) => {
                     let result = self.udp.try_io(Interest::READABLE, || {
-                        self.state.recv((&self.udp).into(), bufs, meta)
+                        self.state
+                            .recv((&self.udp).into(), remaining_bufs, remaining_meta)
                     });
                     match result {
-                        Ok(n) => return Poll::Ready(Ok(n)),
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                        Err(e) => return Poll::Ready(Err(e)),
+                        Ok(n) => break Some(Ok(n)),
+                        // `poll_recv_ready` can report ready and then have
+                        // the non-blocking read turn up `WouldBlock` anyway
+                        // (a spurious or already-consumed readiness event);
+                        // the fix, matching `quinn`'s own tokio runtime
+                        // (`quinn/src/runtime/tokio.rs:71-79`), is to loop
+                        // back and call `poll_recv_ready` again immediately
+                        // rather than returning early, since a bare
+                        // `Pending` here without re-arming it can miss the
+                        // next real wakeup. Only safe to retry when this
+                        // call has filled nothing yet: once the queue has
+                        // served something, a busy-loop here would discard
+                        // it by never returning.
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock && filled == 0 => continue,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break None,
+                        Err(e) => break Some(Err(e)),
                     }
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => break Some(Err(e)),
+                Poll::Pending => break None,
+            }
+        };
+        match socket_result {
+            Some(Ok(n)) => return Poll::Ready(Ok(filled + n)),
+            Some(Err(e)) => {
+                if filled > 0 {
+                    return Poll::Ready(Ok(filled));
+                }
+                return Poll::Ready(Err(e));
+            }
+            None => {}
+        }
+        if filled > 0 {
+            return Poll::Ready(Ok(filled));
+        }
+
+        // This call's chosen order had nothing (queue was empty and given
+        // first turn, or it was the socket's turn and it had nothing): try
+        // whichever source has not been tried yet before giving up, so a
+        // queue with data waiting is never left for a later call while
+        // this one returns `Pending`.
+        if queue_budget == 0 {
+            filled = self.drain_queue_into(bufs, meta, 1);
+            if filled > 0 {
+                return Poll::Ready(Ok(filled));
             }
         }
+        Poll::Pending
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -359,5 +486,35 @@ mod tests {
         let _guard = rt.enter();
         let socket = PorchSocket::new(std_socket).unwrap();
         assert!(!socket.may_fragment());
+    }
+
+    /// Amended section 3's drop policy: once the inbound relay queue is
+    /// full, the *newest* arrival is dropped and counted, the queue itself
+    /// (its oldest entries) left untouched.
+    ///
+    /// Deliberate break to fail this test: in `deliver_synthetic`, swap the
+    /// full-queue branch back to `queue.pop_front()` then `push_back` (drop
+    /// the oldest, uncounted). The dropped count then stays 0 and the
+    /// queue's front entry becomes a later payload instead of the first
+    /// one ever delivered.
+    #[test]
+    fn full_queue_drops_the_newest_arrival_and_counts_it() {
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let socket = PorchSocket::new(std_socket).unwrap();
+        let synthetic = synthetic_addr([1, 2, 3, 4, 5], &[9u8; 32]);
+        socket.register_relay_session(1, synthetic);
+
+        let overflow = 5;
+        for i in 0..(INBOUND_RELAY_QUEUE_CAP + overflow) {
+            #[allow(clippy::cast_possible_truncation)]
+            socket.deliver_synthetic(1, &[i as u8]);
+        }
+
+        assert_eq!(socket.inbound_relay_dropped(), overflow as u64);
+        let queue = socket.inbound_synthetic.lock_or_recover();
+        assert_eq!(queue.len(), INBOUND_RELAY_QUEUE_CAP);
+        assert_eq!(queue.front().unwrap().1, vec![0u8]);
     }
 }

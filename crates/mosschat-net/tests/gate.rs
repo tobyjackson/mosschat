@@ -665,6 +665,153 @@ mod gate {
     }
 
     // ------------------------------------------------------------------
+    // Per-key connection sub-cap (amended section 1)
+    // ------------------------------------------------------------------
+
+    /// A third connection for one key is refused with `gate_at_capacity`;
+    /// the two already seated are never evicted or displaced.
+    ///
+    /// Deliberate break to fail this test, run for real: in
+    /// `server.rs::handle_primary_connection`, change
+    /// `current >= limits::MAX_CONNECTIONS_PER_KEY` to
+    /// `current >= limits::MAX_CONNECTIONS_PER_KEY + 10`. The third
+    /// connection then succeeds instead of being refused, confirmed by an
+    /// actual run. Restore the original comparison to pass again.
+    #[tokio::test]
+    async fn third_connection_for_one_key_is_refused_not_evicted() {
+        let community = random_seed();
+        let seed = random_seed();
+        let key = public_key_of(&seed);
+        let server = start_gate(&[key], community, 256);
+
+        let client_a = connect_client(
+            &server,
+            seed,
+            community,
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await
+        .unwrap();
+        let client_b = connect_client(
+            &server,
+            seed,
+            community,
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.connections_for_key(&key), 2);
+
+        let third = connect_client(
+            &server,
+            seed,
+            community,
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await;
+        assert!(third.is_err());
+        assert_eq!(server.connections_for_key(&key), 2);
+        assert_eq!(
+            server
+                .counters()
+                .connections_refused_at_key_capacity
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // Neither of the two already seated was displaced.
+        client_a.keepalive().await.unwrap();
+        client_b.keepalive().await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // Frame, Keepalive and Reflect rate limits (Konrad finding 5 remainder)
+    // ------------------------------------------------------------------
+
+    /// A flood of `Keepalive` frames past its own 3/s tolerance is rate
+    /// limited, and past the general 32/s, burst 64 control-frame rate is
+    /// rate limited again on top of that.
+    ///
+    /// Deliberate break to fail this test, run for real: in `control_loop`,
+    /// change `if !registration.frame_rate.lock_or_recover().try_take()` to
+    /// `if false`. `frame_rate_limited` then stays at 0 no matter how many
+    /// frames are sent, confirmed by an actual run. Restore the original
+    /// condition to pass again.
+    #[tokio::test]
+    async fn frame_and_keepalive_rate_limits_are_enforced() {
+        let community = random_seed();
+        let seed = random_seed();
+        let server = start_gate(&[public_key_of(&seed)], community, 256);
+        let member = connect_client(
+            &server,
+            seed,
+            community,
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..80 {
+            member.keepalive().await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            server
+                .counters()
+                .keepalive_rate_limited
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+        );
+        assert!(
+            server
+                .counters()
+                .frame_rate_limited
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+        );
+    }
+
+    /// A third `Reflect` inside the same minute is refused (section 1: "2
+    /// per minute").
+    ///
+    /// Deliberate break to fail this test: in
+    /// `server.rs::handle_secondary_connection`, remove the
+    /// `reflect_attempts` rate-limit block. The third `reflect` call then
+    /// succeeds instead of erroring.
+    #[tokio::test]
+    async fn reflect_rate_limit_is_enforced() {
+        let community = random_seed();
+        let seed = random_seed();
+        let server = start_gate(&[public_key_of(&seed)], community, 256);
+        let member = connect_client(
+            &server,
+            seed,
+            community,
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await
+        .unwrap();
+
+        member.reflect(server.secondary_addr()).await.unwrap();
+        member.reflect(server.secondary_addr()).await.unwrap();
+        let third = member.reflect(server.secondary_addr()).await;
+        assert!(third.is_err());
+        assert_eq!(
+            server
+                .counters()
+                .reflect_rate_limited
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    // ------------------------------------------------------------------
     // MTU / max_datagram_size
     // ------------------------------------------------------------------
 
@@ -836,9 +983,6 @@ mod gate {
         // whatever the OS actually assigned).
         assert_ne!(server.secondary_addr().port(), 0);
 
-        // The port `Registered.secondary_port` names (checked indirectly:
-        // `GateClient::reflect` dials `server.secondary_addr()`, the same
-        // value the gate put in that field) is reachable end to end.
         let member = connect_client(
             &server,
             seed,
@@ -848,8 +992,46 @@ mod gate {
         )
         .await
         .unwrap();
-        let observed = member.reflect(server.secondary_addr()).await.unwrap();
+
+        // Konrad finding 6: the house learns the secondary port from the
+        // protocol (`Registered.secondary_port`), not by dialing
+        // `server.secondary_addr()` out of band.
+        assert_eq!(
+            member.registered_secondary_port(),
+            server.secondary_addr().port()
+        );
+        let secondary_addr = SocketAddr::new(
+            server.secondary_addr().ip(),
+            member.registered_secondary_port(),
+        );
+        let observed = member.reflect(secondary_addr).await.unwrap();
         assert!(observed.to_socket_addr().is_some());
+    }
+
+    /// `GateClient` also keeps `Registered.observed`, the house's own
+    /// address as the gate saw it on the primary connection, rather than
+    /// discarding it (Konrad finding 6).
+    #[tokio::test]
+    async fn registered_observed_is_kept_and_exposed() {
+        let community = random_seed();
+        let seed = random_seed();
+        let server = start_gate(&[public_key_of(&seed)], community, 256);
+
+        let member = connect_client(
+            &server,
+            seed,
+            community,
+            Arc::new(InMemoryFriendStore::new()),
+            Arc::new(InMemoryInviteStore::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            member.registered_observed().ip(),
+            server.primary_addr().ip()
+        );
+        assert_ne!(member.registered_observed().port(), 0);
     }
 
     /// The secondary (reflection) port checks membership too: a non-member

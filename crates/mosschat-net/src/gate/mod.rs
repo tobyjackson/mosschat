@@ -13,17 +13,17 @@
 //! smaller, safer reading: one seen set per registration, capped at 4096
 //! entries each.
 //!
-//! **Corrected reading (issue #16, amending the WO-1.3a review's earlier
-//! "insert only on acceptance" note).** Section 1 says the seen set holds
-//! "`BLAKE3(sealed)` ... for every seal it opens", not only for those it
-//! goes on to accept as a friend or invite. The set is inserted into once a
-//! sealed body has decrypted and passed its freshness and pair-tag checks
-//! (that is what "opens" means here), and never before: a body that fails
-//! to decrypt, or fails freshness or the tag check, never occupied a slot
-//! in the first place, so recording it would let an attacker fill the set
-//! with garbage nobody ever opened. Whether the opened body then turns out
-//! to name a friend, an invite or neither is irrelevant to the seen set:
-//! that later accept/decline decision must not gate the insert.
+//! **Seen-set insert point (issue #16, settled by design amendment 1;
+//! supersedes this module's earlier "insert on open, not on accept"
+//! reading, which amendment 1 rejected).** The entry is inserted only after
+//! the seal opens *and* the body verifies as a friend or as an invite
+//! proof -- the accept decision itself, never on receipt and never on an
+//! open alone. A recipient's public key is public, so anyone holding it can
+//! mint a seal that opens; charging the set on opening alone would let a
+//! stranger fill it at whatever rate the gate forwards knocks. Inserting
+//! later loses nothing a fresh insert would have caught: a seal dropped in
+//! silence (wrong freshness, wrong tag, or no friend/invite match) costs
+//! nothing to drop again on a repeat.
 
 pub mod client;
 pub mod server;
@@ -115,7 +115,10 @@ pub mod limits {
 
     /// `min(256, members)`.
     pub const MAX_REGISTRATIONS: usize = 256;
-    /// Two connections per key, a third evicts that key's oldest.
+    /// Two live connections per key (amended section 1): a third is refused
+    /// in the handshake with `gate_at_capacity` and closed before a slot is
+    /// touched; the two already seated are never displaced, silently or
+    /// otherwise.
     pub const MAX_CONNECTIONS_PER_KEY: usize = 2;
     /// Eight live sessions per registration.
     pub const MAX_SESSIONS_PER_REGISTRATION: usize = 8;
@@ -133,6 +136,29 @@ pub mod limits {
     pub const RELAY_DATAGRAMS_PER_SECOND: u32 = 2000;
     /// `Relay`: 2 GiB per session per hour then `cap_exceeded`.
     pub const RELAY_BYTES_PER_HOUR: u64 = 2 * 1024 * 1024 * 1024;
+    /// Any control frame, per connection: 32 per second, burst 64.
+    pub const FRAME_RATE_PER_SECOND: u32 = 32;
+    /// Any control frame's burst allowance (section 1: "32 frames per
+    /// second per connection with burst 64").
+    pub const FRAME_RATE_BURST: u32 = 64;
+    /// `Reflect`: one per connection is the intended use, 2 per minute,
+    /// tracked per key since each `Reflect` rides its own short-lived
+    /// secondary-port connection.
+    pub const REFLECT_PER_MINUTE: u32 = 2;
+    /// `Keepalive`: one per `keepalive_s`, 3 per second tolerated, per
+    /// connection.
+    pub const KEEPALIVE_PER_SECOND: u32 = 3;
+    /// The gate-to-house frame channel's bound (Yseult finding 5 remainder:
+    /// previously unbounded, so a member's frame flood grew gate memory
+    /// without limit). Chosen, not measured: comfortably above
+    /// `FRAME_RATE_BURST` so a legitimate burst never trips it, small
+    /// enough that the worst case for one connection is a bounded handful
+    /// of frames. A full channel drops the newest frame and is silent to
+    /// the sender of the frame that no longer fits (the writer task is
+    /// already draining it as fast as the stream allows; a full channel
+    /// means that house's own connection, not the sender, is the
+    /// bottleneck).
+    pub const FRAME_TX_QUEUE_CAP: usize = 256;
     /// The window every sealed body's freshness is checked against (section
     /// 1, "so that one captured Introduce would otherwise replay forever").
     pub const SEEN_WINDOW: Duration = Duration::from_secs(120);
@@ -155,9 +181,10 @@ pub mod limits {
     /// to absorb a burst well past `RELAY_DATAGRAMS_PER_SECOND` for one
     /// tick of scheduling, small enough that the worst case (every entry at
     /// the 1200 byte relay cap) is a bounded ~1.2 MiB. The drop policy is
-    /// stated where it is enforced: oldest first, since a stale queued
-    /// packet is worth less than a fresh one under QUIC's own loss
-    /// recovery.
+    /// stated where it is enforced (amended section 3): the *newest*
+    /// arrival is dropped and counted once the queue is full, and one
+    /// `poll_recv` call always attempts the real socket before the queue,
+    /// never draining one while starving the other.
     pub const INBOUND_RELAY_QUEUE_CAP: usize = 1024;
 }
 

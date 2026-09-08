@@ -352,6 +352,12 @@ struct Inner {
     invites: Arc<dyn InviteStore>,
     seen: StdMutex<SeenSet>,
     auto_answer_knocks: std::sync::atomic::AtomicBool,
+    /// This house's own address as the gate observed it on the primary
+    /// connection, and the gate's secondary (reflection) port, both taken
+    /// from `Registered` at connect time (Konrad finding 6: previously
+    /// discarded, so a house could learn either only out of band).
+    registered_observed: std::net::SocketAddr,
+    registered_secondary_port: u16,
 }
 
 /// A house's connection to one gate: registered, able to seal and send an
@@ -440,8 +446,17 @@ impl GateClient {
         let (mut send, mut recv) = authed_conn.connection().open_bi().await?;
         wire::write_frame(&mut send, &Frame::Register { v: 1, community }).await?;
         let reply = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
-        match reply {
-            Frame::Registered { .. } => {}
+        let (registered_observed, registered_secondary_port) = match reply {
+            Frame::Registered {
+                observed,
+                secondary_port,
+                ..
+            } => {
+                let observed = observed.to_socket_addr().ok_or_else(|| {
+                    GateError::Protocol("Registered.observed did not decode".into())
+                })?;
+                (observed, secondary_port)
+            }
             Frame::Error { code, detail, .. } => {
                 return Err(GateError::Protocol(format!(
                     "gate refused registration: code={code} detail={detail}"
@@ -452,7 +467,7 @@ impl GateClient {
                     "expected Registered or Error, got {other:?}"
                 )));
             }
-        }
+        };
 
         let signing_key = RawSigningKey::from_bytes(&identity_seed);
         let identity_key = AuthorKey::from_bytes(&identity_seed);
@@ -474,6 +489,8 @@ impl GateClient {
             invites,
             seen: StdMutex::new(SeenSet::new()),
             auto_answer_knocks: std::sync::atomic::AtomicBool::new(true),
+            registered_observed,
+            registered_secondary_port,
         });
 
         let reader_inner = Arc::clone(&inner);
@@ -494,6 +511,21 @@ impl GateClient {
     #[must_use]
     pub fn gate_key(&self) -> [u8; 32] {
         self.inner.gate.peer_key()
+    }
+
+    /// This house's own address as the gate observed it (`Registered.observed`),
+    /// learned from the protocol at registration time.
+    #[must_use]
+    pub fn registered_observed(&self) -> std::net::SocketAddr {
+        self.inner.registered_observed
+    }
+
+    /// The gate's secondary (reflection) port (`Registered.secondary_port`),
+    /// learned from the protocol at registration time rather than out of
+    /// band.
+    #[must_use]
+    pub fn registered_secondary_port(&self) -> u16 {
+        self.inner.registered_secondary_port
     }
 
     /// The underlying gate control connection, for tests that need to read
@@ -700,15 +732,16 @@ async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
 }
 
 async fn answer_knock(inner: &Arc<Inner>, tag: [u8; 32], sealed: Vec<u8>) {
-    // Corrected reading of issue #16 (`gate/mod.rs`'s module doc): the seen
-    // set is charged only once a sealed body has opened *and* verified --
-    // decrypted, within its freshness window, and its pair tag matches --
-    // never before. Charging it on every `Knock` delivered (the previous
-    // order here) let anyone able to deliver a knock, opening or not, fill
-    // a target's seen set on its behalf; charging it only once the friend
-    // or invite decision is also made would instead let a captured, still
-    // fresh seal replay against the exact same acceptance decision inside
-    // the window, which section 1 says the set must prevent.
+    // Design amendment 1 (settling issue #16): the seen set is charged only
+    // on the accept decision itself -- the seal has opened, its freshness
+    // and pair tag both verify, *and* the body names a friend or a valid
+    // invite proof -- never on receipt and never on an open alone. B's key
+    // is public, so anyone holding it can mint a seal that opens; charging
+    // the set on opening alone lets a stranger fill it at whatever rate the
+    // gate forwards knocks. Inserting after the accept decision loses
+    // nothing: a seal this house was always going to answer with silence
+    // (wrong freshness, wrong tag, or no friend/invite match) costs nothing
+    // to drop again on a repeat.
     let Ok(body) = seal::open(&sealed, &inner.signing_key) else {
         return;
     };
@@ -721,14 +754,6 @@ async fn answer_knock(inner: &Arc<Inner>, tag: [u8; 32], sealed: Vec<u8>) {
         &inner.identity_key.public_bytes(),
     ) != tag
     {
-        return;
-    }
-
-    let fresh = {
-        let mut seen = inner.seen.lock_or_recover();
-        seen.accept(&sealed)
-    };
-    if !fresh {
         return;
     }
 
@@ -747,7 +772,19 @@ async fn answer_knock(inner: &Arc<Inner>, tag: [u8; 32], sealed: Vec<u8>) {
 
     if !accept {
         // A stranger with no proof, or a spent invite: silence, per section
-        // 1, never an explicit decline.
+        // 1, never an explicit decline, and the seen set is left uncharged
+        // (never occupying a slot for a knock this house was never going to
+        // accept).
+        return;
+    }
+
+    let fresh = {
+        let mut seen = inner.seen.lock_or_recover();
+        seen.accept(&sealed)
+    };
+    if !fresh {
+        // A repeat of an already-accepted seal replayed inside the window:
+        // silence, per section 1.
         return;
     }
 
