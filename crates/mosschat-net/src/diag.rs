@@ -394,11 +394,21 @@ pub enum VisitEventKind {
     /// stdout only, because a refused dial has no attempt and so no
     /// record.
     Refused,
+    /// A house's connection to its gate ended while it was registered.
+    /// House stdout only, for the same reason [`VisitEventKind::Registered`]
+    /// is: it is a fact about the house, not about one attempt.
+    ///
+    /// **Added because its absence was invisible** (run 3, issue 84). A
+    /// house whose gate connection died went on running, answered nothing,
+    /// said nothing, and every later row failed at `introduce` against a
+    /// callee that looked alive. A registration that has ended is the one
+    /// thing a house must say out loud.
+    GateLost,
 }
 
 impl VisitEventKind {
     /// All variants, in the order a visit produces them.
-    pub const ALL: [VisitEventKind; 10] = [
+    pub const ALL: [VisitEventKind; 11] = [
         VisitEventKind::Registered,
         VisitEventKind::Knock,
         VisitEventKind::VisitOpen,
@@ -409,6 +419,7 @@ impl VisitEventKind {
         VisitEventKind::Recovered,
         VisitEventKind::Goodbye,
         VisitEventKind::Refused,
+        VisitEventKind::GateLost,
     ];
 
     /// The `snake_case` spelling used in the record and on a house's
@@ -426,6 +437,7 @@ impl VisitEventKind {
             VisitEventKind::Recovered => "recovered",
             VisitEventKind::Goodbye => "goodbye",
             VisitEventKind::Refused => "refused",
+            VisitEventKind::GateLost => "gate_lost",
         }
     }
 
@@ -1931,6 +1943,13 @@ impl Recorder {
     /// The attempt id of frame 16, once the porch stream has named it.
     pub fn set_attempt(&self, attempt: [u8; 16]) {
         self.inner.state.lock_or_recover().attempt = attempt;
+    }
+
+    /// The attempt id this record is for, all zero until the candidate
+    /// exchange names one.
+    #[must_use]
+    pub fn attempt(&self) -> [u8; 16] {
+        self.inner.state.lock_or_recover().attempt
     }
 
     /// The gate's session id (frame 6).

@@ -288,8 +288,13 @@ mosschat house --headless: stay home, answer knocks from friends, and hold visit
                           asked for rather than inferred from a failure.
 
 Prints one JSON object per line on stdout, one per event: registered, knock, visit_open,
-upgraded, path_stale, path_dead, fell_back, recovered, goodbye. Stops on SIGTERM and on
-Ctrl-C, saying goodbye to every open visit and to the gate.";
+upgraded, path_stale, path_dead, fell_back, recovered, goodbye, refused, gate_lost. Stops
+on SIGTERM and on Ctrl-C, saying goodbye to every open visit and to the gate.
+
+Exit: 0 when it was asked to stop. 1, after a gate_lost line, if the connection to the gate
+ends while this house is registered: a house that cannot reach its gate is reachable by no
+friend, however healthy it looks, so it leaves rather than run on unreachable. Nothing
+redials yet (issue 84), so a supervisor that wants this house back must restart it.";
 
 fn run_house(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = args.collect();

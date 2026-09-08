@@ -162,6 +162,10 @@ struct RelayRoutes {
     drained: HashSet<SocketAddr>,
 }
 
+/// One attempt's queue of inbound probes, with the source address each
+/// arrived from.
+type ProbeQueue = VecDeque<(SocketAddr, Probe)>;
+
 /// A `quinn::AsyncUdpSocket` backed by a real UDP socket for the gate
 /// connection (and, in WO-1.3b, direct peer paths), that also relays any
 /// transmit addressed to a registered synthetic peer address through the
@@ -204,7 +208,20 @@ pub struct PorchSocket {
     /// under a currently armed attempt key, which is stronger than a source
     /// check rather than weaker, and the queue is capped at
     /// [`INBOUND_PROBE_QUEUE_CAP`] on top of that.
-    inbound_probes: Mutex<VecDeque<(SocketAddr, Probe)>>,
+    ///
+    /// **One queue per attempt, not one per socket** (Yseult's High on PR
+    /// 89). There is one porch socket per house and one doorbell per
+    /// visit, and each doorbell used to drain the single queue to empty and
+    /// discard whatever was not its own attempt. Two visits at once
+    /// therefore ate each other's pongs, and with section 4 now probing
+    /// every relayed visit that is three misses and a false `path_dead` on
+    /// a healthy path, which is the same untruth this liveness exists to
+    /// remove. Keyed by attempt, a doorbell sees only its own and cannot
+    /// consume anyone else's. The map is bounded by the armed key set,
+    /// because [`PorchSocket::queue_probes`] files a probe under the
+    /// attempt whose key verified it and refuses one that names another,
+    /// and each entry by [`INBOUND_PROBE_QUEUE_CAP`].
+    inbound_probes: Mutex<HashMap<[u8; 16], ProbeQueue>>,
     /// The probe keys currently armed, by attempt id. Empty means no
     /// attempt is running, and then every probe segment is dropped and
     /// counted rather than queued for a consumer that does not exist.
@@ -306,7 +323,7 @@ impl PorchSocket {
             }),
             paths: Mutex::new(PathTable::new()),
             inbound_synthetic: Mutex::new(VecDeque::new()),
-            inbound_probes: Mutex::new(VecDeque::new()),
+            inbound_probes: Mutex::new(HashMap::new()),
             probe_keys: Mutex::new(HashMap::new()),
             probes_unauthenticated: AtomicU64::new(0),
             inbound_probes_dropped: AtomicU64::new(0),
@@ -567,6 +584,23 @@ impl PorchSocket {
             routes.by_session.get(&session).copied()
         };
         let Some(addr) = addr else { return };
+        // Section 3's split, applied to the relay leg as well as the wire:
+        // a probe is not a QUIC packet, and handing one to quinn would put
+        // 81 bytes of nothing into a connection that has no idea what it
+        // is. The discriminator is unambiguous here for the same reason it
+        // is on the wire (`is_probe`), since what a relay carries for this
+        // peer is that same end to end connection's packets. The source is
+        // the synthetic address, which is what the relay path's own
+        // liveness probes are addressed to and therefore what a pong from
+        // one must compare equal to.
+        if is_probe(payload)
+            && let Some(segment) = payload.get(..PROBE_LEN)
+        {
+            let mut probe = [0u8; PROBE_LEN];
+            probe.copy_from_slice(segment);
+            self.queue_probes(addr, &[probe]);
+            return;
+        }
         let pushed = {
             let mut queue = self.inbound_synthetic.lock_or_recover();
             if queue.len() >= INBOUND_RELAY_QUEUE_CAP {
@@ -610,9 +644,7 @@ impl PorchSocket {
     /// as this socket is concerned.
     pub fn disarm_probe_key(&self, attempt: &[u8; 16]) {
         self.probe_keys.lock_or_recover().remove(attempt);
-        self.inbound_probes
-            .lock_or_recover()
-            .retain(|(_, probe)| probe.attempt != *attempt);
+        self.inbound_probes.lock_or_recover().remove(attempt);
     }
 
     /// Probe segments dropped because no armed key authenticated them,
@@ -743,6 +775,18 @@ impl PorchSocket {
     /// [`io::ErrorKind::WouldBlock`] if the socket is not writable; a probe
     /// is cheap and repeated every 100 ms, so a caller may simply drop it.
     pub fn send_probe(&self, to: SocketAddr, probe: &[u8; PROBE_LEN]) -> io::Result<()> {
+        // Section 4 applies to whichever path is carrying the visit, and a
+        // relayed visit's path is the relay session. A probe addressed to
+        // the peer's synthetic address is therefore wrapped as a `Relay`
+        // payload and shaped like any other relayed datagram rather than
+        // written to the wire, where a ULA that names nothing would go
+        // nowhere. There is no ambiguity to resolve: a synthetic address is
+        // a `fd00::/8` address this house invented and can never be a
+        // candidate, so a real candidate probe still takes the branch
+        // below.
+        if let Some(session) = self.relay_session_for(to) {
+            return self.send_probe_relayed(session, to, probe);
+        }
         let transmit = Transmit {
             destination: self.map_destination(to),
             ecn: None,
@@ -755,11 +799,84 @@ impl PorchSocket {
         })
     }
 
+    /// The relay session registered for `synthetic_peer`, if that address
+    /// is one.
+    fn relay_session_for(&self, synthetic_peer: SocketAddr) -> Option<u32> {
+        self.relay
+            .lock_or_recover()
+            .by_synthetic
+            .get(&synthetic_peer)
+            .copied()
+    }
+
+    /// Sends one probe through `session`'s shaped queue.
+    ///
+    /// The same queue every relayed QUIC packet for this peer goes through,
+    /// so a relay probe is delayed and counted exactly as the traffic it is
+    /// measuring is, which is the only way its round trip means anything.
+    /// No gate-attached check, unlike [`PorchSocket::try_send`]'s relay
+    /// branch: that one exists so quinn gets a hard error to back off on,
+    /// while `register_relay_session` already documents that registering a
+    /// session and attaching a gate may happen in either order and that the
+    /// drain task starts with whichever arrives second. A probe queued
+    /// before a gate attaches therefore leaves when one does, and the only
+    /// caller is a visit already carrying its traffic through that gate.
+    ///
+    /// `try_enqueue_all` and not `enqueue_or_drop` (Yseult's Medium 1 on
+    /// PR 89): dropping the newest and counting it is the *gate's* policy
+    /// and only the gate's, because it forwards unreliable datagrams and
+    /// has nothing to push back on. Section 1 says of a house's own egress
+    /// queue that it never drops, and a probe silently dropped here would
+    /// be charged to the peer as a missed answer, which is a false
+    /// `path_stale` on a path carrying data at full rate. Refusing the
+    /// whole thing counts `relay_socket_backpressure` and hands the caller
+    /// a `WouldBlock` it is required to act on.
+    fn send_probe_relayed(
+        &self,
+        session: u32,
+        synthetic_peer: SocketAddr,
+        probe: &[u8; PROBE_LEN],
+    ) -> io::Result<()> {
+        let payload = encode_relay(session, probe).map_err(|e| io::Error::other(e.to_string()))?;
+        let Some(shaper) = self.shaper_for(synthetic_peer) else {
+            return Err(io::Error::other(
+                "no path table entry for a registered relay session",
+            ));
+        };
+        match shaper.try_enqueue_all(vec![payload]) {
+            Enqueued::Accepted => Ok(()),
+            Enqueued::Full => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            Enqueued::Closed => Err(io::Error::other("relay session closed")),
+        }
+    }
+
     /// Takes the next probe lifted out of the inbound stream, if one is
     /// waiting, with the real source address it arrived from.
+    ///
+    /// Takes `attempt` because the queue is keyed by it: one house runs one
+    /// doorbell per visit against one porch socket, and a doorbell that
+    /// could take another visit's probe would take it away from the visit
+    /// that is timing it (Yseult's High on PR 89).
     #[must_use]
-    pub fn try_recv_probe(&self) -> Option<(SocketAddr, Probe)> {
-        self.inbound_probes.lock_or_recover().pop_front()
+    pub fn try_recv_probe(&self, attempt: &[u8; 16]) -> Option<(SocketAddr, Probe)> {
+        let mut queues = self.inbound_probes.lock_or_recover();
+        let queue = queues.get_mut(attempt)?;
+        let next = queue.pop_front();
+        if queue.is_empty() {
+            queues.remove(attempt);
+        }
+        next
+    }
+
+    /// How many probes are queued across every attempt, for tests and
+    /// diagnostics.
+    #[must_use]
+    pub fn queued_probes(&self) -> usize {
+        self.inbound_probes
+            .lock_or_recover()
+            .values()
+            .map(ProbeQueue::len)
+            .sum()
     }
 
     /// Waits for the next inbound probe.
@@ -767,13 +884,13 @@ impl PorchSocket {
     /// One waiter at a time: the doorbell is a single task per house, and a
     /// second waiter would silently displace the first, which is the very
     /// shape issue #19 was.
-    pub async fn recv_probe(&self) -> (SocketAddr, Probe) {
-        std::future::poll_fn(|cx| {
-            if let Some(probe) = self.try_recv_probe() {
+    pub async fn recv_probe(&self, attempt: [u8; 16]) -> (SocketAddr, Probe) {
+        std::future::poll_fn(move |cx| {
+            if let Some(probe) = self.try_recv_probe(&attempt) {
                 return Poll::Ready(probe);
             }
             *self.probe_waker.lock_or_recover() = Some(cx.waker().clone());
-            match self.try_recv_probe() {
+            match self.try_recv_probe(&attempt) {
                 Some(probe) => Poll::Ready(probe),
                 None => Poll::Pending,
             }
@@ -845,23 +962,34 @@ impl PorchSocket {
     /// mapping nobody has seen yet; the keyed hash section 2 specifies is
     /// the check, and it is the stronger of the two.
     fn queue_probes(&self, source: SocketAddr, segments: &[[u8; PROBE_LEN]]) {
-        let keys: Vec<[u8; 32]> = {
+        let keys: Vec<([u8; 16], [u8; 32])> = {
             let armed = self.probe_keys.lock_or_recover();
             if armed.is_empty() {
                 self.probes_unauthenticated
                     .fetch_add(segments.len() as u64, Ordering::Relaxed);
                 return;
             }
-            armed.values().copied().collect()
+            armed.iter().map(|(id, key)| (*id, *key)).collect()
         };
         let mut woke = false;
         for segment in segments {
-            let Some(probe) = keys.iter().find_map(|key| Probe::decode(segment, key)) else {
+            // **The attempt a probe names must be the attempt whose key
+            // signed it** (Yseult's High on PR 89). The MAC covers the
+            // attempt field, so a probe minted under attempt A's key and
+            // claiming attempt B verifies under A and nothing else; without
+            // this check it would then be filed under B, which is a session
+            // peer choosing the queue another visit reads and the one way
+            // the map below could grow past the armed set.
+            let Some(probe) = keys
+                .iter()
+                .find_map(|(id, key)| Probe::decode(segment, key).filter(|p| p.attempt == *id))
+            else {
                 self.probes_unauthenticated.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             let pushed = {
-                let mut queue = self.inbound_probes.lock_or_recover();
+                let mut queues = self.inbound_probes.lock_or_recover();
+                let queue = queues.entry(probe.attempt).or_default();
                 if queue.len() >= INBOUND_PROBE_QUEUE_CAP {
                     false
                 } else {
@@ -1447,6 +1575,149 @@ mod tests {
         assert_eq!(queue.front().unwrap().1, vec![0u8]);
     }
 
+    /// Section 4 reaches the relay path: a probe addressed to a registered
+    /// relay session's synthetic address is wrapped as a `Relay` payload
+    /// and put on that session's shaped queue, not written to the wire
+    /// where a `fd00::/8` address that names nothing would go nowhere.
+    ///
+    /// Deliberate break to fail this test: delete the `relay_session_for`
+    /// branch from `send_probe`, which is exactly the code before this fix.
+    /// The probe then takes the raw-socket path, the shaper stays empty,
+    /// and the length assertion below fails. That is the bug: a relayed
+    /// visit could not be probed at all, so it had no liveness and died in
+    /// silence.
+    #[test]
+    fn a_probe_to_a_synthetic_address_goes_through_the_relay_not_the_wire() {
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let socket = PorchSocket::new(std_socket).unwrap();
+        let synthetic = synthetic_addr([1, 2, 3, 4, 5], &[9u8; 32]);
+        socket.register_relay_session(7, synthetic);
+        let shaper = socket.shaper_for(synthetic).unwrap();
+        assert_eq!(shaper.len(), 0);
+
+        let probe = Probe {
+            kind: crate::punch::PROBE_PING,
+            attempt: [3u8; 16],
+            tx: [4u8; 8],
+            observed: crate::gate::wire::Addr::default(),
+        }
+        .encode(&[5u8; 32]);
+
+        // Queued on the peer's own shaper, one relayed datagram like any
+        // other, and nothing was written to the real socket.
+        assert!(socket.send_probe(synthetic, &probe).is_ok());
+        assert_eq!(shaper.len(), 1);
+
+        // A real address still takes the wire, which is the branch the
+        // doorbell's candidate burst uses: whether the send itself
+        // succeeds is the reactor's business, but it must not have gone
+        // anywhere near this peer's relay queue.
+        let elsewhere: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let _ = socket.send_probe(elsewhere, &probe);
+        assert_eq!(shaper.len(), 1);
+    }
+
+    /// The receive half of the same split: a probe arriving over the relay
+    /// is lifted into the probe queue with the synthetic address as its
+    /// source, never handed to quinn, which has no idea what an 81 byte
+    /// non-QUIC packet is.
+    ///
+    /// Deliberate break to fail this test: delete the `is_probe` branch
+    /// from `deliver_synthetic`. The probe then lands in
+    /// `inbound_synthetic` and the two assertions below swap.
+    #[test]
+    fn a_probe_arriving_over_the_relay_is_lifted_into_the_probe_queue() {
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let socket = PorchSocket::new(std_socket).unwrap();
+        let synthetic = synthetic_addr([1, 2, 3, 4, 5], &[9u8; 32]);
+        socket.register_relay_session(7, synthetic);
+        let key = [5u8; 32];
+        socket.arm_probe_key([3u8; 16], key);
+
+        let probe = Probe {
+            kind: crate::punch::PROBE_PONG,
+            attempt: [3u8; 16],
+            tx: [4u8; 8],
+            observed: crate::gate::wire::Addr::default(),
+        }
+        .encode(&key);
+        socket.deliver_synthetic(7, &probe);
+
+        assert_eq!(socket.inbound_synthetic.lock_or_recover().len(), 0);
+        let (from, received) = socket
+            .try_recv_probe(&[3u8; 16])
+            .expect("the probe was queued");
+        assert_eq!(from, synthetic);
+        assert_eq!(received.tx, [4u8; 8]);
+
+        // A relayed QUIC packet still goes where it always went.
+        socket.deliver_synthetic(7, &[0x40u8; 32]);
+        assert_eq!(socket.inbound_synthetic.lock_or_recover().len(), 1);
+    }
+
+    /// Yseult's High on PR 89, the active half: a session peer holds its
+    /// own attempt's probe key, so it can mint valid probes. It must not be
+    /// able to file them under another visit's attempt, where that visit's
+    /// doorbell would read them and where the map of queues would otherwise
+    /// grow to whatever ids it chose.
+    ///
+    /// The MAC covers the attempt field, so a probe minted under A's key
+    /// naming attempt B verifies under A and under nothing else. The check
+    /// is that the id it names is the id whose key signed it.
+    ///
+    /// Deliberate break to fail this test: drop the
+    /// `.filter(|p| p.attempt == *id)` from `queue_probes`. The forged
+    /// probe is then filed under B, the victim's `try_recv_probe` returns
+    /// it, and the last two assertions fail.
+    #[test]
+    fn a_probe_cannot_be_filed_under_an_attempt_whose_key_did_not_sign_it() {
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let socket = PorchSocket::new(std_socket).unwrap();
+        let attacker = [0xAAu8; 16];
+        let victim = [0xBBu8; 16];
+        socket.arm_probe_key(attacker, [1u8; 32]);
+        socket.arm_probe_key(victim, [2u8; 32]);
+        let source: SocketAddr = "203.0.113.77:4433".parse().unwrap();
+
+        // A probe the attacker can really make: its own key, another
+        // visit's attempt id.
+        let forged = Probe {
+            kind: crate::punch::PROBE_PONG,
+            attempt: victim,
+            tx: [9u8; 8],
+            observed: crate::gate::wire::Addr::default(),
+        }
+        .encode(&[1u8; 32]);
+        socket.queue_probes(source, &[forged]);
+
+        assert_eq!(
+            socket.probes_unauthenticated(),
+            1,
+            "a probe naming an attempt its key did not sign is not authenticated"
+        );
+        assert_eq!(socket.queued_probes(), 0);
+        assert!(socket.try_recv_probe(&victim).is_none());
+        assert!(socket.try_recv_probe(&attacker).is_none());
+
+        // Its own attempt still works, and lands only in its own queue.
+        let honest = Probe {
+            kind: crate::punch::PROBE_PONG,
+            attempt: attacker,
+            tx: [9u8; 8],
+            observed: crate::gate::wire::Addr::default(),
+        }
+        .encode(&[1u8; 32]);
+        socket.queue_probes(source, &[honest]);
+        assert!(socket.try_recv_probe(&victim).is_none());
+        assert!(socket.try_recv_probe(&attacker).is_some());
+    }
+
     /// Section 3's per-packet gate-address check, the leaving half: an
     /// address is in the live gate-address set from its connection's
     /// registration and leaves it when that connection closes, after which
@@ -1780,8 +2051,8 @@ mod tests {
                 &quic[..],
                 "the QUIC packet is unaltered"
             );
-            assert_eq!(socket.try_recv_probe(), Some((direct, ping())));
-            assert_eq!(socket.try_recv_probe(), None);
+            assert_eq!(socket.try_recv_probe(&ATTEMPT), Some((direct, ping())));
+            assert_eq!(socket.try_recv_probe(&ATTEMPT), None);
         }
 
         /// The probe can equally arrive first, which makes the stride 81:
@@ -1809,9 +2080,9 @@ mod tests {
             assert_eq!(socket.demultiplex(&mut bufs, &mut meta, 1), 0);
             assert_eq!(meta[0].len, 0);
             for _ in 0..3 {
-                assert_eq!(socket.try_recv_probe(), Some((source, ping())));
+                assert_eq!(socket.try_recv_probe(&ATTEMPT), Some((source, ping())));
             }
-            assert_eq!(socket.try_recv_probe(), None);
+            assert_eq!(socket.try_recv_probe(&ATTEMPT), None);
         }
 
         /// A probe still reaches the doorbell when it arrives before the
@@ -1837,7 +2108,7 @@ mod tests {
             assert_eq!(socket.demultiplex(&mut bufs, &mut meta, 1), 1);
             assert_eq!(meta[0].len, PROBE_LEN);
             assert_eq!(&bufs[0][..PROBE_LEN], &quic);
-            assert_eq!(socket.try_recv_probe(), Some((source, ping())));
+            assert_eq!(socket.try_recv_probe(&ATTEMPT), Some((source, ping())));
         }
 
         /// Yseult's High, Konrad's must 1: a stranger reaching the porch
@@ -1865,8 +2136,8 @@ mod tests {
                 deliver_one_probe(&socket, stranger, &a_probe());
             }
             assert_eq!(socket.probes_unauthenticated(), flood as u64);
-            assert!(socket.try_recv_probe().is_none());
-            assert_eq!(socket.inbound_probes.lock_or_recover().len(), 0);
+            assert!(socket.try_recv_probe(&ATTEMPT).is_none());
+            assert_eq!(socket.queued_probes(), 0);
 
             // A key armed for a different attempt does not authenticate
             // this one either: the check is the keyed hash, not the shape.
@@ -1875,7 +2146,7 @@ mod tests {
                 deliver_one_probe(&socket, stranger, &a_probe());
             }
             assert_eq!(socket.probes_unauthenticated(), (flood * 2) as u64);
-            assert!(socket.try_recv_probe().is_none());
+            assert!(socket.try_recv_probe(&ATTEMPT).is_none());
 
             // With the right key armed the queue fills to the cap and not
             // one past it, and every further arrival is counted.
@@ -1884,17 +2155,14 @@ mod tests {
             for _ in 0..(INBOUND_PROBE_QUEUE_CAP + overflow) {
                 deliver_one_probe(&socket, stranger, &a_probe());
             }
-            assert_eq!(
-                socket.inbound_probes.lock_or_recover().len(),
-                INBOUND_PROBE_QUEUE_CAP
-            );
+            assert_eq!(socket.queued_probes(), INBOUND_PROBE_QUEUE_CAP);
             assert_eq!(socket.inbound_probes_dropped(), overflow as u64);
             assert_eq!(socket.probes_unauthenticated(), (flood * 2) as u64);
 
             // Disarming ends the attempt as far as the socket is concerned
             // and takes its queued probes with it.
             socket.disarm_probe_key(&ATTEMPT);
-            assert_eq!(socket.inbound_probes.lock_or_recover().len(), 0);
+            assert_eq!(socket.queued_probes(), 0);
         }
 
         /// Feeds one probe-shaped datagram through the real receive path.

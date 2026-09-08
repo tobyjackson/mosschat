@@ -333,6 +333,24 @@ impl PeerLiveness {
         true
     }
 
+    /// Undoes one [`PeerLiveness::due_probe`] whose probe never left this
+    /// machine, so the peer is not charged a miss for this house's own
+    /// full queue (Yseult's Medium 1 on PR 89).
+    ///
+    /// `due_probe` deliberately records a probe as sent in the same call
+    /// that authorises it, because a probe the caller was told to send and
+    /// did send must be timed. A send that fails is the other case, and
+    /// the caller is the only thing that knows which happened. Only the
+    /// marker this call's own probe created is cleared: an older
+    /// unanswered probe is a real miss and stays outstanding. `last_sent`
+    /// is left alone, so a full queue is retried at the next interval
+    /// rather than hammered.
+    pub fn probe_not_sent(&mut self, sent_at: Instant) {
+        if self.outstanding == Some(sent_at) {
+            self.outstanding = None;
+        }
+    }
+
     /// An answer arrived at `now`, `rtt` being its measured round trip.
     ///
     /// **A stale path is not restored by an answer.** Section 4 says stale

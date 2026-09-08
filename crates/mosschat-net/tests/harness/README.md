@@ -514,7 +514,36 @@ mode ran.
 `down` stops house-b the same way it stops the gatehouse, by the pid its
 own pidfile records, and copies `.run/house-b.jsonl`, the callee's own
 account of every visit, to `docs/measurements/<date>-house-b.jsonl` before
-teardown deletes `.run`.
+teardown deletes `.run`. It also copies both roles' section 7 diagnostics
+records out, to `<date>-house-a-records.jsonl` and
+`<date>-house-b-records.jsonl`. Each role runs with its own
+`XDG_STATE_HOME` under `.run` so the two sides land in two files rather
+than interleaved in one, and so they survive teardown at all: run 3 came
+down to whether the callee had ever probed, its stdout could not say, and
+its records were inside `.run` when teardown ran.
+
+**The unshaped smoke run must reach a direct path**, not merely exit 0.
+Exit 0 says the visit went live, which is equally true of a visit that
+relayed for its whole hold; run 3 relayed every row, said `probe_timeout`
+in every record, and the matrix reported twelve passes. In normal mode a
+smoke run that never leaves the relay now stops the matrix and prints the
+record's `path`, `reason` and `failed_step`, because measuring how
+fall-back degrades under twelve fault conditions is worth nothing until
+something has punched once. `MOSS_ALLOW_RELAY_SMOKE=1` runs the matrix
+anyway, for the case where the relay behaviour itself is what is being
+measured; `--relay-only` skips the check outright, that mode being
+relayed on purpose.
+
+**What the copied files contain, before you commit them.** Everything
+under `docs/measurements/` goes into a public repository. A run through
+this harness is safe by construction: both roles live inside network
+namespaces, so every address in a record is 10.1.0.x, 10.2.0.x or
+203.0.113.x, a peer is a salted fingerprint and never a key, and no seed
+or payload byte is written (section 7's redaction). A run of the same
+binaries *outside* the namespaces is not: `local_observed` is then
+whatever address your gate reflected, which is your machine's. Read a
+record before committing one that did not come from this harness
+(Yseult's Info 1 on PR 89).
 
 ### One identity cannot run every row
 
