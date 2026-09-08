@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod authed;
+pub mod diag;
 pub mod gate;
 pub(crate) mod lockext;
 pub mod path;
