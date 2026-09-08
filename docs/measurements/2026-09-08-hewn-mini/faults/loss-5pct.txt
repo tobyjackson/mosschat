@@ -1,0 +1,11 @@
+# fault-matrix.sh row: loss-5pct
+# condition: Packet loss 5%
+# pass criterion: Connects, degraded RTT; log records timings, no false failure
+# started (UTC): 2026-09-08T16:22:47Z
+# command: ip netns exec house-a /home/hewn/mosschat/mosschat doctor --gate 203.0.113.1:443 --community f733993a7ed3f79b9aeceb87bf726323c9879a0f61b1415c882b81bc4467b706 --identity-file /home/hewn/mosschat/crates/mosschat-net/tests/harness/.run/house-a.seed --json
+# netem applied (tc qdisc show, captured right after applying):
+# tc qdisc show dev veth-ha (in house-a):
+#   qdisc netem 8002: root refcnt 5 limit 1000 loss 5% seed 16881176627158312574
+# --- command output follows ---
+This report contains IP addresses: yours, your friend's and your gate's.
+{"attempt":"00000000000000000000000000000000","ended_at":"2026-09-08T16:22:47.974Z","failed_step":null,"gate_bytes":0,"gate_carried_traffic":false,"gate_ms":0,"local_observed":["family=0 bytes=00000000000000000000000000000000 port=0","family=0 bytes=00000000000000000000000000000000 port=0"],"mapping":"unknown","path":"relay","path_addr":"family=0 bytes=00000000000000000000000000000000 port=0","path_rtt_us":0,"peer":"00000000","peer_observed":"family=0 bytes=00000000000000000000000000000000 port=0","platform":"linux","reason":"internal","relay_dropped_at_full":0,"relay_queued":0,"relay_shaped_delay_max_us":0,"relay_shaped_delay_p50_us":0,"session":0,"started_at":"2026-09-08T16:22:47.919Z","steps":[{"at_ms":1,"detail":"gate at 203.0.113.1:443","outcome":"ok","step":"gate_dial"}],"version":"0.1.0"}

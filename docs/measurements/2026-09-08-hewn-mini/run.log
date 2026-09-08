@@ -1,0 +1,152 @@
+
+#### 2026-09-08T16:22:41Z run-harness.sh matrix
+
+== netns-nat.sh --mode eim (left up for the matrix)
+== netns-nat.sh: mode=eim dry_run=0 ==
+== topology ready (mode=eim) ==
+gatehouse binds inside the 'internet' namespace, e.g.:
+  ip netns exec internet /home/hewn/mosschat/mosschat gatehouse --bind 203.0.113.1:443 --secondary-bind 203.0.113.1:444 --community <hex> --members <path>
+
+house-a and house-b reach it as 203.0.113.1:443 / :444 through their own NAT.
+
+== confirm the NAT mode with conntrack, never assume it ==
+Only one address exists past nat-a's outward side (203.0.113.1, the
+internet bridge), so the probe below varies the DESTINATION PORT, not
+the destination address, and it must be sent from one FIXED local
+source port -- two different ephemeral source ports would get two
+different mappings under EITHER mode and prove nothing. See
+README.md 'Confirming which NAT mode is really in effect' for the
+exact socat commands, then run:
+
+  ip netns exec nat-a conntrack -L -n -s 10.1.0.2
+
+Interpretation: each line shows two tuples, the original request and
+the reply tuple as the NAT sees it. The mapped external port is the
+reply tuple's dport= field (e.g. '... src=203.0.113.1 dst=203.0.113.11
+sport=443 dport=41234 ...', src/dst/sport/dport in that order, same as
+README.md's worked example), not the sport on the request side. If the
+two probes (dest port 443, then 444) show the SAME reply dport=, the
+NAT is endpoint-independent (EIM). If they show two DIFFERENT reply
+dport= values, it is endpoint-dependent, i.e. symmetric (EDM).
+Do this for nat-b with -s 10.2.0.2 too.
+
+== community, seeds, members
+# hewn-mini 7.0.0-31-generic 2026-09-08T16:22:45Z
+community: f733993a7ed3f79b9aeceb87bf726323c9879a0f61b1415c882b81bc4467b706
+house-a: d58cf7d9108dd3253f4874ee9827bb9358a95af4fba0086acb3faa411795cd3b
+house-b: 6ea261bd1e2794a0612d6e01b5c3a3c473f8c1cac9239e158b81a57606f4f457
+
+== gatehouse in the internet namespace (log: /home/hewn/mosschat/crates/mosschat-net/tests/harness/.run/gatehouse.log)
+mosschat gatehouse: community=f733993a7ed3f79b9aeceb87bf726323c9879a0f61b1415c882b81bc4467b706
+mosschat gatehouse: primary=203.0.113.1:443 secondary=203.0.113.1:444
+
+== doctor smoke run, unshaped
+This report contains IP addresses: yours, your friend's and your gate's.
+{"attempt":"00000000000000000000000000000000","ended_at":"2026-09-08T16:22:47.714Z","failed_step":null,"gate_bytes":0,"gate_carried_traffic":false,"gate_ms":0,"local_observed":["203.0.113.11:36101","203.0.113.11:36101"],"mapping":"endpoint_independent","path":"relay","path_addr":"family=0 bytes=00000000000000000000000000000000 port=0","path_rtt_us":0,"peer":"00000000","peer_observed":"family=0 bytes=00000000000000000000000000000000 port=0","platform":"linux","reason":"ok","relay_dropped_at_full":0,"relay_queued":0,"relay_shaped_delay_max_us":0,"relay_shaped_delay_p50_us":0,"session":0,"started_at":"2026-09-08T16:22:47.711Z","steps":[{"at_ms":1,"detail":"gate at 203.0.113.1:443","outcome":"ok","step":"gate_dial"},{"at_ms":2,"detail":"registered, secondary port 444","outcome":"ok","step":"gate_register"},{"at_ms":2,"detail":"gate saw 203.0.113.11:36101","outcome":"ok","step":"reflect_primary"},{"at_ms":3,"detail":"gate saw 203.0.113.11:36101","outcome":"ok","step":"reflect_secondary"}],"version":"0.1.0"}
+doctor exit: 0
+
+== fault matrix (12 rows; blackout row alone takes ~70 s)
+== fault-matrix.sh: dry_run=0 row_timeout=120s command: ip netns exec house-a /home/hewn/mosschat/mosschat doctor --gate 203.0.113.1:443 --community f733993a7ed3f79b9aeceb87bf726323c9879a0f61b1415c882b81bc4467b706 --identity-file /home/hewn/mosschat/crates/mosschat-net/tests/harness/.run/house-a.seed --json ==
+== output directory: /home/hewn/mosschat/docs/measurements/2026-09-08-faults ==
+
+-- row: loss-1pct --
+   condition: Packet loss 1%
+   pass criterion: Connects; log shows no failed step
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/loss-1pct.txt
+
+-- row: loss-5pct --
+   condition: Packet loss 5%
+   pass criterion: Connects, degraded RTT; log records timings, no false failure
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/loss-5pct.txt
+
+-- row: loss-20pct --
+   condition: Packet loss 20%
+   pass criterion: Connects direct or relays inside the deadline; log names the fallback step
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/loss-20pct.txt
+
+-- row: delay-50ms --
+   condition: Delay 50ms plus jitter
+   pass criterion: Median RTT under 500ms (acceptance criterion 1)
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/delay-50ms.txt
+
+-- row: delay-200ms --
+   condition: Delay 200ms plus jitter
+   pass criterion: Criterion 1 boundary; a miss is explained in the log
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/delay-200ms.txt
+
+-- row: delay-1000ms --
+   condition: Delay 1000ms plus jitter
+   pass criterion: Visit still opens; doorbell and notes still succeed, only slower
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/delay-1000ms.txt
+
+-- row: reorder --
+   condition: Reorder
+   pass criterion: No duplicate or out-of-order events; host ordering unaffected
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/reorder.txt
+
+-- row: duplicate --
+   condition: Duplicate
+   pass criterion: QUIC dedups; no duplicate message in the recording
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/duplicate.txt
+
+-- row: bandwidth-256kbit --
+   condition: Bandwidth cap 256kbit
+   pass criterion: File transfer resumes by missing pieces, completes; no false timeout (full pass criterion is WO-4.3's; this row only applies the condition)
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/bandwidth-256kbit.txt
+
+-- row: blackout-60s --
+   condition: Total blackout, both directions, 60s, applied 5s after the command starts
+   pass criterion: Recovers inside WO-1.6 case (e); a queued note delivers within 60s per WO-3.3; log records the drop and recovery
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/blackout-60s.txt
+
+-- row: asymmetric-loss --
+   condition: Asymmetric loss, 10 percent A to B and 2 percent B to A
+   pass criterion: Fallback does not assume symmetric loss; log shows each side's own view
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/asymmetric-loss.txt
+
+-- row: gatehouse-killed --
+   condition: Gatehouse killed mid-visit, by its recorded pid, 5s after the command starts
+   pass criterion: Direct connections continue; gate-dependent ones fail closed with a log record, never a silent hang
+   output: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/gatehouse-killed.txt
+
+== fault-matrix.sh: summary ==
+row                  exit       file
+loss-1pct            0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/loss-1pct.txt
+loss-5pct            0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/loss-5pct.txt
+loss-20pct           0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/loss-20pct.txt
+delay-50ms           0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/delay-50ms.txt
+delay-200ms          0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/delay-200ms.txt
+delay-1000ms         0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/delay-1000ms.txt
+reorder              0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/reorder.txt
+duplicate            0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/duplicate.txt
+bandwidth-256kbit    0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/bandwidth-256kbit.txt
+blackout-60s         0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/blackout-60s.txt
+asymmetric-loss      0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/asymmetric-loss.txt
+gatehouse-killed     0          /home/hewn/mosschat/docs/measurements/2026-09-08-faults/gatehouse-killed.txt
+matrix exit: 0
+
+== gatehouse log after the matrix
+mosschat gatehouse: community=f733993a7ed3f79b9aeceb87bf726323c9879a0f61b1415c882b81bc4467b706
+mosschat gatehouse: primary=203.0.113.1:443 secondary=203.0.113.1:444
+
+== done. Results: /home/hewn/mosschat/docs/measurements/2026-09-08-faults/  Now run:  sudo bash /home/hewn/mosschat/run-harness.sh down
+/home/hewn/mosschat/run-harness.sh: line 52: /proc/44186/cmdline: No such file or directory
+
+#### 2026-09-08T16:24:15Z run-harness.sh down
+== teardown.sh: dry_run=0 ==
+teardown.sh: deleted namespace house-a
+teardown.sh: deleted namespace nat-a
+teardown.sh: deleted namespace house-b
+teardown.sh: deleted namespace nat-b
+teardown.sh: deleted namespace internet
+teardown.sh: removed /home/hewn/mosschat/crates/mosschat-net/tests/harness/.run (pidfiles, members file)
+== teardown.sh: done ==
+Every veth, the bridge and every qdisc fault-matrix.sh applied all
+live inside the five namespaces just deleted, so there is nothing
+left on the host to clear by hand. To verify that yourself:
+
+  ip netns list | grep -E '^(house-a|nat-a|house-b|nat-b|internet)( |$)' && echo STILL PRESENT || echo clean
+
+If fault-matrix.sh was interrupted mid-row before this ran, its own
+trap already reset the qdisc it had applied and killed the row's
+process by pid before exiting; nothing from it should be left either.
