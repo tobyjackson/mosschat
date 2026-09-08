@@ -713,6 +713,21 @@ impl PorchSocket {
         self.paths.lock_or_recover().get(peer).cloned()
     }
 
+    /// The path entry behind a synthetic address, if one is registered.
+    ///
+    /// The one question a house answering an incoming peer dial can ask
+    /// before the handshake proves who it is: quinn reports the dial as
+    /// coming from the synthetic address this socket rewrote it to
+    /// (section 3), and that address is what names the peer's path table
+    /// entry and so its congestion epoch.
+    #[must_use]
+    pub fn path_by_synthetic(&self, synthetic: &SocketAddr) -> Option<PathEntry> {
+        self.paths
+            .lock_or_recover()
+            .get_by_synthetic(synthetic)
+            .cloned()
+    }
+
     /// Sends one already-encoded probe straight to `to` on the real socket,
     /// bypassing the relay and the path table both.
     ///

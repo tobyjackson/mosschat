@@ -24,6 +24,9 @@ use mosschat_net::diag::{DiagRecord, Step};
 
 const COMMUNITY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const IDENTITY: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+/// A friend's public key, for the runs that need `--friend` to be present
+/// rather than to be reachable.
+const FRIEND: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
 /// A unique temporary state directory, removed first so one run never sees
 /// another's records.
@@ -70,6 +73,79 @@ fn records_written(dir: &Path) -> Vec<DiagRecord> {
         }
     }
     out
+}
+
+/// Yseult's Low 1: `--hold` is bounded at the command line, before any
+/// network work, rather than panicking after the visit is open.
+///
+/// `--hold 18446744073709551615` used to register at the gate, knock,
+/// wake the friend's house, open the visit and *then* panic on
+/// `Duration` overflow, leaving a seated registration and an abandoned
+/// visit. A value large enough to overflow an `Instant` instead meant
+/// "hold forever" with nothing said.
+///
+/// The gate here is one that does not resolve, so a run that got past the
+/// bound would still not touch the network; what this asserts is that it
+/// never gets that far, which is the empty diagnostics directory.
+///
+/// Deliberate break to fail this test: drop the `MAX_HOLD_S` check from
+/// `DoctorArgs::parse`. The run then reaches the dial, writes a record
+/// naming `gate_dial`, and the "no record" assertion fails.
+#[test]
+fn a_hold_past_its_maximum_is_refused_before_any_network_work() {
+    let dir = state_dir("hold-too-long");
+    for too_long in ["18446744073709551615", "86401"] {
+        let out = doctor(
+            &dir,
+            &[
+                "--gate",
+                "gate.invalid.example.:443",
+                "--community",
+                COMMUNITY,
+                "--identity",
+                IDENTITY,
+                "--friend",
+                FRIEND,
+                "--hold",
+                too_long,
+            ],
+        );
+        assert!(!out.status.success(), "{too_long} must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--hold takes at most 86400 seconds"),
+            "the refusal says the bound in plain words: {stderr:?}"
+        );
+        assert!(
+            !diagnostics_dir(&dir).exists(),
+            "a refused argument does no work, so it writes no record either"
+        );
+    }
+
+    // And the bound itself is accepted as an argument: this run fails at
+    // the dial, which is proof it got past parsing.
+    let out = doctor(
+        &dir,
+        &[
+            "--gate",
+            "gate.invalid.example.:443",
+            "--community",
+            COMMUNITY,
+            "--identity",
+            IDENTITY,
+            "--friend",
+            FRIEND,
+            "--hold",
+            "86400",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("failed at step gate_dial"),
+        "the maximum is a value, not an error: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// A gate whose name does not resolve at all: the fast half of "against an
