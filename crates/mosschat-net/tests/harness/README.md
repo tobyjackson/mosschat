@@ -5,23 +5,24 @@ a Linux kernel. They will not run on macOS. They were written and dry-run
 checked on a Mac with no root; they have not been run for real by anyone
 yet. Run them on hewn-mini or hewn-pc.
 
-This harness drives two things that exist in the merged code today:
+This harness drives four things that exist in the merged code today:
 
 - the `mosschat gatehouse` subcommand (`crates/mosschat/src/main.rs`)
+- `mosschat house --headless`, the callee: it registers at a gate, answers
+  knocks from a friend list and holds a visit open, printing one JSON line
+  per event (WO-1.5a)
+- `mosschat doctor --friend <key> --hold <seconds> --json`, the caller and
+  the row command: it runs the doorbell for real and prints the record,
+  which is where every number below comes from (WO-1.4b, WO-1.5a)
 - the `spike` example (`cargo run -p mosschat-net --example spike`), which
-  opens one key-authenticated QUIC connection between two processes
+  opens one key-authenticated QUIC connection between two processes, still
+  useful for a plain direct-path sanity check with no gate in it
 
-There is no doorbell you can drive from outside a test yet. `punch.rs`,
-`live.rs` and `discovery.rs` exist in `mosschat-net`'s library, but
-`main.rs` wires up only the `gatehouse` subcommand; there is no CLI
-command that runs an ICE-style doorbell (gather, relay-first, probe,
-upgrade) between two standalone processes. WO-1.4's `doctor` subcommand
-will add one; when it lands, point `fault-matrix.sh --` at it instead of
-the spike example for a real end-to-end connect-and-report path. Until
-then, the commands below use the spike example for a real connection
-between the two houses, and the `gatehouse` subcommand as a process this
-harness can start, register nothing with yet, and kill by pid for the
-`gatehouse-killed` row.
+The doorbell is drivable from the command line: see "The long-lived row
+command" below, which is what the `blackout-60s` and `gatehouse-killed`
+rows need and what every other row should use in preference to a
+`spike dial`, since only `doctor` reports a path, a reason and a round
+trip.
 
 ## Prerequisites
 
@@ -280,12 +281,189 @@ the relay path specifically means watching the gatehouse's own stdout
 counts while a connection is attempted through it, per its design doc
 section 1, rather than a single command that reports success or failure).
 
+## The long-lived row command
+
+Every row above dials, measures and exits inside a second or two, which is
+enough for a netem loss or delay row and useless for the two rows that need
+a connection to still be there a minute later: `blackout-60s` and
+`gatehouse-killed`. WO-1.5a added the two halves those rows need, a callee
+that stays running and a caller that holds a visit open, so from here the
+row command is one `doctor` run rather than a `spike dial`.
+
+**Seeds go in files here, not in variables.** `house` and `doctor` both
+take `--identity-file`, a path holding 64 hex characters, rather than the
+`--identity <hex>` the spike sections above use, because a seed on a
+command line is readable by any local user through `ps`. Write one per
+identity before starting anything: house-b's, and one per matrix row (see
+"One identity cannot run every row" below). `.run/` is gitignored, and
+these files are this run's private keys, so give them 0600 and delete them
+with the rest of `.run/` at teardown.
+
+Each identity is made once and used twice: the seed goes in a file for
+`house`/`doctor`, and its public key goes in the gate's `members.txt` and,
+for a row, in house-b's `friends.txt`. The public key comes from the
+binaries rather than being typed: `spike listen` prints
+`spike: identity <64 hex>` as soon as it has bound, before it waits for
+anything, which is the same trick the spike section above uses. The helper
+below runs it outside the namespaces (no root, no `ip netns`), reads that
+one line and lets `timeout` end it.
+
+```
+RUN=crates/mosschat-net/tests/harness/.run
+mkdir -p "$RUN"
+umask 077
+
+# $1 = a name. Writes $RUN/$1.seed (0600) and prints that identity's
+# public key. The seed is on spike's command line, and so is briefly
+# visible in `ps`, exactly as the spike section above already does it;
+# these are throwaway harness identities, and the file is what `house`
+# and `doctor` read precisely so their seeds are never in argv.
+new_identity() {
+  seed=$(openssl rand -hex 32)
+  printf '%s\n' "$seed" > "$RUN/$1.seed"
+  timeout 2 "$SPIKE_BIN" listen --identity "$seed" --bind 127.0.0.1:0 \
+    | sed -n 's/^spike: identity //p' | head -1
+}
+
+HOUSE_B_PUB=$(new_identity house-b)
+
+# One identity per row. Take the row ids from
+# `fault-matrix.sh --help` and list them here; there is no parsing of
+# that output, on purpose, so a change to it cannot silently produce
+# fewer identities than rows.
+ROWS="loss-1pct loss-5pct loss-20pct delay-50ms delay-200ms delay-1000ms reorder duplicate bandwidth-256kbit blackout-60s asymmetric-loss gatehouse-killed"
+
+: > "$RUN/friends.txt"
+for row in $ROWS; do
+  new_identity "row-$row" >> "$RUN/friends.txt"
+done
+
+# The gate seats house-b and every row; house-b answers every row.
+cp "$RUN/friends.txt" "$RUN/members.txt"
+printf '%s\n' "$HOUSE_B_PUB" >> "$RUN/members.txt"
+
+wc -l "$RUN/friends.txt" "$RUN/members.txt"
+awk 'length != 64 { print FILENAME": bad line "NR": "$0; bad=1 } END { exit bad }' \
+  "$RUN/friends.txt" "$RUN/members.txt" && echo "both files are 64 hex per line"
+```
+
+Check `$ROWS` against `fault-matrix.sh --help` before running it: a row
+with no identity of its own falls back to sharing one, which is the thing
+"One identity cannot run every row" below exists to stop.
+`MemberList::load` reads both files and refuses any non-blank, non-`#`
+line that is not exactly 64 hex characters
+(`crates/mosschat-net/src/gate/mod.rs`), so a blank line or a stray
+placeholder stops the gate or the house at start rather than halfway
+through the matrix, which is what the `awk` check above catches first.
+
+**house-b runs the callee**, after those two files exist and after the
+gatehouse is up with this `members.txt` (the gate reads it once, at
+start, and on `SIGHUP`, so every key goes in before it starts or the
+reload does):
+
+```
+sudo sh -c "echo \$\$ > crates/mosschat-net/tests/harness/.run/house-b.pid; exec ip netns exec house-b $MOSSCHAT_BIN house --headless --gate 203.0.113.1:443 --community $COMMUNITY --identity-file crates/mosschat-net/tests/harness/.run/house-b.seed --friends crates/mosschat-net/tests/harness/.run/friends.txt" | tee /tmp/house-b.jsonl
+```
+
+It prints one line on stderr before anything else saying what its output
+contains (addresses, its friends' fingerprints, its own public key), and
+then one JSON object per line on stdout.
+
+Same pidfile rule as the gatehouse and the same reason (issue #50): the pid
+is written from inside the process that becomes the house, by its own `$$`,
+right before `exec`, so it is never sudo's or a wrapper's. Leave that
+terminal running; `tee` keeps its stdout, which is one JSON object per line
+and the callee's own account of every visit, beside the caller's record.
+Its first line names this house's public key, which is what `--friend`
+below takes and what the `HOUSE_B_PUB` line above reads:
+
+```
+{"detail":"house <64 hex>, gate 203.0.113.1:443, observed 10.2.0.2:51820, secondary port 444","event":"registered","peer":null,"ts_ms":1757362800123}
+```
+
+**house-a runs the row**, one seed file per row:
+
+```
+sudo bash crates/mosschat-net/tests/harness/fault-matrix.sh -- \
+  ip netns exec house-a $MOSSCHAT_BIN doctor \
+    --gate 203.0.113.1:443 --community $COMMUNITY \
+    --identity-file $RUN/row-blackout-60s.seed \
+    --friend $HOUSE_B_PUB --hold 90 --json
+```
+
+**Case (e), hole punching forced off**, is the one row that changes both
+commands: add `--no-punch` to the `doctor` line above. The flag rides the
+candidate exchange, so house-b is told and neither side probes; adding it
+to the house as well makes the row's intent obvious in both accounts and
+is what the tests cover. Both records then say `punch_disabled`, which is
+the result that row is looking for, and neither says a failure.
+
+`--hold 90` is what makes the row a measurement rather than a connect:
+after the visit goes live it stays open for 90 seconds, sending section 4's
+keepalives, sampling the round trip once a second, and recording every path
+event with its timestamp. 90 rather than 60 because the two rows this is
+for apply a 60 second fault five seconds in, and a hold that ends with the
+fault would measure the fault's start and nothing after it. It is also
+above the gate's own 90 second registration expiry by design: nothing sent
+frame 9 before WO-1.5a, and a hold that outlives a registration is exactly
+how that was found.
+
+Exit codes read differently for a held run, and `fault-matrix.sh` records
+them. 0 means the visit went live and every step that *builds* it
+succeeded: the gate dial, the registration, the introduction, the relay
+session, the peer handshake and the candidate exchange. Non-zero means one
+of those failed, or the visit never went live, or it was cut short, and
+the message names the step. A row that stayed on the relay for its whole
+hold, or upgraded and then lost the path, is a **green** row with a record
+that says so: a relayed path is a result WO-1.5 asks for by name, and a
+lost path is what `--hold` is for. `--json` puts the whole record on
+stdout, which is the row's raw file.
+
+`--hold` takes at most 86400 seconds. A measurement wanting longer wants a
+house on both ends rather than a doctor.
+
+**What each row reads out of that record.** All of it is in one JSON object
+(`docs/dev/gatehouse-design.md` section 7, plus its amendment 4):
+
+- `path` and `path_addr`: relay or direct, and where the traffic went.
+- `rtt_median_us`, `rtt_p95_us`, `rtt_samples`, `rtt_source`: the round trip
+  over the hold. `probe` samples are this design's own probe pongs on a
+  direct path; `quic` samples are the end to end connection's estimate,
+  which is what a relayed visit has; `mixed` means the path changed and the
+  events say when.
+- `events`: `visit_open`, `upgraded`, `path_stale`, `fell_back`,
+  `path_dead`, `recovered`, `goodbye`, each with milliseconds since the
+  attempt started. `path_stale` is the detection, `fell_back` is the move
+  back to the relay, and the gap between them is what the Phase 1 criterion
+  bounds at 1 s on the side that moved. The human report (drop `--json`)
+  prints those two gaps on one `path change:` line.
+- `steps` and `failed_step`: how the visit connected, unchanged.
+- `gate_carried_traffic`, `gate_bytes` and the three shaper counters:
+  whether the relay carried this visit and how much.
+
+The house's own stdout carries the same events in the same words from the
+other end, so a row that says the caller fell back can be checked against
+whether the callee saw the same thing at the same moment.
+
+**Two things this cannot measure yet, stated plainly.** A blackout longer
+than 30 seconds kills the connections it is measuring: `max_idle_timeout`
+is 30 s on the peer connection (section 4, deliberately) and quinn's
+default on the gate connection, so a 60 second blackout ends both, and
+nothing redials a gate whose connection is gone. The `blackout-60s` row
+therefore measures what dying looks like and what the record says about it,
+not a visit that survived; expect the record to end at the fault rather
+than after it, and read `events` for when it noticed. And a visit whose
+path flaps more than about three times in one hold runs out of the gate's
+own budget of 4 `StartRequest`s per session, after which it stays relayed
+and the record's `start_signal` step says so.
+
 ## Running the fault matrix
 
-`fault-matrix.sh` needs a command to run per row, after `--`. With no
-`doctor` command yet, the most useful thing to point it at today is a
-`spike dial` from house-a to a listener already running in house-b, so
-each row measures how that connection behaves under the row's condition:
+`fault-matrix.sh` needs a command to run per row, after `--`. The command
+to use is the `doctor --hold` row above; what follows is the older
+`spike dial` form, kept because it needs no house and no friend list and
+so is the quickest way to check that a namespace pair passes traffic at
+all under a row's condition:
 
 ```
 sudo bash crates/mosschat-net/tests/harness/fault-matrix.sh -- \
@@ -485,14 +663,15 @@ either; `teardown.sh` deleting the namespaces afterward covers the rest.
 
 ## Known gaps, stated plainly
 
-- No CLI path drives the doorbell yet, so `punch.rs`'s symmetric-NAT
-  fallback and PLAN WO-1.6's "endpoint-dependent case forces the relay
-  path inside WO-1.3's stated deadline" verification line cannot be
-  proved end to end by this harness alone until WO-1.4's `doctor` lands.
-  What this harness can prove today: the two NAT modes are genuinely
-  different (conntrack evidence above, from a fixed source port), and
-  that a direct QUIC connection and a gatehouse both function under each
-  netem condition.
+- The doorbell is drivable from the command line now (`doctor --hold`
+  against a `house --headless`), so `punch.rs`'s symmetric-NAT fallback
+  and PLAN WO-1.6's "endpoint-dependent case forces the relay path inside
+  WO-1.3's stated deadline" verification line can be proved by this
+  harness. What it still cannot prove is a visit surviving a fault longer
+  than 30 seconds: both connections carry a 30 s idle timeout and nothing
+  redials a gate whose connection is gone, so the `blackout-60s` row
+  measures what dying looks like rather than a survived outage. Stated in
+  full under "The long-lived row command".
 - The `edm` mode's nftables rule (`snat ... random`) does not pick a
   literal fresh random port on every new conntrack entry; corrected in
   netns-nat.sh's own comment after PR 48 review (Konrad): the kernel

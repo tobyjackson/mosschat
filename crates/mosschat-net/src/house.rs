@@ -140,6 +140,16 @@ impl HouseEvent {
     }
 }
 
+/// The line a house prints before anything else, on stderr, so nobody
+/// keeps this output without knowing what is in it.
+///
+/// Section 7's own reason for `doctor`'s notice, applied to the role whose
+/// stdout an operator is told to keep: a house's lines carry addresses,
+/// and the first of them carries this house's own public key in full,
+/// which section 7 permits a role to print about itself.
+pub const PRIVACY_NOTICE: &str = "This house's output contains IP addresses, your friends' \
+                                  fingerprints, and this house's own public key.";
+
 /// Where a house's events go. The binary prints them; a test collects
 /// them.
 pub type HouseEventSink = Arc<dyn Fn(HouseEvent) + Send + Sync>;
@@ -216,7 +226,14 @@ pub async fn run(
         VisitEventKind::Registered,
         None,
         format!(
-            "gate {gate}, observed {observed}, secondary port {secondary}",
+            "house {house}, gate {gate}, observed {observed}, secondary port {secondary}",
+            // This house's own public key, in full, because a friend
+            // needs it to knock and nothing else prints it. Section 7's
+            // redaction is about naming *peers* in a log that gets pasted
+            // into an issue; a house's own public key is the thing it
+            // hands out, the gatehouse prints its community id for the
+            // same reason, and this line is stdout only, never a record.
+            house = hex32(&client.public_key()),
             gate = config.gate,
             observed = client.registered_observed(),
             secondary = client.registered_secondary_port(),
@@ -513,6 +530,11 @@ impl Visit {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+}
+
+/// 32 bytes as lowercase hex.
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Hands one house-level event to the sink with the clock read at the

@@ -461,7 +461,10 @@ kept, mode 0600 on Unix.
 **Redaction.** Never written: private key material, the ticket secret, any invite secret, any probe key, any relay
 payload byte, any message content. A public key becomes the first 8 hex characters of `BLAKE3(install_salt || key)`,
 `install_salt` being 16 random bytes generated once and stored beside the log, so a peer is named consistently within
-one install and correlatable neither across users nor back to a key. IP addresses are kept, because they are the thing
+one install and correlatable neither across users nor back to a key. **One exception, and only about itself**
+(amendment 4): a role may print its own public key on its own standard output when it starts, because that key is the
+thing it hands out and nothing else prints it, and a role that does so prints the same "what this contains" line
+`doctor` prints. It stays out of every record, where the rule above is unqualified. IP addresses are kept, because they are the thing
 being diagnosed, and the doctor command says so on its first line so nobody sends a file blind.
 
 **`mosschat doctor`** takes `--friend <name>` or `--gate`, runs the steps for real, and prints a first line saying the
@@ -595,6 +598,10 @@ against the bullet above it that was wrong or thin.
 - **`Hold::For` is clamped at a day**, and `doctor` refuses a longer `--hold` at the command line before any network work. An
   unbounded value overflowed the deadline arithmetic and panicked after the visit was already open, in a crate that forbids
   panics, or degraded into "hold forever" through a `checked_add` that quietly returned `None`.
+- **A role may print its own public key when it starts**, which section 7's redaction paragraph now says in as many
+  words. A house's first line names its own key in full, because a friend needs it to knock and nothing else prints it,
+  and the argument for that was in a code comment where the rule it bends is in this document. The house prints the same
+  notice `doctor` does, on stderr, since the harness tells an operator to keep its stdout.
 - **Text from off the machine is capped and stripped before it reaches a house's stdout**, the same two rules the gate's own
   text already gets: a peer's QUIC close reason is bytes it chose, and it reached an operator's log through a visit that
   ended before it opened. The `goodbye` event is also stamped when the frame is sent rather than after its acknowledgement,
