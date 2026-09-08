@@ -821,6 +821,16 @@ impl PorchSocket {
     /// drain task starts with whichever arrives second. A probe queued
     /// before a gate attaches therefore leaves when one does, and the only
     /// caller is a visit already carrying its traffic through that gate.
+    ///
+    /// `try_enqueue_all` and not `enqueue_or_drop` (Yseult's Medium 1 on
+    /// PR 89): dropping the newest and counting it is the *gate's* policy
+    /// and only the gate's, because it forwards unreliable datagrams and
+    /// has nothing to push back on. Section 1 says of a house's own egress
+    /// queue that it never drops, and a probe silently dropped here would
+    /// be charged to the peer as a missed answer, which is a false
+    /// `path_stale` on a path carrying data at full rate. Refusing the
+    /// whole thing counts `relay_socket_backpressure` and hands the caller
+    /// a `WouldBlock` it is required to act on.
     fn send_probe_relayed(
         &self,
         session: u32,
@@ -833,10 +843,8 @@ impl PorchSocket {
                 "no path table entry for a registered relay session",
             ));
         };
-        match shaper.enqueue_or_drop(payload) {
+        match shaper.try_enqueue_all(vec![payload]) {
             Enqueued::Accepted => Ok(()),
-            // A probe is cheap and repeated, so a full queue drops this one
-            // rather than blocking: the caller documents exactly that.
             Enqueued::Full => Err(io::Error::from(io::ErrorKind::WouldBlock)),
             Enqueued::Closed => Err(io::Error::other("relay session closed")),
         }

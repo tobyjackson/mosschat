@@ -704,6 +704,100 @@ mod house {
         fixture.stop().await;
     }
 
+    /// Yseult's Medium 2 on PR 89: a relay that comes back after being
+    /// declared dead is seen coming back, and the visit's reason stops
+    /// naming an outage it survived.
+    ///
+    /// Dead is absorbing in `PeerLiveness`, which is right for a direct
+    /// path, because a dead one is dropped and a rerun builds a fresh one.
+    /// The relay is not dropped and there is no rerun, so if probing
+    /// stopped at dead a visit would have no liveness at all for the rest
+    /// of its life over any outage between the 9 seconds it takes to
+    /// declare dead and the 30 seconds quinn takes to close the
+    /// connection, and its record would say `path_idle_timeout` whatever
+    /// actually ended it.
+    ///
+    /// Deliberate break to fail this test: make `RelayWatch::due_probe`
+    /// return `self.liveness.due_probe(now)` unconditionally, so probing
+    /// stops at dead. Nothing is ever answered again, no `recovered`
+    /// arrives, and the reason assertion reads `path_idle_timeout` on a
+    /// visit that spent its last 8 seconds on a working relay.
+    #[tokio::test]
+    async fn a_relay_that_comes_back_after_dead_is_recovered_and_the_reason_says_so() {
+        let (fixture, caller_seed) = Fixture::start("relayback", true).await;
+        let (caller, connection, session) = fixture.call(caller_seed).await;
+
+        let caller_diagnostics = diag_dir("relayback-caller");
+        let caller_events = Collected::default();
+        let sink = {
+            let collected = Arc::clone(&caller_events.0);
+            VisitEventSink::new(move |kind, detail| {
+                collected.lock().unwrap().push(HouseEvent {
+                    at_ms: 0,
+                    kind,
+                    peer: None,
+                    detail: detail.to_string(),
+                });
+            })
+        };
+        let control = DoorbellControl::new();
+        let held = Held {
+            caller: &caller,
+            connection: &connection,
+            session,
+            peer_key: fixture.house_key,
+            hold: Hold::For(Duration::from_secs(18)),
+            no_punch: true,
+            control: &control,
+            diagnostics: &caller_diagnostics,
+            events: Some(sink),
+            candidates: None,
+            vouch_peer: true,
+        }
+        .spawn();
+
+        caller_events
+            .wait_for(VisitEventKind::VisitOpen, Duration::from_secs(10))
+            .await
+            .expect("the visit must open on the relay");
+
+        // Out, then back inside quinn's own 30 s idle timeout, so the
+        // connection under the visit survives the outage that the liveness
+        // above it declares dead.
+        let gate_addr = caller.gate_connection().remote_address();
+        caller.porch().detach_gate(gate_addr);
+        caller_events
+            .wait_for(VisitEventKind::PathDead, Duration::from_secs(20))
+            .await
+            .expect("the caller must declare the relay dead first");
+        caller.porch().attach_gate(caller.gate_connection().clone());
+
+        let recovered = caller_events
+            .wait_for(VisitEventKind::Recovered, Duration::from_secs(15))
+            .await
+            .expect("a relay that answers again must be seen answering again");
+        assert!(
+            recovered.detail.contains("relay"),
+            "the event names the path that came back: {}",
+            recovered.detail
+        );
+
+        let record = tokio::time::timeout(Duration::from_secs(40), held)
+            .await
+            .expect("the caller's hold must end")
+            .unwrap();
+        assert_eq!(
+            record.reason,
+            Reason::PunchDisabled,
+            "a visit that outlived its outage is not reported by it: {:?}",
+            record.steps
+        );
+
+        connection.close(0u32.into(), b"test over");
+        let _ = std::fs::remove_dir_all(&caller_diagnostics);
+        fixture.stop().await;
+    }
+
     /// Yseult's High on PR 89: a house holding two relayed visits at once
     /// keeps both of them, and neither doorbell eats the other's pongs.
     ///

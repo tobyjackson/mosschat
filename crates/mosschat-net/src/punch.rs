@@ -1696,6 +1696,12 @@ struct RelayWatch {
     /// it answers rather than to whatever arrived.
     outstanding: Option<[u8; 8]>,
     sent_at: Option<Instant>,
+    /// When this watch's liveness reached dead, after which
+    /// [`crate::live::PeerLiveness::due_probe`] answers `false` for good
+    /// and this schedule takes over.
+    dead_since: Option<Instant>,
+    /// The last probe sent under that schedule.
+    last_dead_probe: Option<Instant>,
 }
 
 impl RelayWatch {
@@ -1709,7 +1715,49 @@ impl RelayWatch {
             liveness,
             outstanding: None,
             sent_at: None,
+            dead_since: None,
+            last_dead_probe: None,
         }
+    }
+
+    /// Whether a probe is due at `now`, under either schedule: section 4's
+    /// own while the path is live or stale, and
+    /// [`crate::live::DEAD_PROBE_INTERVAL`] after it is dead.
+    ///
+    /// **Probing does not stop at dead on the relay** (Yseult's Medium 2 on
+    /// PR 89). Dead is absorbing in `PeerLiveness`, and for a direct path
+    /// that is right, because a dead path is dropped and a rerun builds a
+    /// fresh one. The relay is not dropped and there is no rerun, so
+    /// stopping there would leave a visit with no liveness for the rest of
+    /// its life, which `Hold::For` allows to be a day, over an outage
+    /// anywhere between the 9 seconds this takes to declare dead and the
+    /// 30 seconds quinn takes to close the connection. One probe a second
+    /// is what section 4 already spends through the stale grace, and it is
+    /// what lets a relay that comes back be seen coming back.
+    fn due_probe(&mut self, now: Instant) -> bool {
+        if self.dead_since.is_none() {
+            return self.liveness.due_probe(now);
+        }
+        if self
+            .last_dead_probe
+            .is_some_and(|last| now.duration_since(last) < crate::live::DEAD_PROBE_INTERVAL)
+        {
+            return false;
+        }
+        self.last_dead_probe = Some(now);
+        true
+    }
+
+    /// Undoes a [`RelayWatch::due_probe`] whose probe never left, so this
+    /// house's own full egress queue is not charged to the peer.
+    fn probe_not_sent(&mut self, sent_at: Instant) {
+        if self.dead_since.is_none() {
+            self.liveness.probe_not_sent(sent_at);
+        } else {
+            self.last_dead_probe = None;
+        }
+        self.outstanding = None;
+        self.sent_at = None;
     }
 }
 
@@ -2354,7 +2402,7 @@ pub async fn run_doorbell(
                     // it as a `Relay` payload and the gate forwards it
                     // opaquely; the peer answers it in whatever phase it is
                     // in, because a ping is always answered.
-                    if watch.liveness.due_probe(now) {
+                    if watch.due_probe(now) {
                         let mut tx = [0u8; 8];
                         rand::rng().fill(&mut tx);
                         let ping = Probe {
@@ -2363,9 +2411,17 @@ pub async fn run_doorbell(
                             tx,
                             observed: Addr::default(),
                         };
-                        let _ = porch.send_probe(watch.addr, &ping.encode(&key));
                         watch.outstanding = Some(tx);
                         watch.sent_at = Some(now);
+                        // A probe this house's own full egress queue
+                        // refused never reached the network, so the peer
+                        // must not wear it as a missed answer (Yseult's
+                        // Medium 1). The refusal is already counted, as
+                        // `relay_socket_backpressure` on this peer's
+                        // shaper.
+                        if porch.send_probe(watch.addr, &ping.encode(&key)).is_err() {
+                            watch.probe_not_sent(now);
+                        }
                     }
                     match watch.liveness.poll(now) {
                         Some(crate::live::LivenessChange::WentStale) => {
@@ -2382,9 +2438,14 @@ pub async fn run_doorbell(
                         }
                         Some(crate::live::LivenessChange::WentDead) => {
                             // Reported once per watch: `PeerLiveness::poll`
-                            // returns each transition exactly once and a
-                            // dead path is never probed again.
+                            // returns each transition exactly once.
+                            // `relay_dead` says the relay is dead *now*
+                            // rather than that it was once dead, so a visit
+                            // that recovers is not reported by the outage
+                            // it survived (Yseult's Medium 2).
                             relay_dead = true;
+                            watch.dead_since = Some(now);
+                            watch.outstanding = None;
                             emit(
                                 rec,
                                 sink,
@@ -2396,9 +2457,9 @@ pub async fn run_doorbell(
                             );
                             // A one-shot run has nothing left to wait for:
                             // the path it was on is gone and there is no
-                            // other. A held visit stays, because its
-                            // connection may still close with something
-                            // more to say and the record is written once.
+                            // other. A held visit stays, because the relay
+                            // may come back inside the connection's own
+                            // idle timeout and the record is written once.
                             if !held {
                                 record_relay_counters(rec, path.as_ref());
                                 settle(rec, Reason::PathIdleTimeout);
@@ -2469,19 +2530,48 @@ pub async fn run_doorbell(
                             // the path being watched, which for a relayed
                             // visit is the peer's synthetic address.
                             if from == watch.addr && watch.outstanding == Some(probe.tx) {
-                                if let Some(sent) = watch.sent_at {
-                                    // Fed to the liveness only, never to
-                                    // `rtt`: section 7's `rtt_source` says
-                                    // `probe` for a direct path measured by
-                                    // its own probes and `quic` for a
-                                    // relayed visit, and quietly changing
-                                    // what a shipped measurement means is
-                                    // not this fix's to do.
-                                    watch
-                                        .liveness
-                                        .on_pong(arrived, arrived.duration_since(sent));
+                                if watch.dead_since.is_some() {
+                                    // The relay answered again, which is
+                                    // unambiguous: the source is this
+                                    // peer's synthetic address and the tx
+                                    // id is one this house drew. A fresh
+                                    // watch, because dead is absorbing, and
+                                    // the reason stops naming an outage the
+                                    // visit survived (Yseult's Medium 2).
+                                    relay_dead = false;
+                                    *watch = RelayWatch::new(
+                                        watch.addr,
+                                        params.recorder.clone(),
+                                        arrived,
+                                    );
+                                    diag::record(
+                                        rec,
+                                        Step::RelayFallback,
+                                        StepOutcome::Ok,
+                                        "the relay answered again after going dead",
+                                    );
+                                    emit(
+                                        rec,
+                                        sink,
+                                        diag::VisitEventKind::Recovered,
+                                        format!("the relay through {gate_addr} is answering again"),
+                                    );
+                                } else {
+                                    if let Some(sent) = watch.sent_at {
+                                        // Fed to the liveness only, never
+                                        // to `rtt`: section 7's
+                                        // `rtt_source` says `probe` for a
+                                        // direct path measured by its own
+                                        // probes and `quic` for a relayed
+                                        // visit, and quietly changing what
+                                        // a shipped measurement means is
+                                        // not this fix's to do.
+                                        watch
+                                            .liveness
+                                            .on_pong(arrived, arrived.duration_since(sent));
+                                    }
+                                    watch.outstanding = None;
                                 }
-                                watch.outstanding = None;
                             }
                         }
                     },
@@ -2590,6 +2680,17 @@ pub async fn run_doorbell(
                         // from row to row. The goodbye is still in the
                         // record twice over, as a `closed` step and as an
                         // event.
+                        //
+                        // `relay_dead` is deliberately not consulted here
+                        // (Yseult's Medium 2 on PR 89, which asked that the
+                        // two exits from one visit agree). A goodbye that
+                        // arrived is proof the path it arrived on works,
+                        // and the flag now says the relay is dead *now*
+                        // rather than that it was once dead, so it cannot
+                        // outlive an outage the visit survived. The two
+                        // exits therefore describe the same relay: this one
+                        // names the peer that hung up, and the others name
+                        // a path that was still dead when the visit ended.
                         let reason = if give_up_reason == Some(Reason::PunchDisabled) {
                             Reason::PunchDisabled
                         } else {
