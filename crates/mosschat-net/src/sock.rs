@@ -29,7 +29,7 @@
 //! every one of those as a hard I/O error for the relayed transmit rather
 //! than `WouldBlock`, since none of them resolve by waiting.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io::{self, IoSliceMut};
@@ -63,6 +63,25 @@ pub fn synthetic_addr(process_salt: [u8; 5], peer_key: &[u8; 32]) -> SocketAddr 
     SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), 1)
 }
 
+/// Normalises an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its plain
+/// IPv4 form, leaving every other address alone.
+///
+/// A dual-stack socket reports an IPv4 peer's source address in the mapped
+/// form, while every address this crate holds from elsewhere (the gate
+/// address dialled, a candidate from frame 16, a reflection from frame 2)
+/// is plain IPv4. Both forms name one host and port, so both must compare
+/// equal wherever a source address is matched against a known one.
+#[must_use]
+fn unmap_v4(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
+            None => addr,
+        },
+        IpAddr::V4(_) => addr,
+    }
+}
+
 struct RelayRoutes {
     /// The gate control connection whose `Relay` datagrams carry this
     /// socket's peer traffic. WO-1.3a supports exactly one gate at a time.
@@ -84,6 +103,13 @@ pub struct PorchSocket {
     /// real IPv4 or IPv6 gate address and this house's IPv6 synthetic peer
     /// addresses (section 3).
     state: UdpSocketState,
+    /// Whether the real socket is bound IPv6 (and therefore dual-stack).
+    /// Cached at construction because every send consults it: a V4
+    /// destination has to be handed to a V6 socket in its IPv4-mapped
+    /// form, which is what quinn does for its own transmits
+    /// (`ensure_ipv6`, `quinn/src/endpoint.rs:222` and `:631-636`) and
+    /// what a probe or a direct-path send has to do for itself.
+    local_is_ipv6: bool,
     relay: Mutex<RelayRoutes>,
     /// The per peer path table of section 3, indexed by synthetic address
     /// on the send path. A peer with a direct path leaves on the wire; a
@@ -97,6 +123,13 @@ pub struct PorchSocket {
     /// address the doorbell scores.
     inbound_probes: Mutex<VecDeque<(SocketAddr, [u8; PROBE_LEN])>>,
     probe_waker: Mutex<Option<Waker>>,
+    /// The real source addresses whose QUIC packets may reach quinn
+    /// unchanged: the gate addresses this house itself dialled. See
+    /// [`PorchSocket::allow_source`].
+    allowed_sources: Mutex<HashSet<SocketAddr>>,
+    /// Count of inbound QUIC segments dropped for arriving from an address
+    /// in neither the path table nor the allow-list (section 3).
+    unknown_source_dropped: AtomicU64,
     waker: Mutex<Option<Waker>>,
     /// Count of inbound relayed datagrams dropped because
     /// [`crate::gate::limits::INBOUND_RELAY_QUEUE_CAP`] was already full
@@ -134,9 +167,11 @@ impl PorchSocket {
         let state = UdpSocketState::new((&std_socket).into())?;
         std_socket.set_nonblocking(true)?;
         let udp = tokio::net::UdpSocket::from_std(std_socket)?;
+        let local_is_ipv6 = matches!(udp.local_addr()?, SocketAddr::V6(_));
         Ok(Arc::new(Self {
             udp,
             state,
+            local_is_ipv6,
             relay: Mutex::new(RelayRoutes {
                 gate: None,
                 by_synthetic: HashMap::new(),
@@ -146,6 +181,8 @@ impl PorchSocket {
             inbound_synthetic: Mutex::new(VecDeque::new()),
             inbound_probes: Mutex::new(VecDeque::new()),
             probe_waker: Mutex::new(None),
+            allowed_sources: Mutex::new(HashSet::new()),
+            unknown_source_dropped: AtomicU64::new(0),
             waker: Mutex::new(None),
             inbound_relay_dropped: AtomicU64::new(0),
             poll_recv_prefer_socket: std::sync::atomic::AtomicBool::new(false),
@@ -164,6 +201,7 @@ impl PorchSocket {
     /// inbound `Relay` datagrams by session into the registered synthetic
     /// addresses.
     pub fn attach_gate(self: &Arc<Self>, gate: quinn::Connection) {
+        self.allow_source(gate.remote_address());
         {
             let mut routes = self.relay.lock_or_recover();
             routes.gate = Some(gate.clone());
@@ -232,6 +270,65 @@ impl PorchSocket {
         }
     }
 
+    /// The form `addr` must take to be sent from this socket: a V4
+    /// destination on an IPv6 (dual-stack) socket becomes its IPv4-mapped
+    /// form, and everything else is unchanged.
+    ///
+    /// Not cosmetic. A raw `sendmsg` with an `AF_INET` address on an
+    /// `AF_INET6` socket does not reach the destination, and the send
+    /// reports success, so a probe sent without this mapping is silently
+    /// never delivered and a direct path never proves itself.
+    fn map_destination(&self, addr: SocketAddr) -> SocketAddr {
+        match addr {
+            SocketAddr::V4(v4) if self.local_is_ipv6 => {
+                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+            }
+            other => other,
+        }
+    }
+
+    /// Allows QUIC packets from `addr` to reach quinn unchanged.
+    ///
+    /// **This is the exception section 3's drop rule needs, and the design
+    /// does not name it.** Section 3 says "direct packets from an address
+    /// in no peer's candidate table are dropped, which is a feature: nobody
+    /// publishes where a house is (D3), so every real path came from a
+    /// ticket, discovery or a candidate exchange". It is written about
+    /// *peer* paths, and it is silent about the house's own connections to
+    /// its gate, which ride this same socket and whose addresses are in no
+    /// peer's candidate table: the primary address the house dialled, and
+    /// the secondary reflection port the gate names in `Registered`
+    /// (frame 2). Implementing the rule without that exception drops the
+    /// gate's reflection replies and `Reflect` never completes, which is
+    /// how this was found.
+    ///
+    /// The smaller reading, taken here: an address the house itself
+    /// deliberately dialled is allowed, and nothing else is. That keeps the
+    /// property the rule exists for, since a stranger's address is one the
+    /// house never dialled and never proved, while letting the two gate
+    /// connections work. Recorded as a design gap in the pull request.
+    pub fn allow_source(&self, addr: SocketAddr) {
+        self.allowed_sources
+            .lock_or_recover()
+            .insert(unmap_v4(addr));
+    }
+
+    /// Withdraws an address added by [`PorchSocket::allow_source`], for a
+    /// short-lived connection such as a `Reflect` that has finished.
+    pub fn forget_source(&self, addr: &SocketAddr) {
+        self.allowed_sources
+            .lock_or_recover()
+            .remove(&unmap_v4(*addr));
+    }
+
+    /// The number of inbound QUIC segments dropped for arriving from an
+    /// address this house has neither dialled nor proved, for tests and
+    /// diagnostics.
+    #[must_use]
+    pub fn unknown_source_dropped(&self) -> u64 {
+        self.unknown_source_dropped.load(Ordering::Relaxed)
+    }
+
     /// Registers `peer` in the path table on the relay path, reachable by
     /// its key and by `synthetic`, and returns the shared entry the
     /// doorbell upgrades and falls back on.
@@ -264,7 +361,7 @@ impl PorchSocket {
     /// is cheap and repeated every 100 ms, so a caller may simply drop it.
     pub fn send_probe(&self, to: SocketAddr, probe: &[u8; PROBE_LEN]) -> io::Result<()> {
         let transmit = Transmit {
-            destination: to,
+            destination: self.map_destination(to),
             ecn: None,
             contents: probe,
             segment_size: None,
@@ -341,9 +438,15 @@ impl PorchSocket {
             read = end;
         }
         if !probes.is_empty() {
+            // The source is unmapped before it is queued: a dual-stack
+            // socket reports an IPv4 peer as `::ffff:a.b.c.d`, while the
+            // candidate the doorbell scores came from frame 16 as plain
+            // IPv4, and a pong whose source does not compare equal to the
+            // candidate it answers proves nothing at all.
+            let source = unmap_v4(meta.addr);
             let mut queue = self.inbound_probes.lock_or_recover();
             for probe in probes {
-                queue.push_back((meta.addr, probe));
+                queue.push_back((source, probe));
             }
             drop(queue);
             if let Some(waker) = self.probe_waker.lock_or_recover().take() {
@@ -353,36 +456,41 @@ impl PorchSocket {
         write
     }
 
-    /// The synthetic address a real source address must be presented to
-    /// quinn as, or `None` if quinn may see it unchanged.
+    /// What quinn may be shown of a packet from real source `addr`
+    /// (section 3).
     ///
-    /// **Half of section 3's rule, deliberately, with the other half named
-    /// rather than guessed.** The rewrite is here: an inbound packet from a
-    /// peer's proved direct path is presented as that peer's stable
+    /// An address a peer proved is presented as that peer's stable
     /// synthetic address, which is the indirection that lets an upgrade
-    /// happen without quinn migrating, and without a **client**
-    /// connection hitting `panic!("packets from unknown remote should be
-    /// dropped by clients")`
-    /// (`quinn-proto/src/connection/mod.rs:3016-3018`).
-    ///
-    /// The other half, "direct packets from an address in no peer's
-    /// candidate table are dropped", is **not** implemented here and must
-    /// not be approximated: this layer is told about the gate connection
-    /// and the path table and nothing else, so a legitimate real source it
-    /// has never heard of, the gate's *secondary* reflection port among
-    /// them, would be dropped with it. Dropping needs the candidate table
-    /// the doorbell holds, and the flag WO-4.1 needs for an outstanding
-    /// invite, neither of which reaches the socket yet. Until then quinn's
-    /// own connection-ID routing is what keeps a stranger's packet from
-    /// reaching a connection, which is weaker than the design asks for and
-    /// is recorded as such.
-    fn synthetic_source_for(&self, addr: SocketAddr) -> Option<SocketAddr> {
-        let paths = self.paths.lock_or_recover();
-        paths
-            .direct_addrs()
-            .into_iter()
-            .find(|(direct, _)| *direct == addr)
-            .map(|(_, synthetic)| synthetic)
+    /// happen without quinn migrating and without a **client** connection
+    /// hitting `panic!("packets from unknown remote should be dropped by
+    /// clients")` (`quinn-proto/src/connection/mod.rs:3016-3018`). An
+    /// address this house dialled itself (see
+    /// [`PorchSocket::allow_source`]) is shown unchanged. Anything else is
+    /// dropped before quinn sees it, which is section 3's rule.
+    fn classify_source(&self, addr: SocketAddr) -> SourceVerdict {
+        // The porch socket is bound IPv6-unspecified and dual-stack, so an
+        // IPv4 peer's packets are reported with an IPv4-mapped source
+        // (`::ffff:a.b.c.d`) while the address the house dialled and the
+        // address a candidate exchange named are plain IPv4. Comparing the
+        // two forms unmapped is not cosmetic: without it every gate
+        // connection over IPv4 is dropped by the rule below, which is
+        // exactly what happened when this landed.
+        let addr = unmap_v4(addr);
+        let direct = {
+            let paths = self.paths.lock_or_recover();
+            paths
+                .direct_addrs()
+                .into_iter()
+                .find(|(direct, _)| unmap_v4(*direct) == addr)
+                .map(|(_, synthetic)| synthetic)
+        };
+        if let Some(synthetic) = direct {
+            return SourceVerdict::Rewrite(synthetic);
+        }
+        if self.allowed_sources.lock_or_recover().contains(&addr) {
+            return SourceVerdict::Keep;
+        }
+        SourceVerdict::Drop
     }
 
     /// Splits one batch of received buffers into what quinn may see and
@@ -412,22 +520,31 @@ impl PorchSocket {
                 break;
             };
             let kept = self.filter_probes(buf, &original);
-            let synthetic = if kept == 0 {
-                None
+            let verdict = if kept == 0 {
+                SourceVerdict::Drop
             } else {
-                self.synthetic_source_for(original.addr)
+                self.classify_source(original.addr)
             };
             let Some(slot) = meta.get_mut(index) else {
                 break;
             };
-            slot.len = kept;
-            if kept == 0 {
-                continue;
+            match verdict {
+                SourceVerdict::Drop => {
+                    if kept > 0 {
+                        self.unknown_source_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    slot.len = 0;
+                }
+                SourceVerdict::Keep => {
+                    slot.len = kept;
+                    carrying = carrying.saturating_add(1);
+                }
+                SourceVerdict::Rewrite(synthetic) => {
+                    slot.len = kept;
+                    slot.addr = synthetic;
+                    carrying = carrying.saturating_add(1);
+                }
             }
-            if let Some(synthetic) = synthetic {
-                slot.addr = synthetic;
-            }
-            carrying = carrying.saturating_add(1);
         }
         carrying
     }
@@ -491,6 +608,18 @@ impl PorchSocket {
 /// (`quinn/src/runtime/tokio.rs:58-62` through `UdpPollHelper`,
 /// `quinn/src/runtime.rs:130-153`), reproduced here rather than reused
 /// because `UdpPollHelper` is crate-private to quinn.
+/// What the porch socket does with a received buffer's real source address
+/// before quinn sees it (section 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceVerdict {
+    /// Show it to quinn unchanged: the house dialled this address itself.
+    Keep,
+    /// Show it as this peer's synthetic address.
+    Rewrite(SocketAddr),
+    /// Never let quinn see it.
+    Drop,
+}
+
 struct PorchPoller {
     socket: Arc<PorchSocket>,
     /// The in-flight `writable()` future, kept across `poll_writable` calls
@@ -553,7 +682,7 @@ impl AsyncUdpSocket for PorchSocket {
             .and_then(crate::path::PathEntry::direct_addr);
         if let Some(direct) = direct {
             let rewritten = Transmit {
-                destination: direct,
+                destination: self.map_destination(direct),
                 ecn: transmit.ecn,
                 contents: transmit.contents,
                 segment_size: transmit.segment_size,
@@ -981,9 +1110,6 @@ mod tests {
             let direct: SocketAddr = "203.0.113.4:4433".parse().unwrap();
             let entry = socket.insert_relay_path([9u8; 32], synthetic);
             entry.upgrade_to(direct);
-            // A gate must be attachable-looking for `classify_source` to
-            // reach its drop arm at all; with no gate attached every source
-            // is kept, so the rewrite is what this asserts.
             let stride = 1200usize;
             let quic: Vec<u8> = (0..stride).map(|i| (i % 251) as u8).collect();
             let probe = a_probe();
@@ -1053,6 +1179,7 @@ mod tests {
             let socket = porch();
             let probe = a_probe();
             let source: SocketAddr = "203.0.113.8:4433".parse().unwrap();
+            socket.allow_source(source);
             let quic = [0xC3u8; PROBE_LEN];
             let mut storage = [0u8; PROBE_LEN * 2];
             storage[..PROBE_LEN].copy_from_slice(&probe);
@@ -1069,6 +1196,52 @@ mod tests {
             assert_eq!(meta[0].len, PROBE_LEN);
             assert_eq!(&bufs[0][..PROBE_LEN], &quic);
             assert_eq!(socket.try_recv_probe(), Some((source, probe)));
+        }
+
+        /// Section 3: a QUIC packet from an address this house has neither
+        /// dialled nor proved never reaches quinn, and is counted.
+        ///
+        /// Deliberate break to fail this test: in
+        /// `PorchSocket::classify_source`, change the final
+        /// `SourceVerdict::Drop` to `SourceVerdict::Keep`. The stranger's
+        /// packet is then handed to quinn and the count stays 0.
+        #[tokio::test]
+        async fn a_quic_packet_from_an_undialled_unproved_source_is_dropped_and_counted() {
+            let socket = porch();
+            let dialled: SocketAddr = "203.0.113.1:4433".parse().unwrap();
+            let stranger: SocketAddr = "203.0.113.99:4433".parse().unwrap();
+            socket.allow_source(dialled);
+
+            for (source, expected_len) in [(dialled, 40usize), (stranger, 0usize)] {
+                let mut storage = [0xC3u8; 40];
+                let mut bufs = [IoSliceMut::new(&mut storage)];
+                let mut meta = [RecvMeta {
+                    addr: source,
+                    len: 40,
+                    stride: 40,
+                    ecn: None,
+                    dst_ip: None,
+                }];
+                socket.demultiplex(&mut bufs, &mut meta, 1);
+                assert_eq!(meta[0].len, expected_len, "source {source}");
+            }
+            assert_eq!(socket.unknown_source_dropped(), 1);
+
+            // Withdrawing the address (a `Reflect` connection closing) puts
+            // it back outside the rule.
+            socket.forget_source(&dialled);
+            let mut storage = [0xC3u8; 40];
+            let mut bufs = [IoSliceMut::new(&mut storage)];
+            let mut meta = [RecvMeta {
+                addr: dialled,
+                len: 40,
+                stride: 40,
+                ecn: None,
+                dst_ip: None,
+            }];
+            socket.demultiplex(&mut bufs, &mut meta, 1);
+            assert_eq!(meta[0].len, 0);
+            assert_eq!(socket.unknown_source_dropped(), 2);
         }
 
         /// Section 2 step 6 and step 7 at the socket: once a candidate has

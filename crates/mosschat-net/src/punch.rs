@@ -21,7 +21,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use minicbor::{Decoder, Encoder, decode::Error as DecodeError};
+use rand::RngExt as _;
 
+use crate::gate::GateError;
 use crate::gate::wire::Addr;
 
 /// The probe packet's first byte (section 3's discriminator). `0x2A` has
@@ -497,7 +499,7 @@ pub fn gather(
             if out.len() >= MAX_CANDIDATES {
                 return out;
             }
-            if !is_plausible_candidate(*addr) {
+            if !is_gatherable(*addr) {
                 continue;
             }
             if out.iter().any(|(existing, _)| existing == addr) {
@@ -509,22 +511,35 @@ pub fn gather(
     out
 }
 
-/// Whether an address is worth probing at all: a real host address with a
-/// real port. A loopback or unspecified address, or port 0, is never a
-/// candidate, and neither is port 1, which is the port every synthetic peer
-/// address carries (section 3) and which no real peer ever listens on.
+/// Whether an address may be **offered** as one of this house's own
+/// candidates (section 2 step 1: "every non-loopback address on every up
+/// interface"). Loopback is excluded here and only here: telling a peer to
+/// probe 127.0.0.1 tells it to probe itself.
+fn is_gatherable(addr: SocketAddr) -> bool {
+    if addr.ip().is_loopback() {
+        return false;
+    }
+    is_probeable(addr)
+}
+
+/// Whether an address is worth **probing**, which is a weaker test than
+/// [`is_gatherable`] on purpose.
 ///
-/// A unique local address is *not* filtered even though the synthetic
-/// address is one: a real LAN may use `fd00::/8` for real hosts, and
-/// section 6 wants exactly those reachable. The port is the precise
-/// discriminator; the prefix is not.
-fn is_plausible_candidate(addr: SocketAddr) -> bool {
+/// Step 1 constrains what a house gathers and offers; step 5 probes "every
+/// candidate" the exchange produced. A house does not get to second-guess
+/// which of its peer's addresses are real, because the peer knows its own
+/// interfaces and this house does not, and probing a wrong one costs one
+/// 81 byte packet every 100 ms for at most 10 seconds. What is refused is
+/// what cannot be a peer at all: port 0, port 1 (which every synthetic
+/// address carries, section 3, and no real peer listens on), and the
+/// unspecified, multicast and broadcast addresses.
+fn is_probeable(addr: SocketAddr) -> bool {
     if addr.port() == 0 || addr.port() == 1 {
         return false;
     }
     match addr.ip() {
-        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified() && !v4.is_broadcast(),
-        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast(),
+        IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_broadcast() && !v4.is_multicast(),
+        IpAddr::V6(v6) => !v6.is_unspecified() && !v6.is_multicast(),
     }
 }
 
@@ -628,7 +643,7 @@ impl Attempt {
     /// [`MAX_CANDIDATES`] cap is already reached.
     pub fn add_candidate(&mut self, addr: SocketAddr, source: CandidateSource) -> bool {
         if self.candidates.len() >= MAX_CANDIDATES
-            || !is_plausible_candidate(addr)
+            || !is_probeable(addr)
             || self.candidates.iter().any(|c| c.addr == addr)
         {
             return false;
@@ -853,6 +868,385 @@ impl Attempt {
     }
 }
 
+// ----------------------------------------------------------------------
+// Running the doorbell (section 2 end to end)
+// ----------------------------------------------------------------------
+
+/// Section 4's shape, in the one slice section 2 step 7 cannot do without:
+/// on a live path, one probe every 500 ms, and three consecutive
+/// unanswered probes mean the path is gone. The rest of section 4 (the
+/// idle keepalive clamp, the dead grace, local address change) is a later
+/// work order; without at least this much, "fall back on path failure"
+/// has no failure to fall back on.
+pub const LIVE_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Section 4: three consecutive unanswered probes make a live path stale,
+/// which is when traffic moves back to the relay.
+pub const LIVE_PROBES_TO_STALE: u32 = 3;
+
+/// What a house needs to know before it can run the doorbell for one peer.
+#[derive(Debug, Clone)]
+pub struct DoorbellParams {
+    /// The relay session the gate assigned, which `StartRequest` names.
+    pub session: u32,
+    /// `1` if this house is the initiator (frame 6's `role`), `2` if the
+    /// responder. The initiator opens the porch stream, chooses the
+    /// attempt id and asks the gate to start.
+    pub role: u8,
+    /// The peer this attempt is for, which names its path table entry.
+    pub peer_key: [u8; 32],
+    /// This house's own candidate addresses, already gathered
+    /// ([`gather`]).
+    pub candidates: Vec<SocketAddr>,
+}
+
+/// A live doorbell's one control: whether it still answers pings.
+///
+/// A path that has died and a peer that has stopped answering are the same
+/// thing seen from the other side, which is what makes this the honest way
+/// to exercise section 2 step 7 without unplugging a cable.
+#[derive(Debug, Default)]
+pub struct DoorbellControl {
+    answer_probes: std::sync::atomic::AtomicBool,
+}
+
+impl DoorbellControl {
+    /// A control that answers pings, which is every live doorbell.
+    #[must_use]
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            answer_probes: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    /// Stops answering pings from this moment, which is what the peer sees
+    /// when this house's path to it dies.
+    pub fn stop_answering_probes(&self) {
+        self.answer_probes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn answering(&self) -> bool {
+        self.answer_probes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// How one doorbell attempt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DoorbellOutcome {
+    /// The attempt id both sides' records join on.
+    pub attempt: [u8; 16],
+    /// The address this house upgraded to, if any candidate proved itself.
+    pub upgraded_to: Option<SocketAddr>,
+    /// Whether that path later failed and this house went back to the
+    /// relay.
+    pub fell_back: bool,
+}
+
+/// Reads one length-prefixed porch frame, bounded by
+/// [`crate::gate::wire::CONTROL_FRAME_LEN_CAP`] checked before allocating
+/// and by `deadline` (section 5: "every read on the control and porch
+/// streams carries a deadline").
+///
+/// # Errors
+///
+/// Returns [`GateError::FrameTooLarge`], [`GateError::Timeout`] or a
+/// protocol error.
+pub async fn read_porch_frame(
+    stream: &mut quinn::RecvStream,
+    deadline: Duration,
+) -> Result<PorchFrame, GateError> {
+    let read = async {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf);
+        if len > crate::gate::wire::CONTROL_FRAME_LEN_CAP {
+            return Err(GateError::FrameTooLarge(len));
+        }
+        let mut body = vec![0u8; len as usize];
+        stream.read_exact(&mut body).await?;
+        PorchFrame::from_cbor(&body).map_err(|e| GateError::Protocol(e.to_string()))
+    };
+    tokio::time::timeout(deadline, read)
+        .await
+        .map_err(|_| GateError::Timeout)?
+}
+
+/// Writes one length-prefixed porch frame.
+///
+/// # Errors
+///
+/// Returns a [`GateError`] if the stream write fails.
+pub async fn write_porch_frame(
+    stream: &mut quinn::SendStream,
+    frame: &PorchFrame,
+) -> Result<(), GateError> {
+    let body = frame.to_cbor();
+    let len = u32::try_from(body.len()).map_err(|_| GateError::FrameTooLarge(u32::MAX))?;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(&body).await?;
+    Ok(())
+}
+
+/// Runs section 2 for one peer, end to end, on an already-open end to end
+/// QUIC connection that is already carrying traffic through the relay.
+///
+/// The order is the design's: exchange candidates on the porch stream
+/// inside the sealed connection so the gate sees them as ciphertext (step
+/// 3), ask the gate to fire both sides together (step 4), probe every
+/// candidate at once (step 5), upgrade the first to answer three
+/// consecutive probes (step 6), and revert to the relay if that path later
+/// dies (step 7). The end to end connection is never touched by any of it:
+/// it addresses the peer's synthetic address throughout and never learns
+/// the path moved, which is section 3's whole premise.
+///
+/// Returns when the attempt is settled: every candidate given up, or a
+/// path upgraded and later lost, or the peer connection closed.
+///
+/// # Errors
+///
+/// Returns a [`GateError`] if the porch stream cannot be opened, a frame
+/// is malformed, the gate never sends `Start`, or the peer connection
+/// fails.
+pub async fn run_doorbell(
+    porch: &std::sync::Arc<crate::sock::PorchSocket>,
+    gate: &crate::gate::client::GateClient,
+    peer: &quinn::Connection,
+    params: DoorbellParams,
+    control: &std::sync::Arc<DoorbellControl>,
+) -> Result<DoorbellOutcome, GateError> {
+    let initiator = params.role == 1;
+    let mut half = [0u8; 32];
+    rand::rng().fill(&mut half);
+
+    // Step 3. The initiator opens the porch stream and names the attempt;
+    // the responder accepts and adopts it, so one id names the attempt in
+    // both houses' records without either having to agree on a draw.
+    let (mut send, mut recv) = if initiator {
+        peer.open_bi().await?
+    } else {
+        peer.accept_bi().await?
+    };
+    let deadline = crate::authed::control_read_deadline();
+
+    let (attempt, peer_addrs, peer_half) = if initiator {
+        let mut attempt = [0u8; 16];
+        rand::rng().fill(&mut attempt);
+        write_porch_frame(
+            &mut send,
+            &PorchFrame::Candidates {
+                v: 1,
+                attempt,
+                addrs: params
+                    .candidates
+                    .iter()
+                    .copied()
+                    .map(Addr::from_socket_addr)
+                    .collect(),
+                probe_half: half,
+            },
+        )
+        .await?;
+        let (peer_attempt, addrs, peer_half) = expect_candidates(&mut recv, deadline).await?;
+        if peer_attempt != attempt {
+            return Err(GateError::Protocol(
+                "the responder's Candidates named a different attempt".into(),
+            ));
+        }
+        (attempt, addrs, peer_half)
+    } else {
+        let (attempt, addrs, peer_half) = expect_candidates(&mut recv, deadline).await?;
+        write_porch_frame(
+            &mut send,
+            &PorchFrame::Candidates {
+                v: 1,
+                attempt,
+                addrs: params
+                    .candidates
+                    .iter()
+                    .copied()
+                    .map(Addr::from_socket_addr)
+                    .collect(),
+                probe_half: half,
+            },
+        )
+        .await?;
+        (attempt, addrs, peer_half)
+    };
+
+    let (half_initiator, half_responder) = if initiator {
+        (half, peer_half)
+    } else {
+        (peer_half, half)
+    };
+    let key = probe_key(&attempt, &half_initiator, &half_responder);
+
+    let mut state = Attempt::new(attempt, key);
+    for addr in peer_addrs {
+        if let Some(addr) = addr.to_socket_addr() {
+            state.add_candidate(addr, CandidateSource::PeerReported);
+        }
+    }
+
+    // Step 4. Either side may ask; the initiator does, so exactly one
+    // request is sent for the ordinary case and the 4 per session budget
+    // is not spent on a race.
+    if initiator {
+        gate.request_start(params.session).await?;
+    }
+    let start = gate
+        .await_start(params.session, Duration::from_secs(10))
+        .await?;
+    state.start_signal_received(start.received_at);
+
+    let path = porch.path_for(&params.peer_key);
+    let mut outcome = DoorbellOutcome {
+        attempt,
+        upgraded_to: None,
+        fell_back: false,
+    };
+    let mut live_misses = 0u32;
+    let mut live_outstanding: Option<[u8; 8]> = None;
+    let mut live_last_sent: Option<Instant> = None;
+
+    loop {
+        let now = Instant::now();
+
+        if let Some(winner) = outcome.upgraded_to {
+            // Step 7's precondition, and section 4's smallest slice: one
+            // probe every 500 ms on the live path, three unanswered in a
+            // row and it is gone.
+            if live_last_sent.is_none_or(|last| now.duration_since(last) >= LIVE_PROBE_INTERVAL) {
+                if live_outstanding.take().is_some() {
+                    live_misses = live_misses.saturating_add(1);
+                }
+                if live_misses >= LIVE_PROBES_TO_STALE {
+                    if let Some(path) = path.as_ref() {
+                        path.fall_back_to_relay();
+                    }
+                    outcome.fell_back = true;
+                    let _ = write_porch_frame(
+                        &mut send,
+                        &PorchFrame::PathDown {
+                            v: 1,
+                            attempt,
+                            addr: Addr::from_socket_addr(winner),
+                            // Section 7's reason enum: `path_idle_timeout`.
+                            reason: 16,
+                        },
+                    )
+                    .await;
+                    return Ok(outcome);
+                }
+                let mut tx = [0u8; 8];
+                rand::rng().fill(&mut tx);
+                let ping = Probe {
+                    kind: PROBE_PING,
+                    attempt,
+                    tx,
+                    observed: Addr::default(),
+                };
+                let _ = porch.send_probe(winner, &ping.encode(&key));
+                live_outstanding = Some(tx);
+                live_last_sent = Some(now);
+            }
+        } else {
+            for (to, bytes) in state.due_probes(now, || {
+                let mut tx = [0u8; 8];
+                rand::rng().fill(&mut tx);
+                tx
+            }) {
+                let _ = porch.send_probe(to, &bytes);
+            }
+            if state.given_up(now) {
+                return Ok(outcome);
+            }
+        }
+
+        // Drain whatever has arrived, then wait a short tick. The tick is
+        // 20 ms rather than the probe interval so a pong is timed at
+        // roughly its true round trip rather than rounded up to the next
+        // schedule point.
+        let mut decided = None;
+        loop {
+            let Some((from, bytes)) = porch.try_recv_probe() else {
+                break;
+            };
+            let Some(probe) = Probe::decode(&bytes, &key) else {
+                continue;
+            };
+            if probe.attempt != attempt {
+                continue;
+            }
+            match probe.kind {
+                PROBE_PING => {
+                    if control.answering() {
+                        let _ = porch.send_probe(from, &state.pong_for(&probe, from));
+                    }
+                }
+                _ => {
+                    if outcome.upgraded_to.is_some() {
+                        if live_outstanding == Some(probe.tx) {
+                            live_outstanding = None;
+                            live_misses = 0;
+                        }
+                    } else {
+                        state.on_pong(from, &probe, Instant::now());
+                    }
+                }
+            }
+        }
+        if outcome.upgraded_to.is_none() {
+            decided = state.decide();
+        }
+
+        if let Some(winner) = decided {
+            // Step 6. The winner goes into the path table, `PathUp` goes
+            // out, and the relay session stays open but idle.
+            if let Some(path) = path.as_ref() {
+                path.upgrade_to(winner.addr);
+            }
+            outcome.upgraded_to = Some(winner.addr);
+            live_last_sent = Some(Instant::now());
+            live_outstanding = None;
+            live_misses = 0;
+            let rtt_us = u32::try_from(winner.rtt.as_micros()).unwrap_or(u32::MAX);
+            write_porch_frame(
+                &mut send,
+                &PorchFrame::PathUp {
+                    v: 1,
+                    attempt,
+                    addr: Addr::from_socket_addr(winner.addr),
+                    rtt_us,
+                },
+            )
+            .await?;
+        }
+
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            _ = peer.closed() => return Ok(outcome),
+        }
+    }
+}
+
+async fn expect_candidates(
+    recv: &mut quinn::RecvStream,
+    deadline: Duration,
+) -> Result<([u8; 16], Vec<Addr>, [u8; 32]), GateError> {
+    match read_porch_frame(recv, deadline).await? {
+        PorchFrame::Candidates {
+            attempt,
+            addrs,
+            probe_half,
+            ..
+        } => Ok((attempt, addrs, probe_half)),
+        other => Err(GateError::Protocol(format!(
+            "expected Candidates as the first porch frame, got {other:?}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1040,7 +1434,7 @@ mod tests {
     #[test]
     fn local_addresses_are_real_host_addresses_of_both_families_or_none() {
         for candidate in local_addresses(4433) {
-            assert!(is_plausible_candidate(candidate));
+            assert!(is_gatherable(candidate));
             assert_eq!(candidate.port(), 4433);
         }
     }

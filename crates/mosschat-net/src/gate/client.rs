@@ -358,6 +358,34 @@ struct Inner {
     /// discarded, so a house could learn either only out of band).
     registered_observed: std::net::SocketAddr,
     registered_secondary_port: u16,
+    starts: StdMutex<HashMap<u32, StartSlot>>,
+}
+
+/// A `Start` (frame 7) as this house received it: the gate's parameters
+/// plus the local instant it arrived, which is what section 2 step 4
+/// actually fires from. `gate_ms` is the gate's monotonic clock, written
+/// into the diagnostics record so two logs can be aligned, and is never a
+/// time to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartSignal {
+    /// The session the start is for.
+    pub session: u32,
+    /// How long after `received_at` to fire the first probe burst.
+    pub fire_in_ms: u16,
+    /// The gate's monotonic clock at the moment it sent this.
+    pub gate_ms: u64,
+    /// This house's own reading of when the frame arrived.
+    pub received_at: std::time::Instant,
+}
+
+/// One session's `Start` slot. A `Start` can arrive before the side that
+/// did not ask for it gets round to waiting, so an arrival with no waiter
+/// is kept rather than dropped; otherwise the responder would wait out its
+/// whole timeout for a frame it had already been sent.
+#[derive(Default)]
+struct StartSlot {
+    received: Option<StartSignal>,
+    waiter: Option<oneshot::Sender<StartSignal>>,
 }
 
 /// A house's connection to one gate: registered, able to seal and send an
@@ -440,6 +468,11 @@ impl GateClient {
         )?;
         endpoint.set_default_client_config(client_config);
 
+        // Section 3's drop rule (`PorchSocket::allow_source`): the gate's
+        // primary address is in no peer's candidate table, so it must be
+        // allowed explicitly, and before the dial rather than after, since
+        // the handshake's own packets come back from it.
+        porch.allow_source(primary_addr);
         let connecting = endpoint.connect(primary_addr, "gate")?;
         let connection = connecting.await?;
         let authed_conn = AuthedConnection::new(connection)?;
@@ -503,6 +536,7 @@ impl GateClient {
             auto_answer_knocks: std::sync::atomic::AtomicBool::new(true),
             registered_observed,
             registered_secondary_port,
+            starts: StdMutex::new(HashMap::new()),
         });
 
         let reader_inner = Arc::clone(&inner);
@@ -605,8 +639,18 @@ impl GateClient {
     ///
     /// Returns a [`GateError`] if the connection or exchange fails.
     pub async fn reflect(&self, secondary_addr: std::net::SocketAddr) -> Result<Addr, GateError> {
+        // The gate's secondary port is the other address this house dials
+        // itself, and the only other one; allowed for the life of this
+        // short connection and withdrawn when it closes.
+        self.inner.porch.allow_source(secondary_addr);
         let connecting = self.inner.endpoint.connect(secondary_addr, "gate")?;
-        let connection = connecting.await?;
+        let connection = match connecting.await {
+            Ok(connection) => connection,
+            Err(e) => {
+                self.inner.porch.forget_source(&secondary_addr);
+                return Err(e.into());
+            }
+        };
         let (mut send, mut recv) = connection.open_bi().await?;
         wire::write_frame(&mut send, &Frame::Reflect { v: 1 }).await?;
         let reply = wire::read_frame(&mut recv, authed::control_read_deadline()).await?;
@@ -614,11 +658,54 @@ impl GateClient {
         // for this before dropping its own `Connection`, see `server.rs`)
         // does not sit on its bounded wait for no reason.
         connection.close(0u32.into(), b"reflect done");
+        self.inner.porch.forget_source(&secondary_addr);
         match reply {
             Frame::Reflected { observed, .. } => Ok(observed),
             other => Err(GateError::Protocol(format!(
                 "expected Reflected, got {other:?}"
             ))),
+        }
+    }
+
+    /// Section 2 step 4: asks the gate to fire the simultaneous open for
+    /// `session`. Either side may ask; the gate sends `Start` to both,
+    /// back to back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`GateError`] if the control stream write fails.
+    pub async fn request_start(&self, session: u32) -> Result<(), GateError> {
+        let mut send = self.inner.control_send.lock().await;
+        wire::write_frame(&mut send, &Frame::StartRequest { v: 1, session }).await
+    }
+
+    /// Waits for this session's `Start`, which either side receives whether
+    /// or not it was the one that asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GateError::Timeout`] if none arrives inside `deadline`.
+    pub async fn await_start(
+        &self,
+        session: u32,
+        deadline: Duration,
+    ) -> Result<StartSignal, GateError> {
+        let rx = {
+            let mut starts = self.inner.starts.lock_or_recover();
+            let slot = starts.entry(session).or_default();
+            if let Some(signal) = slot.received.take() {
+                return Ok(signal);
+            }
+            let (tx, rx) = oneshot::channel();
+            slot.waiter = Some(tx);
+            rx
+        };
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(signal)) => Ok(signal),
+            _ => {
+                self.inner.starts.lock_or_recover().remove(&session);
+                Err(GateError::Timeout)
+            }
         }
     }
 
@@ -666,9 +753,14 @@ impl GateClient {
 
         match tokio::time::timeout(Duration::from_secs(u64::from(ttl_s)), rx).await {
             Ok(Ok(outcome)) => {
+                let synthetic = self.synthetic_addr_for(&peer_key);
                 self.inner
                     .porch
-                    .register_relay_session(outcome.session, self.synthetic_addr_for(&peer_key));
+                    .register_relay_session(outcome.session, synthetic);
+                // Section 2 step 2: the peer starts relayed, so its path
+                // table entry exists from the introduction, not from the
+                // upgrade. The doorbell finds it with `porch.path_for`.
+                self.inner.porch.insert_relay_path(peer_key, synthetic);
                 Ok(outcome)
             }
             _ => {
@@ -722,10 +814,9 @@ async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
                     // route ourselves, since `Introduction` carries no key.
                     let peer_key = { inner.pending_accepts.lock_or_recover().remove(&tag) };
                     if let Some(peer_key) = peer_key {
-                        inner.porch.register_relay_session(
-                            session,
-                            sock::synthetic_addr(inner.process_salt, &peer_key),
-                        );
+                        let synthetic = sock::synthetic_addr(inner.process_salt, &peer_key);
+                        inner.porch.register_relay_session(session, synthetic);
+                        inner.porch.insert_relay_path(peer_key, synthetic);
                     }
                 }
             }
@@ -735,6 +826,27 @@ async fn reader_loop(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
                     answer_knock(&inner, tag, sealed).await;
+                }
+            }
+            Frame::Start {
+                session,
+                fire_in_ms,
+                gate_ms,
+                ..
+            } => {
+                let signal = StartSignal {
+                    session,
+                    fire_in_ms,
+                    gate_ms,
+                    received_at: std::time::Instant::now(),
+                };
+                let mut starts = inner.starts.lock_or_recover();
+                let slot = starts.entry(session).or_default();
+                match slot.waiter.take() {
+                    Some(waiter) => {
+                        let _ = waiter.send(signal);
+                    }
+                    None => slot.received = Some(signal),
                 }
             }
             Frame::KeepaliveAck { .. } | Frame::Error { .. } => {}

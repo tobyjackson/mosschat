@@ -130,6 +130,12 @@ pub mod limits {
     pub const INTRODUCE_PER_HOUR: u32 = 60;
     /// `Introduce.ttl_s` cap.
     pub const INTRODUCE_TTL_CAP_S: u16 = 60;
+    /// `StartRequest`: 4 per session, then ignored (section 1).
+    pub const START_REQUESTS_PER_SESSION: u32 = 4;
+    /// `Start.fire_in_ms` (section 2 step 4): each side fires its first
+    /// probe this long after receiving `Start`. No clock is synchronised;
+    /// the skew is the difference in the two one way delays from the gate.
+    pub const START_FIRE_IN_MS: u16 = 200;
     /// `Register`: 4 connection attempts per key per minute.
     pub const REGISTER_ATTEMPTS_PER_MINUTE: u32 = 4;
     /// `Relay`: 2000 datagrams and 3 MiB/s per session each way.
@@ -183,8 +189,11 @@ pub mod limits {
     /// the 1200 byte relay cap) is a bounded ~1.2 MiB. The drop policy is
     /// stated where it is enforced (amended section 3): the *newest*
     /// arrival is dropped and counted once the queue is full, and one
-    /// `poll_recv` call always attempts the real socket before the queue,
-    /// never draining one while starving the other.
+    /// `poll_recv` call draws from both the queue and the real socket
+    /// rather than draining either one first. (This used to say the real
+    /// socket is always attempted before the queue; it is not, and must
+    /// not be, since the real socket is what feeds the queue. Konrad's
+    /// merge review of PR #17 flagged the mismatch.)
     pub const INBOUND_RELAY_QUEUE_CAP: usize = 1024;
 }
 
