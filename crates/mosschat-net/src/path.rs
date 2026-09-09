@@ -18,11 +18,12 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use std::time::Instant as ProtoInstant;
 
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::lockext::LockExt;
 
@@ -985,15 +986,21 @@ mod tests {
     /// at 2000 a second is 50 ms, and a full queue refuses rather than
     /// dropping, counting the refusal in `relay_socket_backpressure`.
     ///
-    /// The floor is the real assertion, and it cannot be beaten: a shaper
-    /// that hands 100 datagrams over in less than 45 ms is not shaping at
-    /// the rate. The ceiling is deliberately loose, since a loaded runner
-    /// can only add scheduling delay, never remove it.
+    /// Runs under paused tokio time (issue #71): `RelayShaper` now times
+    /// itself with `tokio::time::Instant` rather than `std::time::Instant`,
+    /// identical to real time whenever the clock is not paused, so this is
+    /// the only line that changes production behaviour, and it does not.
+    /// Under `start_paused = true` every `tokio::time::sleep` in `drain`
+    /// advances the virtual clock by exactly its argument with no real
+    /// waiting, so the elapsed time here is the shaper's own arithmetic,
+    /// not wall time a loaded CI runner can shave: it was measured at
+    /// 42 to 44 ms against a real clock's floor of 50 ms on such a runner
+    /// (issue #71), which this floor cannot happen to.
     ///
     /// Deliberate break to fail this test: in `RelayShaper::drain`, replace
     /// the `Next::Sleep` arm's duration with `Duration::ZERO`. The queue
-    /// then empties in about a millisecond and the 45 ms floor fails.
-    #[tokio::test]
+    /// then empties with no elapsed time at all and the floor fails.
+    #[tokio::test(start_paused = true)]
     async fn a_full_house_queue_drains_at_the_house_rate() {
         let shaper = RelayShaper::house();
         assert_eq!(shaper.depth(), HOUSE_RELAY_QUEUE_DEPTH);
@@ -1031,13 +1038,17 @@ mod tests {
             .map(|index| vec![u8::try_from(index % 256).unwrap_or(0)])
             .collect();
         assert_eq!(drained, expected, "in order, byte for byte");
+        // The shaper's own virtual clock under `start_paused = true`: 100
+        // datagrams at 2000 a second is exactly 50 ms of accrued sleeps,
+        // with a microsecond of slack either way for the token bucket's
+        // floating point rounding rather than any real scheduling.
         assert!(
-            elapsed >= Duration::from_millis(45),
-            "100 datagrams at 2000 a second is 50 ms, not {elapsed:?}"
+            elapsed >= Duration::from_micros(49_999),
+            "100 datagrams at 2000 a second is 50 ms on the shaper's own clock, not {elapsed:?}"
         );
         assert!(
-            elapsed <= Duration::from_millis(200),
-            "the queue took {elapsed:?} to drain, far past 50 ms"
+            elapsed <= Duration::from_micros(50_100),
+            "the shaper's own clock advanced {elapsed:?}, past the 50 ms this rate accrues"
         );
         let stats = shaper.stats();
         assert_eq!(
