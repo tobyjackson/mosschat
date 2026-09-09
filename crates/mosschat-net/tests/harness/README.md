@@ -576,13 +576,27 @@ prints a summary.
 Everything lands under `docs/measurements/<date>-capture/`:
 
 - `nat-a.pcap`, `nat-b.pcap`, `house-a.pcap`, `house-b.pcap` -- the four
-  captures, readable with `tcpdump -n -r <file>` or Wireshark.
+  captures, readable with `tcpdump -n -r <file>` or Wireshark. A pcap of
+  24 bytes is the header alone, zero packets: tcpdump was started with
+  `-U` (flush per packet, not on its own internal buffer) and stopped
+  with a bounded wait for it to exit on its own before ever escalating to
+  `KILL`, specifically so a real capture cannot come back empty from
+  being cut off mid-write; the summary at the end prints each pcap's byte
+  count and packet count so an empty one is called out as such rather
+  than silently read as "no traffic".
 - `conntrack-nat-a.txt`, `conntrack-nat-b.txt`, `nft-nat-a.txt`,
   `nft-nat-b.txt`, `netns-state.txt` -- the mid-hold snapshot.
 - `doctor.json` -- the row's `--json` record (stdout only; the privacy
   notice `doctor` prints on stderr is not in this file, so it stays
-  exactly one JSON line).
+  exactly one JSON line, plus `row()`'s own leading `# identity NN` line).
+- `doctor.stderr.txt` -- the row's stderr: the privacy notice on a normal
+  run, or the actual error text if the row failed before printing a
+  record at all (also printed in the summary).
 - `house-b.jsonl` -- house-b's own event log for this run.
+- `gatehouse.log`, `house-b.stderr.log` -- the gatehouse's own stdout and
+  house-b's own stderr (its privacy notice, or an early failure), copied
+  out before teardown deletes `.run`, which is otherwise the only place
+  either ever existed.
 - `<date>-house-a-records.jsonl`, `<date>-house-b-records.jsonl` -- both
   roles' section 7 diagnostics records (`save_records()`, the same
   mechanism `down` uses; each role runs with its own `XDG_STATE_HOME`

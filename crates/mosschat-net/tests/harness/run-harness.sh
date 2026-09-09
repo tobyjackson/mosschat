@@ -90,20 +90,37 @@ stop_house(){
 # capture()'s four tcpdumps. Same pidfile rule as the gatehouse and
 # house-b above, and the same reason (issue #50): the pid is written from
 # inside the process that becomes tcpdump, by its own `$$`, right before
-# `exec`, so it is never a wrapper's.
+# `exec`, so it is never a wrapper's. `-U` makes tcpdump flush each packet
+# to the savefile as it is written (packet-buffered) rather than holding
+# it in its own internal buffer -- without it, a TERM (or, worse, a KILL)
+# before tcpdump's own buffer fills can leave a 24 byte file (pcap header,
+# zero packets) even though traffic crossed the interface the whole time
+# (found live, run 2).
 start_tcpdump(){
   local ns="$1" iface="$2" out="$3" tag="$4"
   say "tcpdump on $iface in $ns -> $out"
-  sh -c "echo \$\$ > $RUN/tcpdump-$tag.pid; exec ip netns exec $ns tcpdump -n -i $iface -w $out udp" \
+  sh -c "echo \$\$ > $RUN/tcpdump-$tag.pid; exec ip netns exec $ns tcpdump -U -n -i $iface -w $out udp" \
     >"$RUN/tcpdump-$tag.log" 2>&1 &
 }
 
+# TERM, then actually wait for the pid to be gone (bounded at 5 s, half
+# second steps) before ever escalating to KILL -- a KILL can cut tcpdump
+# off before it finishes flushing `-U`'s per-packet writes, the same
+# empty-pcap failure `-U` alone does not fully rule out under a dead-set
+# SIGKILL (found live, run 2; the previous version here only slept a
+# flat 1 s and did not confirm the process was actually gone before it
+# moved on).
 stop_tcpdump(){
-  local tag="$1" pid
+  local tag="$1" pid waited
   pid="$(cat "$RUN/tcpdump-$tag.pid" 2>/dev/null)" || return 0
   if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -q tcpdump; then
-    echo "stopping tcpdump $tag pid $pid"; kill -TERM "$pid" 2>/dev/null; sleep 1
-    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    echo "stopping tcpdump $tag pid $pid"; kill -TERM "$pid" 2>/dev/null
+    waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 10 ]; do
+      sleep 0.5
+      waited=$((waited + 1))
+    done
+    kill -0 "$pid" 2>/dev/null && { echo "tcpdump $tag did not exit in 5s, sending KILL"; kill -KILL "$pid" 2>/dev/null; }
   fi
   rm -f "$RUN/tcpdump-$tag.pid"
 }
@@ -176,11 +193,16 @@ pub_of(){
 # are the doctor's, one per doctor run. matrix() and capture() each
 # export both of these (to 14/13 and 3/2 respectively) right before
 # calling setup_eim(), so the fresh `bash run-harness.sh row` process
-# each row's DOCTOR command starts sees the same bound, not the defaults
-# below (which are only what a bare `row` outside either of them would
-# see).
-SEEDS=14
-DOCTOR_SEEDS=$((SEEDS - 1))
+# each row's DOCTOR command starts inherits them -- but only if the
+# lines below respect an inherited value rather than overwrite it: an
+# unconditional `SEEDS=14` here would run again in that fresh process
+# too (every invocation of this script reaches this point, `row`
+# included) and silently stomp the export right back to 14/13. That
+# does not break anything a single row can observe on its own (1 or 2
+# is always <= 13), so it went unnoticed until traced end to end; fixed
+# by only defaulting when unset.
+SEEDS="${SEEDS:-14}"
+DOCTOR_SEEDS="${DOCTOR_SEEDS:-$((SEEDS - 1))}"
 next_seed(){
   local n
   n="$(cat "$RUN/seed-next" 2>/dev/null || echo 1)"
@@ -382,12 +404,18 @@ capture(){
   start_tcpdump house-b veth-hb "$capdir/house-b.pcap" house-b
   sleep 1
 
-  # Stdout only, same as matrix()'s own smoke-run capture: `doctor --json`
-  # prints the record's one JSON line on stdout and the privacy notice on
-  # stderr (print_record, main.rs), and doctor.json has to stay exactly
-  # that one line for the grep below and for whoever reads it back.
-  say "doctor row from house-a, hold 20s (log: $capdir/doctor.json)"
-  MOSS_HOLD=20 bash "$H/run-harness.sh" row >"$capdir/doctor.json" &
+  # Stdout and stderr to two separate files: `doctor --json` prints the
+  # record's one JSON line on stdout and the privacy notice (or, if
+  # something fails before that, the actual error) on stderr
+  # (print_record and the `mosschat doctor: error: {err}` wrapper,
+  # main.rs), and doctor.json has to stay exactly the JSON line for the
+  # grep below and for whoever reads it back. The previous version left
+  # stderr unredirected, so a row that failed before printing anything
+  # left doctor.json holding only row()'s own "# identity NN" line with
+  # the actual reason nowhere in the results directory (found live, run
+  # 2) -- captured now, and printed in the summary below either way.
+  say "doctor row from house-a, hold 20s (log: $capdir/doctor.json, stderr: $capdir/doctor.stderr.txt)"
+  MOSS_HOLD=20 bash "$H/run-harness.sh" row >"$capdir/doctor.json" 2>"$capdir/doctor.stderr.txt" &
   local doctor_pid=$!
 
   sleep 10
@@ -421,24 +449,36 @@ capture(){
   say "stopping the four tcpdumps"
   stop_tcpdumps
 
-  say "copying house-b's log and both roles' diagnostics records"
+  # Before teardown removes .run: house-b's log and diagnostics records
+  # (as before), plus the gatehouse's and house-b's own logs, which
+  # otherwise only ever existed under .run (found live, run 2 needed
+  # house-b's registration line and the gatehouse's own output to rule
+  # out a gate-side cause).
+  say "copying house-b's log, the gatehouse and house-b logs, and both roles' diagnostics records"
   cp "$RUN/house-b.jsonl" "$capdir/house-b.jsonl" 2>/dev/null || echo "no $RUN/house-b.jsonl"
+  cp "$RUN/gatehouse.log" "$capdir/gatehouse.log" 2>/dev/null || echo "no $RUN/gatehouse.log"
+  cp "$RUN/house-b.stderr.log" "$capdir/house-b.stderr.log" 2>/dev/null || echo "no $RUN/house-b.stderr.log"
   save_records
   local role
   for role in house-a house-b; do
     [ -f "$OUT/${DATE_TAG}-$role-records.jsonl" ] && cp "$OUT/${DATE_TAG}-$role-records.jsonl" "$capdir/"
   done
 
-  say "summary: probe traffic in each pcap (udp, excluding the gate's ports 443 and 444)"
+  say "summary: packet counts and probe traffic in each pcap (udp, excluding the gate's" \
+    "ports 443 and 444) -- a pcap at 24 bytes is the header alone, zero packets captured"
   local pcap
   for pcap in nat-a nat-b house-a house-b; do
-    echo "-- $capdir/$pcap.pcap --"
+    echo "-- $capdir/$pcap.pcap ($(wc -c <"$capdir/$pcap.pcap" 2>/dev/null || echo 0) bytes," \
+      "$(tcpdump -n -r "$capdir/$pcap.pcap" 2>/dev/null | wc -l) packets) --"
     tcpdump -n -r "$capdir/$pcap.pcap" 'udp and not port 443 and not port 444' 2>/dev/null | head -40
   done
 
   say "doctor record: candidate_exchange and probe_burst"
   grep -o '"step":"candidate_exchange"[^}]*}' "$capdir/doctor.json" 2>/dev/null
   grep -o '"step":"probe_burst"[^}]*}' "$capdir/doctor.json" 2>/dev/null
+
+  say "doctor stderr"
+  cat "$capdir/doctor.stderr.txt" 2>/dev/null
 
   say "capture is self-contained: the EXIT trap now stops house-b, the gatehouse and" \
     "tears down"
