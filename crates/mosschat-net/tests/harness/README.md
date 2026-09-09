@@ -822,6 +822,22 @@ own trap already reset the qdisc it had applied and stopped the row's
 process by pid before it exited, so there is nothing left over from it
 either; `teardown.sh` deleting the namespaces afterward covers the rest.
 
+## What this harness can and cannot test
+
+Plain nftables `masquerade`, the rule `netns-nat.sh --mode eim` applies, is
+endpoint-independent mapping (EIM) across destination ports on a single
+destination address; run 1's conntrack test proved that. It is not
+reliably EIM across destination addresses: a packet capture on
+2026-09-09 ([issue 88](https://github.com/tobyjackson/mosschat/issues/88))
+showed house-b getting a different external port per destination address
+(57205 to the gate, 15798 to the peer), so a hole punch relying on the
+gate-observed mapping being reusable against the peer's address can never
+complete here.
+
+This harness can therefore measure relay behaviour and the fault matrix.
+It cannot test hole punching or the direct-path upgrade; proving NAT
+traversal is WO-1.5's job, on real machines and real routers.
+
 ## Known gaps, stated plainly
 
 - The doorbell is drivable from the command line now (`doctor --hold`

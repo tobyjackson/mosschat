@@ -191,6 +191,21 @@ apply_nft_snat() {
     local ns="$1" subnet="$2" out_if="$3" out_ip="$4"
     local rule
     if [ "$MODE" = "eim" ]; then
+        # --- EIM mode limitation (issue 88) ---
+        # Plain nftables `masquerade` is endpoint-independent mapping
+        # (EIM) across destination PORTS on a single destination address:
+        # run 1's conntrack test proved that. It is NOT reliably EIM
+        # across destination ADDRESSES: a packet capture on 2026-09-09
+        # (https://github.com/tobyjackson/mosschat/issues/88, comment
+        # 5593808634) showed house-b getting a different external port
+        # per destination address (57205 to the gate, 15798 to the peer),
+        # so a hole punch relying on the gate-observed mapping being
+        # reusable against the peer's address can never complete here.
+        # This is a property of the lab's NAT, not a bug in this script,
+        # and it is not being fixed in this harness. As a result this
+        # harness can measure relay behaviour and the fault matrix, but
+        # it cannot test hole punching or the direct-path upgrade; that
+        # is WO-1.5's job, on real machines and real routers.
         rule="ip saddr ${subnet} oifname \"${out_if}\" masquerade"
     else
         rule="ip saddr ${subnet} oifname \"${out_if}\" meta l4proto { tcp, udp } snat to ${out_ip}:1024-65535 random"
