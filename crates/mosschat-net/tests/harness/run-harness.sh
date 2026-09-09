@@ -251,7 +251,14 @@ setup_eim(){
   [ "$relay_only" -eq 1 ] && house_no_punch=" --no-punch"
   say "house-b in its own namespace, headless (log: $RUN/house-b.jsonl)"
   mkdir -p "$RUN/state-house-a" "$RUN/state-house-b"
-  sh -c "echo \$\$ > $RUN/house-b.pid; XDG_STATE_HOME=$RUN/state-house-b exec ip netns exec house-b $MOSSCHAT_BIN house --headless --gate 203.0.113.1:443 --community $COMMUNITY --identity-file $RUN/seeds/$total.seed --friends $RUN/friends.txt$house_no_punch" >"$RUN/house-b.jsonl" 2>"$RUN/house-b.stderr.log" &
+  # Seed files are named by the same %02d padding next_seed() and the
+  # minting loop above both use (01.seed, 02.seed, ...), so house-b's own
+  # tag (the last one minted, plain $total here) has to be padded the
+  # same way -- matrix() only worked by coincidence, because 14 prints
+  # identically either way; capture()'s 3 does not (found live, run 1).
+  local total_tag
+  total_tag="$(printf '%02d' "$total")"
+  sh -c "echo \$\$ > $RUN/house-b.pid; XDG_STATE_HOME=$RUN/state-house-b exec ip netns exec house-b $MOSSCHAT_BIN house --headless --gate 203.0.113.1:443 --community $COMMUNITY --identity-file $RUN/seeds/$total_tag.seed --friends $RUN/friends.txt$house_no_punch" >"$RUN/house-b.jsonl" 2>"$RUN/house-b.stderr.log" &
 
   local i
   # 50 x 0.2s = 10s, bounded.
@@ -350,7 +357,15 @@ capture(){
   local f="$OUT/${DATE_TAG}-capture-setup.txt"
   local capdir="$OUT/${DATE_TAG}-capture"
   mkdir -p "$capdir"
-  trap 'stop_tcpdumps; stop_house; stop_gatehouse' EXIT INT TERM
+  # Tears down fully on every exit path, not just the happy one: a run
+  # that fails partway through setup_eim (e.g. house-b never registers)
+  # used to only stop the two processes here and leave the five
+  # namespaces up, breaking the "self-contained" promise below and
+  # needing a manual `down` (found live, run 1). teardown.sh is
+  # idempotent, so running it from here as well as, previously, again
+  # explicitly at the end was always safe; it is now the only place this
+  # runs, so success and failure tear down exactly the same way.
+  trap 'stop_tcpdumps; stop_house; stop_gatehouse; bash "$H/teardown.sh"' EXIT INT TERM
 
   # 2 doctor seeds (only one row runs, but next_seed() takes the contract
   # from matrix() as given -- see the SEEDS/DOCTOR_SEEDS comment above)
@@ -425,12 +440,8 @@ capture(){
   grep -o '"step":"candidate_exchange"[^}]*}' "$capdir/doctor.json" 2>/dev/null
   grep -o '"step":"probe_burst"[^}]*}' "$capdir/doctor.json" 2>/dev/null
 
-  say "capture is self-contained: stopping house-b and the gatehouse and tearing down"
-  stop_house
-  stop_gatehouse
-  bash "$H/teardown.sh"
-  trap - EXIT INT TERM
-
+  say "capture is self-contained: the EXIT trap now stops house-b, the gatehouse and" \
+    "tears down"
   say "done. Results: $capdir"
   return "$doctor_rc"
 }
