@@ -1,0 +1,6 @@
+table ip nat {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 10.1.0.0/24 oifname "veth-na-out" masquerade
+	}
+}
