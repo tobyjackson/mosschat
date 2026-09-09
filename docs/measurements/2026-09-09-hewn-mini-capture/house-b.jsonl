@@ -1,0 +1,4 @@
+{"detail":"house d7ffb48c5b296e9976701efbd1f06d4df6c92b426d321bd5b0ae3cb2542a232c, gate 203.0.113.1:443, observed 203.0.113.12:57205, secondary port 444","event":"registered","peer":null,"ts_ms":1788913053058}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"c73f4883","ts_ms":1788913054311}
+{"detail":"relay through [::ffff:203.0.113.1]:443","event":"visit_open","peer":"c73f4883","ts_ms":1788913054315}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"c73f4883","ts_ms":1788913074353}
