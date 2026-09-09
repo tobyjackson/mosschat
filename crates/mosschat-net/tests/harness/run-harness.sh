@@ -299,7 +299,6 @@ setup_eim(){
   # detail (its default map happens to sort alphabetically; that changes
   # the moment a preserve_order feature or a struct field does), so this
   # greps the line as text rather than assuming a field order.
-  local MOSS_HOUSE_B
   MOSS_HOUSE_B="$(grep -m1 '"event":"registered"' "$RUN/house-b.jsonl" | grep -o 'house [0-9a-f]\{64\}' | head -1 | cut -d' ' -f2)"
   [ -n "$MOSS_HOUSE_B" ] && [ "${#MOSS_HOUSE_B}" -eq 64 ] || { echo "could not read house-b's public key off its registered line:"; cat "$RUN/house-b.jsonl"; return 1; }
   echo "house-b public key: $MOSS_HOUSE_B" | tee -a "$f"
