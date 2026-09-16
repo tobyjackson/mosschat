@@ -23,4 +23,19 @@ minicbor = { version = "2.3.0", features = ["std"] }
 # adds no new version to the tree.
 zeroize = "1.9"
 
+# WO-2.5 (D6): the encrypted store. rusqlite's `bundled-sqlcipher-vendored-openssl`
+# builds and statically links SQLCipher and OpenSSL from source, so the store needs
+# no system crypto library on the machine it runs on or builds on. Reasoning,
+# licences and the alternatives considered are in the store.rs module docs and
+# `docs/dev/store-open-questions.md`.
+rusqlite = { version = "0.40.2", features = ["bundled-sqlcipher-vendored-openssl"] }
+# The passphrase path's memory-hard derivation (decision 10). RustCrypto, MIT OR
+# Apache-2.0, both already allowed.
+argon2 = "0.5.3"
+# The single-instance guard (decision 23): an advisory lock on a lock file, taken
+# before the SQLite connection is opened. Minimal-dependency, descriptor-based,
+# cross-platform (flock on Unix, LockFileEx on Windows).
+fd-lock = "4.0.4"
+
 [dev-dependencies]
+tempfile = "3.14"
