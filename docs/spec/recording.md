@@ -518,6 +518,17 @@ and still displayed. Declining is a local choice and produces no event.
 
 **R-43.** `len(envelope_bytes) + 64 + body_len <= 131_072`.
 
+R-43 is **defence in depth and is provably implied by R-2 and R-5**; it can
+never be the sole reason an event is rejected. R-5's cap is derived from the
+envelope's *largest* possible encoding, so the worst case
+`161 + 64 + 130_847` is exactly 131_072 and any smaller envelope leaves
+slack. An implementer looking for a test case that R-43 alone rejects will
+not find one, and should not go hunting: R-5 (or R-2, for a malformed
+envelope) always fires first or instead. It is stated as its own rule anyway
+because the total is the quantity D5 actually caps, and an implementation
+that checks only `body_len` would silently stop enforcing the real limit if
+the envelope ever grew a field. Found by WO-2.4a.
+
 **R-44.** Every length prefix is checked against its cap before any
 allocation sized by it. A claimed length above its cap is refused without
 reading or reserving the claimed bytes (invariant 4).
