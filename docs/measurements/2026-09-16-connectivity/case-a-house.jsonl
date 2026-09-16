@@ -1,0 +1,4 @@
+{"detail":"house 054cdd265a4951166a7da87c4e47b9d7462fcc9a31799e44055efb818df673e6, gate 127.0.0.1:4433, observed 127.0.0.1:60378, secondary port 4434","event":"registered","peer":null,"ts_ms":1789586596097}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"abd02279","ts_ms":1789586596331}
+{"detail":"relay through [::ffff:127.0.0.1]:4433","event":"visit_open","peer":"abd02279","ts_ms":1789586596334}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"abd02279","ts_ms":1789586616360}

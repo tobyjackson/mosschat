@@ -1,0 +1,2 @@
+mosschat gatehouse: community=90c0aed6bf38c4f20b4830cdf4b67f3b3b32e4b5b648124b42d26865dfa4f715
+mosschat gatehouse: primary=127.0.0.1:4433 secondary=127.0.0.1:4434

@@ -1,0 +1,5 @@
+{"detail":"house 6f77cb0c92d924d2f35fdfc39a8f02ac12e04412f72b43481ed007ca5f45dbb6, gate 192.168.1.193:4433, observed 192.168.1.193:59343, secondary port 4434","event":"registered","peer":null,"ts_ms":1789586899900}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"0a6faeb9","ts_ms":1789586902388}
+{"detail":"relay through [::ffff:192.168.1.193]:4433","event":"visit_open","peer":"0a6faeb9","ts_ms":1789586902407}
+{"detail":"direct to 192.168.1.117:62436 at 21141 us","event":"upgraded","peer":"0a6faeb9","ts_ms":1789586902872}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"0a6faeb9","ts_ms":1789586932422}

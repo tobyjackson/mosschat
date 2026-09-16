@@ -1,0 +1,5 @@
+spike: identity c3d9075f58fd03c755a0b0fae69c3546a36ef30e1751f6d07eafea91ed29fe59
+spike: connected to 127.0.0.1:7777 handshake_time=2.68 ms
+spike: nonce_to_peer=7aa20b6ca89a82baf5e6204d8e22d4e531f1d5f493459f6b8201df08f8559522 nonce_from_peer=29c4479bddbf86c8756fde0d1ec83346ac7dde161db57d8abdb959877158f9b3
+spike: 100 pings: rtt_median=0.19 ms rtt_p95=0.22 ms
+spike: session 1131fe0c
