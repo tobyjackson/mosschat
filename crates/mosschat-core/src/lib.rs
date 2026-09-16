@@ -12,6 +12,7 @@ pub mod error;
 pub mod event;
 pub mod identity;
 pub mod store;
+pub mod view;
 
 #[cfg(test)]
 #[allow(

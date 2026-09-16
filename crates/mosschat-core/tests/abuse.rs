@@ -699,9 +699,59 @@ fn r_13_seq_collision_or_prev_mismatch_marks_visit_broken() {
 /// Expected: two events with `seq` in increasing order but `ts_ms` running
 /// backwards are both accepted and ordered by `seq`, not by `ts_ms`.
 #[test]
-#[ignore = "not implemented: R-13 (ts_ms is display-only, section 4)"]
 fn r_13b_ts_ms_running_backwards_does_not_invalidate_or_reorder() {
-    panic!("not implemented: ts_ms display-only rule, section 4");
+    use mosschat_core::view::visit_section;
+
+    let (mut recording, host) = fresh_recording();
+    let visit = {
+        let mut v = [0u8; 32];
+        v[0] = 0x01;
+        v
+    };
+    let join_id = ingest_join(
+        &mut recording,
+        visit,
+        &host,
+        host.public_bytes(),
+        vec![host.public_bytes()],
+        0,
+        [0u8; 32],
+    );
+
+    // seq 1 has a later ts_ms, seq 2 has an EARLIER ts_ms: timestamps run
+    // backwards across increasing seq.
+    let mut env1 = base_envelope(visit, host.public_bytes(), 1, join_id);
+    env1.ts_ms = 2_000_000_000_000;
+    let bytes1 = signed_bytes(
+        env1,
+        &Body::Message(Message {
+            text: "first by seq, later ts_ms".to_owned(),
+            reply_to: None,
+        }),
+        &host,
+    );
+    let id1 = recording.ingest(&bytes1, 0).expect("seq 1 accepted");
+
+    let mut env2 = base_envelope(visit, host.public_bytes(), 2, *id1.as_bytes());
+    env2.ts_ms = 1_000_000_000_000; // earlier than seq 1's ts_ms
+    let bytes2 = signed_bytes(
+        env2,
+        &Body::Message(Message {
+            text: "second by seq, earlier ts_ms".to_owned(),
+            reply_to: None,
+        }),
+        &host,
+    );
+    recording.ingest(&bytes2, 0).expect("seq 2 accepted");
+
+    // Both accepted, recording not broken.
+    assert!(!recording.is_broken());
+
+    // The view orders entries by seq, not by ts_ms: seq 1 (ts_ms 2e12) comes
+    // before seq 2 (ts_ms 1e12) in the rendered entries.
+    let section = visit_section(&recording);
+    let seqs: Vec<u64> = section.entries.iter().map(|e| e.seq()).collect();
+    assert_eq!(seqs, vec![0, 1, 2], "entries must be in seq order");
 }
 
 // --- Section 5: Bodies -------------------------------------------------
@@ -1360,9 +1410,43 @@ fn r_27_author_not_in_any_unleft_joins_devices_is_rejected() {
 /// an improvement (Dmitri's WO-2.2 must-change item 2 was resolved this way,
 /// PR #101). See also WO-2.2 scenario 2.
 #[test]
-#[ignore = "not implemented: join sole-membership-authority rule, section 5.4"]
 fn join_is_sole_membership_authority_no_device_add_backing_required() {
-    panic!("not implemented: join sole-membership-authority rule, section 5.4");
+    let (mut recording, host) = fresh_recording();
+    let visit = {
+        let mut v = [0u8; 32];
+        v[0] = 0x01;
+        v
+    };
+    let guest = AuthorKey::generate();
+    let second_device = AuthorKey::generate();
+
+    // The host lists `second_device` in `join.devices` alongside `guest`
+    // itself, but this recording has never seen (and never will see) any
+    // `device-add` proving that key belongs to `guest`'s person. Per
+    // section 5.4, a participant does not check for one, and cannot: a
+    // guest's `device-add` events live in that person's own device log
+    // (D4, WO-3.4), never in this visit's recording.
+    let join_id = ingest_join(
+        &mut recording,
+        visit,
+        &host,
+        guest.public_bytes(),
+        vec![guest.public_bytes(), second_device.public_bytes()],
+        0,
+        [0u8; 32],
+    );
+
+    let bytes = signed_bytes(
+        base_envelope(visit, second_device.public_bytes(), 1, join_id),
+        &Body::Message(Message {
+            text: "from a key never backed by a device-add".to_owned(),
+            reply_to: None,
+        }),
+        &second_device,
+    );
+    recording
+        .ingest(&bytes, 0)
+        .expect("a join-listed key is accepted with no backing device-add");
 }
 
 /// **R-32's validity window therefore does not gate the ordinary path**
@@ -2267,9 +2351,135 @@ fn r_40_drop_request_targets_must_be_authored_by_requesters_own_person() {
 /// their request" at that position, and the `drop-request` event itself
 /// remains stored and visible. See also WO-2.2 scenario 7.
 #[test]
-#[ignore = "not implemented: R-41"]
 fn r_41_honouring_drop_request_deletes_target_bytes_leaves_marker_and_keeps_request() {
-    panic!("not implemented: R-41");
+    use mosschat_core::store::{DataKey, KeyFile, Store, StoredEvent as StoreStoredEvent};
+    use mosschat_core::view::{
+        DROPPED_MARKER, ViewEntry, honour_drop_request, recording_from_store, visit_section,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("house.sqlite3");
+    let key_path = dir.path().join("house.key");
+    let key: DataKey = KeyFile::create(&key_path).expect("create key");
+    let store = Store::open(&db_path, &key).expect("open store");
+
+    let host = AuthorKey::generate();
+    let visit = {
+        let mut v = [0u8; 32];
+        v[0] = 0x02;
+        v
+    };
+    store
+        .open_visit(&visit, &host.public_bytes(), 1_000)
+        .unwrap();
+
+    let join_bytes = signed_bytes(
+        base_envelope(visit, host.public_bytes(), 0, [0u8; 32]),
+        &Body::Join(Join {
+            person: host.public_bytes(),
+            devices: vec![host.public_bytes()],
+            name: None,
+        }),
+        &host,
+    );
+    let join_signed = SignedEvent::parse(&join_bytes).unwrap();
+    store
+        .append_event(
+            &visit,
+            &StoreStoredEvent {
+                seq: 0,
+                event_id: *join_signed.event_id.as_bytes(),
+                event_bytes: join_bytes,
+            },
+        )
+        .unwrap();
+
+    let msg_bytes = signed_bytes(
+        base_envelope(
+            visit,
+            host.public_bytes(),
+            1,
+            *join_signed.event_id.as_bytes(),
+        ),
+        &Body::Message(Message {
+            text: "a message someone will ask to drop".to_owned(),
+            reply_to: None,
+        }),
+        &host,
+    );
+    let msg_signed = SignedEvent::parse(&msg_bytes).unwrap();
+    let msg_id = *msg_signed.event_id.as_bytes();
+    store
+        .append_event(
+            &visit,
+            &StoreStoredEvent {
+                seq: 1,
+                event_id: msg_id,
+                event_bytes: msg_bytes,
+            },
+        )
+        .unwrap();
+
+    let drop_bytes = signed_bytes(
+        base_envelope(visit, host.public_bytes(), 2, msg_id),
+        &Body::DropRequest(DropRequest {
+            scope: 1,
+            targets: Some(vec![msg_id]),
+            note: None,
+        }),
+        &host,
+    );
+    let drop_signed = SignedEvent::parse(&drop_bytes).unwrap();
+    let drop_id = *drop_signed.event_id.as_bytes();
+    store
+        .append_event(
+            &visit,
+            &StoreStoredEvent {
+                seq: 2,
+                event_id: drop_id,
+                event_bytes: drop_bytes,
+            },
+        )
+        .unwrap();
+
+    let mut recording =
+        recording_from_store(&store, &visit, &host.public_bytes(), 0).expect("replay");
+    let tombstoned = honour_drop_request(
+        &store,
+        &visit,
+        &mut recording,
+        mosschat_core::event::id::EventId::from_bytes(drop_id),
+    )
+    .expect("honouring succeeds");
+    assert_eq!(tombstoned, vec![1]);
+
+    // The target event's bytes are gone from the store file (kind one,
+    // R-45-style hexdump proof).
+    let file_bytes = std::fs::read(&db_path).unwrap();
+    let needle = b"a message someone will ask to drop";
+    assert!(
+        !file_bytes.windows(needle.len()).any(|w| w == needle),
+        "honoured drop-request's target bytes must be gone from the store file"
+    );
+
+    // The view shows "dropped at their request" at that position.
+    let section = visit_section(&recording);
+    let entry1 = section.entries.iter().find(|e| e.seq() == 1).unwrap();
+    match entry1 {
+        ViewEntry::Dropped { .. } => {
+            assert_eq!(entry1.dropped_marker(), Some(DROPPED_MARKER));
+        }
+        other => panic!("expected a Dropped marker at seq 1, got {other:?}"),
+    }
+
+    // The drop-request event itself remains stored and visible.
+    let row2 = store.get_event(&visit, 2).unwrap().expect("row remains");
+    assert!(
+        row2.event_bytes.is_some(),
+        "the drop-request event itself must never be deleted by honouring it (R-41)"
+    );
+    let entry2 = section.entries.iter().find(|e| e.seq() == 2).unwrap();
+    assert!(matches!(entry2, ViewEntry::Event { .. }));
 }
 
 /// **R-42.** A `drop-request` that a house declines to honour is still
@@ -2619,9 +2829,103 @@ fn r_44_oversized_length_prefix_refused_before_allocation() {
 /// scan of the store file finds none of the deleted visit's plaintext
 /// message content.
 #[test]
-#[ignore = "not implemented: R-45"]
 fn r_45_deleted_visit_absent_from_views_rows_and_store_plaintext() {
-    panic!("not implemented: R-45");
+    use mosschat_core::store::{DataKey, KeyFile, Store, StoredEvent as StoreStoredEvent};
+    use mosschat_core::view::{delete_visit_for_real, group_views, recordings_from_store};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("house.sqlite3");
+    let key_path = dir.path().join("house.key");
+    let key: DataKey = KeyFile::create(&key_path).expect("create key");
+    let mut store = Store::open(&db_path, &key).expect("open store");
+
+    let host = AuthorKey::generate();
+    let visit = {
+        let mut v = [0u8; 32];
+        v[0] = 0x03;
+        v
+    };
+    store
+        .open_visit(&visit, &host.public_bytes(), 1_000)
+        .unwrap();
+
+    let join_bytes = signed_bytes(
+        base_envelope(visit, host.public_bytes(), 0, [0u8; 32]),
+        &Body::Join(Join {
+            person: host.public_bytes(),
+            devices: vec![host.public_bytes()],
+            name: None,
+        }),
+        &host,
+    );
+    let join_signed = SignedEvent::parse(&join_bytes).unwrap();
+    store
+        .append_event(
+            &visit,
+            &StoreStoredEvent {
+                seq: 0,
+                event_id: *join_signed.event_id.as_bytes(),
+                event_bytes: join_bytes,
+            },
+        )
+        .unwrap();
+
+    let needle = b"content that must vanish for real on delete";
+    let msg_bytes = signed_bytes(
+        base_envelope(
+            visit,
+            host.public_bytes(),
+            1,
+            *join_signed.event_id.as_bytes(),
+        ),
+        &Body::Message(Message {
+            text: String::from_utf8(needle.to_vec()).unwrap(),
+            reply_to: None,
+        }),
+        &host,
+    );
+    let msg_signed = SignedEvent::parse(&msg_bytes).unwrap();
+    store
+        .append_event(
+            &visit,
+            &StoreStoredEvent {
+                seq: 1,
+                event_id: *msg_signed.event_id.as_bytes(),
+                event_bytes: msg_bytes,
+            },
+        )
+        .unwrap();
+
+    // Section present before delete.
+    let recordings_before = recordings_from_store(&store, 0).expect("replay");
+    assert!(
+        group_views(&recordings_before)
+            .iter()
+            .any(|g| g.sections.iter().any(|s| s.visit == visit))
+    );
+
+    delete_visit_for_real(&mut store, &visit).expect("delete-for-real");
+
+    // No view names the visit.
+    let recordings_after = recordings_from_store(&store, 0).expect("replay after delete");
+    assert!(
+        !group_views(&recordings_after)
+            .iter()
+            .any(|g| g.sections.iter().any(|s| s.visit == visit)),
+        "no view may name a visit deleted for real (R-45)"
+    );
+
+    // No row references it.
+    assert!(!store.list_visits().unwrap().contains(&visit));
+    assert!(store.get_event(&visit, 0).unwrap().is_none());
+    assert!(store.get_event(&visit, 1).unwrap().is_none());
+
+    // The store file contains none of its plaintext.
+    let file_bytes = std::fs::read(&db_path).unwrap();
+    assert!(
+        !file_bytes.windows(needle.len()).any(|w| w == needle),
+        "deleted visit's plaintext must be gone from the store file"
+    );
 }
 
 /// **R-46.** A private visit produces no store row of any kind. Its absence
@@ -2669,9 +2973,45 @@ fn r_46_private_visit_produces_no_store_row_at_all() {
 /// is rejected, and a private visit's events remain entirely absent from the
 /// store for the visit's whole lifetime, never partially written.
 #[test]
-#[ignore = "not implemented: R-47"]
 fn r_47_visit_privacy_fixed_at_open_never_changes_mid_visit() {
-    panic!("not implemented: R-47");
+    use mosschat_core::store::{DataKey, KeyFile, Store};
+
+    // `Store::open_visit`'s only signature: `(&self, visit_id, host,
+    // opened_ms)`. No privacy parameter exists to flip, before or after
+    // open; `open_visit` always writes `private = 0` (store.rs's own
+    // `INSERT ... VALUES (?1, ?2, NULL, 0, ?3, NULL)`), and there is no
+    // method anywhere on `Store` that takes a visit id and a privacy flag,
+    // so there is no API through which an opened (recorded) visit could be
+    // made private, or a private visit made recorded, mid-visit.
+    //
+    // This test asserts the negative the way `r_46_private_visit_produces_
+    // no_store_row_at_all` does: for a visit nobody ever opened, no row
+    // exists, at any point, and there is no operation exposed that could
+    // create one to flip that visit's privacy after the fact.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("house.sqlite3");
+    let key_path = dir.path().join("house.key");
+    let key: DataKey = KeyFile::create(&key_path).expect("create key");
+    let store = Store::open(&db_path, &key).expect("open store");
+
+    let never_opened = {
+        let mut v = [0u8; 32];
+        v[0] = 0x47;
+        v
+    };
+    assert!(!store.list_visits().unwrap().contains(&never_opened));
+    assert!(store.get_event(&never_opened, 0).unwrap().is_none());
+
+    // Opening it for real (the only way it ever gets a row) fixes privacy
+    // as "recorded" from that instant; there remains no method to un-record
+    // it back to private short of `delete_visit`, which is kind one
+    // (R-45), a documented and different operation, not a privacy flip.
+    let host = [9u8; 32];
+    store.open_visit(&never_opened, &host, 1_000).unwrap();
+    assert!(store.list_visits().unwrap().contains(&never_opened));
+    // Still no operation exists to make it private again mid-visit; only
+    // `delete_visit` removes its row, and that is R-45's own rule, not a
+    // privacy toggle.
 }
 
 // --- Section 8: Views ----------------------------------------------------
@@ -2685,9 +3025,74 @@ fn r_47_visit_privacy_fixed_at_open_never_changes_mid_visit() {
 /// order B (or ingested in a different arrival order but reaching the same
 /// stored `seq` order), produces byte-identical views.
 #[test]
-#[ignore = "not implemented: R-48"]
 fn r_48_view_is_pure_function_of_recordings_independent_of_read_order() {
-    panic!("not implemented: R-48");
+    use mosschat_core::view::{contact_view, group_views};
+
+    let host = AuthorKey::generate();
+    let guest_a = AuthorKey::generate();
+    let guest_b = AuthorKey::generate();
+
+    let visit1 = {
+        let mut v = [0u8; 32];
+        v[0] = 0x48;
+        v
+    };
+    let visit2 = {
+        let mut v = [0u8; 32];
+        v[0] = 0x49;
+        v
+    };
+
+    // Build two independent visits, each with several participants and
+    // messages, through Recording::ingest directly.
+    let build = |visit: [u8; 32], guest: &AuthorKey| -> Recording {
+        let mut recording = Recording::new(visit, host.public_bytes()).expect("open");
+        let host_join = signed_bytes(
+            base_envelope(visit, host.public_bytes(), 0, [0u8; 32]),
+            &Body::Join(Join {
+                person: host.public_bytes(),
+                devices: vec![host.public_bytes()],
+                name: None,
+            }),
+            &host,
+        );
+        let mut prev = recording.ingest(&host_join, 0).unwrap();
+        let guest_join = signed_bytes(
+            base_envelope(visit, host.public_bytes(), 1, *prev.as_bytes()),
+            &Body::Join(Join {
+                person: guest.public_bytes(),
+                devices: vec![guest.public_bytes()],
+                name: None,
+            }),
+            &host,
+        );
+        prev = recording.ingest(&guest_join, 0).unwrap();
+        for i in 0..5u64 {
+            let bytes = signed_bytes(
+                base_envelope(visit, guest.public_bytes(), 2 + i, *prev.as_bytes()),
+                &Body::Message(Message {
+                    text: format!("m{i}"),
+                    reply_to: None,
+                }),
+                guest,
+            );
+            prev = recording.ingest(&bytes, 0).unwrap();
+        }
+        recording
+    };
+
+    let rec1 = build(visit1, &guest_a);
+    let rec2 = build(visit2, &guest_b);
+
+    let order_a = vec![rec1.clone(), rec2.clone()];
+    let order_b = vec![rec2, rec1];
+
+    assert_eq!(
+        contact_view(&order_a, &host.public_bytes()),
+        contact_view(&order_b, &host.public_bytes()),
+        "R-48: view must not depend on the order recordings are supplied in"
+    );
+    assert_eq!(group_views(&order_a), group_views(&order_b));
 }
 
 /// **R-49.** A private visit appears in no view (R-46). A visit deleted for
@@ -2700,9 +3105,167 @@ fn r_48_view_is_pure_function_of_recordings_independent_of_read_order() {
 /// simply omitting the row (a gap would look like data loss, not an
 /// intentional drop).
 #[test]
-#[ignore = "not implemented: R-49"]
 fn r_49_view_shows_drop_marker_not_gap_and_omits_private_and_deleted() {
-    panic!("not implemented: R-49");
+    use mosschat_core::event::id::EventId;
+    use mosschat_core::store::{DataKey, KeyFile, Store, StoredEvent as StoreStoredEvent};
+    use mosschat_core::view::{
+        ViewEntry, delete_visit_for_real, group_views, honour_drop_request, recording_from_store,
+        recordings_from_store, visit_section,
+    };
+
+    // Part 1: private and deleted visits are absent from every view.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("house.sqlite3");
+    let key_path = dir.path().join("house.key");
+    let key: DataKey = KeyFile::create(&key_path).expect("create key");
+    let mut store = Store::open(&db_path, &key).expect("open store");
+
+    let host = AuthorKey::generate();
+    let private_visit = {
+        let mut v = [0u8; 32];
+        v[0] = 0x50;
+        v
+    };
+    // Never opened: this IS the private visit (R-46's own absence rule).
+    let deleted_visit = {
+        let mut v = [0u8; 32];
+        v[0] = 0x51;
+        v
+    };
+    store
+        .open_visit(&deleted_visit, &host.public_bytes(), 1_000)
+        .unwrap();
+    let join_bytes = signed_bytes(
+        base_envelope(deleted_visit, host.public_bytes(), 0, [0u8; 32]),
+        &Body::Join(Join {
+            person: host.public_bytes(),
+            devices: vec![host.public_bytes()],
+            name: None,
+        }),
+        &host,
+    );
+    let join_signed = SignedEvent::parse(&join_bytes).unwrap();
+    store
+        .append_event(
+            &deleted_visit,
+            &StoreStoredEvent {
+                seq: 0,
+                event_id: *join_signed.event_id.as_bytes(),
+                event_bytes: join_bytes,
+            },
+        )
+        .unwrap();
+    delete_visit_for_real(&mut store, &deleted_visit).expect("delete-for-real");
+
+    let recordings = recordings_from_store(&store, 0).expect("replay");
+    let groups = group_views(&recordings);
+    assert!(
+        !groups
+            .iter()
+            .any(|g| g.sections.iter().any(|s| s.visit == private_visit)),
+        "a private visit (never opened) must appear in no view"
+    );
+    assert!(
+        !groups
+            .iter()
+            .any(|g| g.sections.iter().any(|s| s.visit == deleted_visit)),
+        "a visit deleted for real must appear in no view"
+    );
+
+    // Part 2: an honoured drop-request leaves a marker, not a gap.
+    let visit3 = {
+        let mut v = [0u8; 32];
+        v[0] = 0x52;
+        v
+    };
+    store
+        .open_visit(&visit3, &host.public_bytes(), 1_000)
+        .unwrap();
+    let join3 = signed_bytes(
+        base_envelope(visit3, host.public_bytes(), 0, [0u8; 32]),
+        &Body::Join(Join {
+            person: host.public_bytes(),
+            devices: vec![host.public_bytes()],
+            name: None,
+        }),
+        &host,
+    );
+    let join3_signed = SignedEvent::parse(&join3).unwrap();
+    store
+        .append_event(
+            &visit3,
+            &StoreStoredEvent {
+                seq: 0,
+                event_id: *join3_signed.event_id.as_bytes(),
+                event_bytes: join3,
+            },
+        )
+        .unwrap();
+    let msg3 = signed_bytes(
+        base_envelope(
+            visit3,
+            host.public_bytes(),
+            1,
+            *join3_signed.event_id.as_bytes(),
+        ),
+        &Body::Message(Message {
+            text: "will be dropped".to_owned(),
+            reply_to: None,
+        }),
+        &host,
+    );
+    let msg3_signed = SignedEvent::parse(&msg3).unwrap();
+    let msg3_id = *msg3_signed.event_id.as_bytes();
+    store
+        .append_event(
+            &visit3,
+            &StoreStoredEvent {
+                seq: 1,
+                event_id: msg3_id,
+                event_bytes: msg3,
+            },
+        )
+        .unwrap();
+    let drop3 = signed_bytes(
+        base_envelope(visit3, host.public_bytes(), 2, msg3_id),
+        &Body::DropRequest(DropRequest {
+            scope: 1,
+            targets: Some(vec![msg3_id]),
+            note: None,
+        }),
+        &host,
+    );
+    let drop3_signed = SignedEvent::parse(&drop3).unwrap();
+    let drop3_id = *drop3_signed.event_id.as_bytes();
+    store
+        .append_event(
+            &visit3,
+            &StoreStoredEvent {
+                seq: 2,
+                event_id: drop3_id,
+                event_bytes: drop3,
+            },
+        )
+        .unwrap();
+
+    let mut recording3 = recording_from_store(&store, &visit3, &host.public_bytes(), 0).unwrap();
+    honour_drop_request(
+        &store,
+        &visit3,
+        &mut recording3,
+        EventId::from_bytes(drop3_id),
+    )
+    .expect("honour succeeds");
+
+    let section = visit_section(&recording3);
+    let seqs: Vec<u64> = section.entries.iter().map(|e| e.seq()).collect();
+    assert_eq!(
+        seqs,
+        vec![0, 1, 2],
+        "the dropped seq must still occupy a position (a marker), not be missing (a gap)"
+    );
+    let entry1 = section.entries.iter().find(|e| e.seq() == 1).unwrap();
+    assert!(matches!(entry1, ViewEntry::Dropped { .. }));
 }
 
 // --- Section 9: No rule merges two people's recordings ----------------------
@@ -2721,9 +3284,137 @@ fn r_49_view_shows_drop_marker_not_gap_and_omits_private_and_deleted() {
 /// live session, which a test can distinguish by asserting no store-level
 /// read of another participant's on-disk recording ever occurs.
 #[test]
-#[ignore = "not implemented: section 9, no-merge invariant"]
 fn section9_no_rule_reads_another_participants_recording_to_fill_a_gap() {
-    panic!("not implemented: section 9 no-merge invariant");
+    use mosschat_core::view::{contact_view, group_views, visit_section};
+
+    // Two independent recordings of the SAME visit: one complete, one with
+    // a gap (missing seq 2, a message; guest B's recording never received
+    // it). No public function in `mosschat_core::event` or
+    // `mosschat_core::view` takes two `Recording`s of one visit and
+    // reconciles them: `Recording::ingest` operates on `&mut self` alone
+    // (no second recording parameter exists anywhere in its signature or
+    // any other public API this crate exposes), and every view function
+    // (`visit_section`, `contact_view`, `group_views`) renders each
+    // `Recording` it is given independently — passing the SAME visit
+    // twice, as here, just produces two independent sections, never one
+    // merged section.
+    let visit = {
+        let mut v = [0u8; 32];
+        v[0] = 0x53;
+        v
+    };
+    let host = AuthorKey::generate();
+    let guest_full = AuthorKey::generate();
+
+    let mut complete = Recording::new(visit, host.public_bytes()).expect("open");
+    let host_join = signed_bytes(
+        base_envelope(visit, host.public_bytes(), 0, [0u8; 32]),
+        &Body::Join(Join {
+            person: host.public_bytes(),
+            devices: vec![host.public_bytes()],
+            name: None,
+        }),
+        &host,
+    );
+    let mut prev = complete.ingest(&host_join, 0).unwrap();
+    let guest_join = signed_bytes(
+        base_envelope(visit, host.public_bytes(), 1, *prev.as_bytes()),
+        &Body::Join(Join {
+            person: guest_full.public_bytes(),
+            devices: vec![guest_full.public_bytes()],
+            name: None,
+        }),
+        &host,
+    );
+    prev = complete.ingest(&guest_join, 0).unwrap();
+    let msg_at_2 = signed_bytes(
+        base_envelope(visit, guest_full.public_bytes(), 2, *prev.as_bytes()),
+        &Body::Message(Message {
+            text: "seq 2, missing from the gapped recording".to_owned(),
+            reply_to: None,
+        }),
+        &guest_full,
+    );
+    let id2 = complete.ingest(&msg_at_2, 0).unwrap();
+    let msg_at_3 = signed_bytes(
+        base_envelope(visit, guest_full.public_bytes(), 3, *id2.as_bytes()),
+        &Body::Message(Message {
+            text: "seq 3".to_owned(),
+            reply_to: None,
+        }),
+        &guest_full,
+    );
+    complete.ingest(&msg_at_3, 0).unwrap();
+
+    // A second, independent recording of the same visit that never received
+    // seq 2 or seq 3 (a guest whose connection dropped, holding only a
+    // shorter prefix per section 9's "same events, same order... never a
+    // different one" — here modelled simply as fewer received events, not
+    // as this recording running any reconciliation).
+    let mut gapped = Recording::new(visit, host.public_bytes()).expect("open");
+    gapped.ingest(&host_join, 0).unwrap();
+    gapped.ingest(&guest_join, 0).unwrap();
+
+    // No API accepts two Recordings of the same visit for reconciliation:
+    // rendering each independently never fills the gap.
+    let gapped_section = visit_section(&gapped);
+    assert_eq!(
+        gapped_section.entries.iter().map(|e| e.seq()).max(),
+        Some(1),
+        "the gapped recording's view must not gain seq 2/3 from the complete one"
+    );
+    let complete_section = visit_section(&complete);
+    assert_eq!(
+        complete_section.entries.iter().map(|e| e.seq()).max(),
+        Some(3)
+    );
+
+    // Handing both recordings to a view function together still produces
+    // two independent (not merged) results: group_views groups by
+    // participant set, and both recordings currently have the same set
+    // {host, guest_full}, so both sections show up — as SEPARATE sections
+    // of the visit's own state at the time each recording last ingested,
+    // never combined into one longer entries list.
+    let recordings = vec![gapped.clone(), complete.clone()];
+    let groups = group_views(&recordings);
+    let group = groups
+        .iter()
+        .find(|g| g.sections.iter().any(|s| s.visit == visit))
+        .expect("a group exists for this visit");
+    let sections_for_visit: Vec<_> = group.sections.iter().filter(|s| s.visit == visit).collect();
+    assert_eq!(
+        sections_for_visit.len(),
+        2,
+        "two independent recordings of one visit render as two independent sections, never one merged section"
+    );
+    let max_seqs: Vec<Option<u64>> = sections_for_visit
+        .iter()
+        .map(|s| s.entries.iter().map(|e| e.seq()).max())
+        .collect();
+    assert!(
+        max_seqs.contains(&Some(1)) && max_seqs.contains(&Some(3)),
+        "neither section borrowed entries from the other"
+    );
+
+    // Contact view: same story, no merge.
+    let contact = contact_view(&recordings, &host.public_bytes());
+    assert_eq!(contact.sections.len(), 2);
+
+    // The distinguishing test the spec names (decision 34, invariant 7): a
+    // host replaying its OWN sequence into a rejoining guest's recording IS
+    // accepted, because that is delivering events the host already holds
+    // and authored the order for, through the guest's own `ingest` call —
+    // not a read of another participant's stored recording. Modelled here
+    // as the gapped recording (the "rejoining guest") ingesting the host's
+    // own already-held events for the seqs it is missing, through the same
+    // public `Recording::ingest` path any live event arrives through.
+    gapped
+        .ingest(&msg_at_2, 0)
+        .expect("the host's own held sequence, delivered to a rejoining guest, is accepted");
+    gapped
+        .ingest(&msg_at_3, 0)
+        .expect("continuing the host's own sequence is accepted");
+    assert_eq!(visit_section(&gapped).entries.len(), 4);
 }
 
 // ===========================================================================
@@ -3591,9 +4282,90 @@ fn wo22_s1_stolen_unlocked_machine_local_socket_still_grants_full_house() {
 /// stale-host visit, and separately that a later `device-add` re-adding K
 /// once the revocation is known (R-37) IS rejected.
 #[test]
-#[ignore = "not implemented: WO-2.2 scenario 2 (revocation never reaches a friend)"]
 fn wo22_s2_stale_host_joins_revoked_key_events_accepted_in_that_visit() {
-    panic!("not implemented: WO-2.2 scenario 2, revocation never reaches a friend");
+    // A stale host never learned that guest's key K was revoked elsewhere.
+    // It opens a new visit and lists K in a `join` anyway.
+    let (mut recording, host) = fresh_recording();
+    let visit = {
+        let mut v = [0u8; 32];
+        v[0] = 0x01;
+        v
+    };
+    let k = AuthorKey::generate(); // "K", the person's revoked-elsewhere key
+
+    // K is this person's identity key (R-26 requires `join.devices` to
+    // contain `person`); the revocation this stale host never learned of
+    // happened on some OTHER visit's recording, which this visit's `join`
+    // has no way to know about.
+    let join_id = ingest_join(
+        &mut recording,
+        visit,
+        &host,
+        k.public_bytes(),
+        vec![k.public_bytes()],
+        0,
+        [0u8; 32],
+    );
+
+    // K's events in THIS visit are accepted, despite being revoked
+    // elsewhere: this recording has no knowledge of that revocation, and
+    // join is the sole membership authority (section 5.4).
+    let msg = signed_bytes(
+        base_envelope(visit, k.public_bytes(), 1, join_id),
+        &Body::Message(Message {
+            text: "from K, revoked elsewhere but admitted here".to_owned(),
+            reply_to: None,
+        }),
+        &k,
+    );
+    let msg_id = recording
+        .ingest(&msg, 0)
+        .expect("K's events are accepted in the stale host's visit");
+
+    // Separately: once THIS recording sees a revocation of K (a
+    // device-revoke authored by a device of K's own person, other than K
+    // itself), a LATER device-add re-adding K is rejected by R-37.
+    let other_device = AuthorKey::generate();
+    let add_other = signed_bytes(
+        base_envelope(visit, k.public_bytes(), 2, *msg_id.as_bytes()),
+        &Body::DeviceAdd(DeviceAdd {
+            device: other_device.public_bytes(),
+            not_before_ms: 0,
+            not_after_ms: 1_000_000_000_000,
+            label: None,
+        }),
+        &k,
+    );
+    let add_id = recording
+        .ingest(&add_other, 0)
+        .expect("K adds a second device before any revocation is known");
+
+    let revoke = signed_bytes(
+        base_envelope(visit, other_device.public_bytes(), 3, *add_id.as_bytes()),
+        &Body::DeviceRevoke(DeviceRevoke {
+            device: k.public_bytes(),
+            at_ms: 5_000_000_000,
+        }),
+        &other_device,
+    );
+    let revoke_id = recording
+        .ingest(&revoke, 0)
+        .expect("a device of K's own person revokes K");
+
+    let readd_k = signed_bytes(
+        base_envelope(visit, other_device.public_bytes(), 4, *revoke_id.as_bytes()),
+        &Body::DeviceAdd(DeviceAdd {
+            device: k.public_bytes(),
+            not_before_ms: 0,
+            not_after_ms: 1_000_000_000_000,
+            label: None,
+        }),
+        &other_device,
+    );
+    assert!(matches!(
+        recording.ingest(&readd_k, 0),
+        Err(IngestError::DeviceAddOfRevokedKey)
+    ));
 }
 
 /// WO-2.2 scenario 3: host lies about the order (cross-guest host
@@ -3611,9 +4383,80 @@ fn wo22_s2_stale_host_joins_revoked_key_events_accepted_in_that_visit() {
 /// recording remains internally consistent (R-13 passes within each), and
 /// no cross-recording comparison API exists to catch the divergence.
 #[test]
-#[ignore = "not implemented: WO-2.2 scenario 3 (host lies about the order, accepted risk)"]
 fn wo22_s3_cross_guest_host_equivocation_undetectable_by_design() {
-    panic!("not implemented: WO-2.2 scenario 3, host lies about the order");
+    // Two guests of one visit, each holding their own recording. A
+    // (hypothetically malicious) host gives guest 1 one order for seq 1 and
+    // guest 2 a DIFFERENT event at seq 1. Each guest's own recording is
+    // internally consistent (R-13 passes within each): the divergence is
+    // only visible by comparing the two, and section 9 forbids any rule
+    // from reading another participant's recording to do that.
+    let visit = {
+        let mut v = [0u8; 32];
+        v[0] = 0x55;
+        v
+    };
+    let host = AuthorKey::generate();
+    let guest = AuthorKey::generate();
+
+    let join_bytes = signed_bytes(
+        base_envelope(visit, host.public_bytes(), 0, [0u8; 32]),
+        &Body::Join(Join {
+            person: guest.public_bytes(),
+            devices: vec![guest.public_bytes()],
+            name: None,
+        }),
+        &host,
+    );
+
+    let mut recording1 = Recording::new(visit, host.public_bytes()).expect("open");
+    let join_id1 = recording1.ingest(&join_bytes, 0).expect("join accepted");
+    let mut recording2 = Recording::new(visit, host.public_bytes()).expect("open");
+    let join_id2 = recording2.ingest(&join_bytes, 0).expect("join accepted");
+    assert_eq!(join_id1, join_id2);
+
+    // Host equivocates: two different events at seq 1, one told to each
+    // guest.
+    let event_for_guest1 = signed_bytes(
+        base_envelope(visit, guest.public_bytes(), 1, *join_id1.as_bytes()),
+        &Body::Message(Message {
+            text: "what the host told guest 1".to_owned(),
+            reply_to: None,
+        }),
+        &guest,
+    );
+    let event_for_guest2 = signed_bytes(
+        base_envelope(visit, guest.public_bytes(), 1, *join_id2.as_bytes()),
+        &Body::Message(Message {
+            text: "a DIFFERENT event the host told guest 2".to_owned(),
+            reply_to: None,
+        }),
+        &guest,
+    );
+
+    recording1
+        .ingest(&event_for_guest1, 0)
+        .expect("guest 1's own recording accepts its own event, R-13 passes within it");
+    recording2
+        .ingest(&event_for_guest2, 0)
+        .expect("guest 2's own recording accepts its own event, R-13 passes within it");
+
+    // Neither recording is marked broken: within each recording alone,
+    // nothing is inconsistent.
+    assert!(!recording1.is_broken());
+    assert!(!recording2.is_broken());
+
+    // No cross-recording comparison API exists: `Recording::ingest` and
+    // every other public method on `Recording` take `&mut self` (or `&self`)
+    // alone, never a second `Recording`, so there is no call this test (or
+    // any caller) could make to detect the divergence between recording1
+    // and recording2. The divergence is real (their seq-1 event_ids
+    // differ) and undetectable by design, exactly as section 9 states.
+    let id1 = recording1.get(1).expect("seq 1 held").event.event_id;
+    let id2 = recording2.get(1).expect("seq 1 held").event.event_id;
+    assert_ne!(
+        id1, id2,
+        "the two guests' recordings have genuinely diverged at seq 1"
+    );
 }
 
 /// WO-2.2 scenario 4: hostile client at the door. `visit.events`'s `limit`
@@ -3648,10 +4491,93 @@ fn wo22_s4_max_size_events_at_high_limit_truncate_by_bytes_not_items() {
 /// the door's `event` kind with `readable: false` and `body: {"raw":
 /// <bytes>}`, never dropped and never causing a protocol-level error at
 /// either the recording or door layer.
+/// The recording half only: an unassigned body type (here, `9`, a
+/// hypothetical version-two type — `1..=8` are the only assigned values,
+/// section 5's table) is accepted, stored unchanged, `event_id` unaffected,
+/// and surfaced through the view as an unreadable/raw entry
+/// ([`mosschat_core::view::RenderedBody::Unreadable`]).
+///
+/// The door half (`readable: false` + `{"raw": ...}` framing, `door.md`
+/// section 7) is NOT in scope here: WO-2.x (door) owns it. This test
+/// asserts only what exists below the door: R-14's carry-whole behaviour at
+/// the recording layer and this module's own `Unreadable` rendering.
 #[test]
-#[ignore = "not implemented: WO-2.2 scenario 5 (body type added in version two)"]
 fn wo22_s5_v2_only_body_type_carried_and_surfaced_as_unreadable_raw() {
-    panic!("not implemented: WO-2.2 scenario 5, body type added in version two");
+    use mosschat_core::view::{RenderedBody, ViewEntry, visit_section};
+
+    let (mut recording, host) = fresh_recording();
+    let visit = {
+        let mut v = [0u8; 32];
+        v[0] = 0x01;
+        v
+    };
+    let join_id = ingest_join(
+        &mut recording,
+        visit,
+        &host,
+        host.public_bytes(),
+        vec![host.public_bytes()],
+        0,
+        [0u8; 32],
+    );
+
+    // Hand-build a body with an unassigned type value 9.
+    let mut raw = Vec::new();
+    {
+        let mut enc = Encoder::new(&mut raw);
+        enc.map(2).unwrap();
+        enc.u8(0).unwrap();
+        enc.u64(9).unwrap();
+        enc.u8(1).unwrap();
+        enc.str("a version-two-only field").unwrap();
+    }
+    let mut envelope = base_envelope(visit, host.public_bytes(), 1, join_id);
+    envelope.body_hash = *blake3::hash(&raw).as_bytes();
+    envelope.body_len = raw.len() as u32;
+    let envelope_bytes = envelope.to_cbor();
+    let signing_input = {
+        let mut v = Vec::new();
+        v.extend_from_slice(mosschat_core::event::signed::SIGNING_PREFIX);
+        v.extend_from_slice(&envelope_bytes);
+        v
+    };
+    let sig = host.sign(&signing_input);
+    let mut event_bytes = Vec::new();
+    event_bytes.extend_from_slice(&envelope_bytes);
+    event_bytes.extend_from_slice(&sig);
+    event_bytes.extend_from_slice(&raw);
+
+    let expected_event_id = mosschat_core::event::id::EventId::of_envelope(&envelope_bytes);
+    let accepted_id = recording
+        .ingest(&event_bytes, 0)
+        .expect("an unassigned body type is accepted, not dropped (R-14)");
+    assert_eq!(
+        accepted_id, expected_event_id,
+        "event_id is unaffected by carrying an unknown body (R-8)"
+    );
+
+    // Stored unchanged: re-fetching it and re-serialising reproduces the
+    // exact bytes offered.
+    let stored = recording.get(1).expect("stored at seq 1");
+    assert_eq!(stored.event.body_bytes, raw);
+    assert_eq!(stored.event.to_bytes(), event_bytes);
+
+    // Surfaced through the view as an unreadable/raw entry.
+    let section = visit_section(&recording);
+    let entry = section.entries.iter().find(|e| e.seq() == 1).unwrap();
+    match entry {
+        ViewEntry::Event { body, .. } => match body {
+            RenderedBody::Unreadable { type_value, raw: r } => {
+                assert_eq!(*type_value, 9);
+                assert_eq!(r, &raw);
+            }
+            RenderedBody::Readable(_) => panic!("expected Unreadable for an unassigned type"),
+        },
+        other => panic!("expected a live Event entry, got {other:?}"),
+    }
+
+    // The door's `readable: false` framing is WO-2.x's own concern and is
+    // deliberately not asserted here.
 }
 
 /// WO-2.2 scenario 6: visit deleted while a guest is still writing. Without
@@ -3692,7 +4618,125 @@ fn wo22_s6_delete_live_visit_closes_first_in_flight_event_then_refused() {
 /// still holds the original event — i.e. ingest outcome is identical
 /// between the two houses for every event after the drop.
 #[test]
-#[ignore = "not implemented: WO-2.2 scenario 7 (honouring a drop-request breaks the chain)"]
 fn wo22_s7_honoured_drop_request_chain_and_reply_target_ingest_matches_declining_house() {
-    panic!("not implemented: WO-2.2 scenario 7, honouring a drop-request breaks the chain");
+    // Two houses hold identical recordings up to and including a
+    // drop-request at seq = 3, requested by its own author, targeting the
+    // event at seq = 2 (N-1 relative to the drop-request). House A honours
+    // it (tombstones seq 2); house B declines (keeps the original event).
+    let visit = {
+        let mut v = [0u8; 32];
+        v[0] = 0x57;
+        v
+    };
+    let host = AuthorKey::generate();
+
+    let mut honouring = Recording::new(visit, host.public_bytes()).expect("open");
+    let mut declining = Recording::new(visit, host.public_bytes()).expect("open");
+
+    let join_bytes = signed_bytes(
+        base_envelope(visit, host.public_bytes(), 0, [0u8; 32]),
+        &Body::Join(Join {
+            person: host.public_bytes(),
+            devices: vec![host.public_bytes()],
+            name: None,
+        }),
+        &host,
+    );
+    let join_id = honouring.ingest(&join_bytes, 0).unwrap();
+    declining.ingest(&join_bytes, 0).unwrap();
+
+    let before_bytes = signed_bytes(
+        base_envelope(visit, host.public_bytes(), 1, *join_id.as_bytes()),
+        &Body::Message(Message {
+            text: "seq 1, before the drop target".to_owned(),
+            reply_to: None,
+        }),
+        &host,
+    );
+    let before_id = honouring.ingest(&before_bytes, 0).unwrap();
+    declining.ingest(&before_bytes, 0).unwrap();
+
+    let target_bytes = signed_bytes(
+        base_envelope(visit, host.public_bytes(), 2, *before_id.as_bytes()),
+        &Body::Message(Message {
+            text: "seq 2, the event that will be dropped".to_owned(),
+            reply_to: None,
+        }),
+        &host,
+    );
+    let target_id = honouring.ingest(&target_bytes, 0).unwrap();
+    declining.ingest(&target_bytes, 0).unwrap();
+
+    let drop_bytes = signed_bytes(
+        base_envelope(visit, host.public_bytes(), 3, *target_id.as_bytes()),
+        &Body::DropRequest(DropRequest {
+            scope: 1,
+            targets: Some(vec![*target_id.as_bytes()]),
+            note: None,
+        }),
+        &host,
+    );
+    let drop_id = honouring.ingest(&drop_bytes, 0).unwrap();
+    declining.ingest(&drop_bytes, 0).unwrap();
+
+    // House A honours; house B declines (does nothing further).
+    honouring
+        .honour_drop_request(drop_id)
+        .expect("honouring succeeds");
+    assert!(!honouring.is_broken());
+
+    // (a) A later event whose `prev` matches the tombstone's event_id
+    // (which equals the original seq-2 event's event_id, R-50) is accepted
+    // on the honouring house, matching the declining house's own
+    // still-original-event chain, and neither house is marked broken.
+    let after_bytes = signed_bytes(
+        base_envelope(visit, host.public_bytes(), 4, *drop_id.as_bytes()),
+        &Body::Message(Message {
+            text: "after the drop, chain must still match".to_owned(),
+            reply_to: None,
+        }),
+        &host,
+    );
+    let after_id_honouring = honouring
+        .ingest(&after_bytes, 0)
+        .expect("prev matches the drop-request's event_id, chain not broken");
+    let after_id_declining = declining
+        .ingest(&after_bytes, 0)
+        .expect("prev matches the drop-request's event_id on the declining house too");
+    assert!(!honouring.is_broken());
+    assert!(!declining.is_broken());
+    assert_eq!(after_id_honouring, after_id_declining);
+
+    // (b) A reply_to naming the tombstoned event is accepted on both,
+    // identically.
+    let reply_bytes = signed_bytes(
+        base_envelope(
+            visit,
+            host.public_bytes(),
+            5,
+            *after_id_honouring.as_bytes(),
+        ),
+        &Body::Message(Message {
+            text: "replying to the dropped event".to_owned(),
+            reply_to: Some(*target_id.as_bytes()),
+        }),
+        &host,
+    );
+    let reply_result_honouring = honouring.ingest(&reply_bytes, 0);
+    let reply_result_declining = declining.ingest(&reply_bytes, 0);
+    assert!(
+        reply_result_honouring.is_ok(),
+        "a reply to a tombstoned event is accepted on the honouring house (R-18)"
+    );
+    assert!(
+        reply_result_declining.is_ok(),
+        "a reply to the still-held original is accepted on the declining house"
+    );
+    assert_eq!(
+        reply_result_honouring.unwrap(),
+        reply_result_declining.unwrap(),
+        "ingest outcome is identical between the two houses for every event after the drop"
+    );
+    assert!(!honouring.is_broken());
+    assert!(!declining.is_broken());
 }

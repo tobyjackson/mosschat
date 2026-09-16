@@ -269,6 +269,42 @@ impl Recording {
         self.broken
     }
 
+    /// This recording's visit id (section 3).
+    #[must_use]
+    pub fn visit(&self) -> &[u8; 32] {
+        &self.visit
+    }
+
+    /// This recording's host device key (section 4).
+    #[must_use]
+    pub fn host(&self) -> &[u8; 32] {
+        &self.host
+    }
+
+    /// Every person's identity key (`join.person`) ever seen in this
+    /// recording, sorted ascending and deduplicated (WO-2.4b's view layer,
+    /// section 8: a contact's identity is their identity key, so a person
+    /// who added a device still has one page).
+    #[must_use]
+    pub fn participant_keys(&self) -> Vec<[u8; 32]> {
+        let mut keys: Vec<[u8; 32]> = self.participants.keys().copied().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    /// The inclusive `(min, max)` range of `seq` values this recording holds
+    /// a slot (event or tombstone) for, or `None` if it holds none yet.
+    /// WO-2.4b's view layer walks this range with [`Self::get`] and
+    /// [`Self::tombstone_at`] to replay a recording in `seq` order (R-48);
+    /// exposed instead of a public `Slot` type, which stays private.
+    #[must_use]
+    pub fn seq_range(&self) -> Option<(u64, u64)> {
+        let min = self.slots.keys().min().copied()?;
+        let max = self.slots.keys().max().copied()?;
+        Some((min, max))
+    }
+
     /// Returns the event stored at `seq`, if any (not a tombstone).
     #[must_use]
     pub fn get(&self, seq: u64) -> Option<&StoredEvent> {
@@ -714,6 +750,27 @@ impl Recording {
             }
         }
         Ok(count)
+    }
+
+    /// Inserts a [`Tombstone`] directly at `seq`, carrying only `seq` and
+    /// `event_id` (R-50).
+    ///
+    /// This exists for WO-2.4b's store replay path: a tombstoned row has no
+    /// bytes to re-ingest through [`Self::ingest`] (a tombstone is not a
+    /// signed, verifiable event), so a caller rebuilding a [`Recording`] from
+    /// stored rows reconstructs the tombstone slot directly from the store's
+    /// own `(seq, event_id)` pair instead. Kept honest by the type: a
+    /// [`Tombstone`] has no field beyond `seq` and `event_id`, so this method
+    /// cannot be used to smuggle an author, timestamp or body into a slot
+    /// that must not carry one.
+    ///
+    /// Overwrites whatever slot (event or tombstone) `seq` currently holds,
+    /// which mirrors [`Self::ingest`]'s own R-13 same-`seq` handling: this is
+    /// a replay primitive over rows the store already validated once, not a
+    /// second validity check.
+    pub fn insert_tombstone(&mut self, seq: u64, event_id: EventId) {
+        self.slots
+            .insert(seq, Slot::Tombstone(Tombstone { seq, event_id }));
     }
 }
 

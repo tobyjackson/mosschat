@@ -1,0 +1,8 @@
+    Finished `release` profile [optimized] target(s) in 0.13s
+     Running `target/release/examples/view_100k`
+=== view_100k: 100000 messages ===
+write (100k append_event calls):   45.553090541s
+replay (bulk read + re-ingest):     4.736470833s
+view compute (visit_section):       14.474083ms
+TOTAL view path (replay + compute): 4.750944916s
+view path under 2s gate: NO
