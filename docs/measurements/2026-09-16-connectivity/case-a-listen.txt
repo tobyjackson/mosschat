@@ -1,0 +1,6 @@
+spike: identity 764425560ea325b503bfd8c26a817b7743d193f14265a74844762bd6e10a3b6d
+spike: bound on 127.0.0.1:7777, advertising 127.0.0.1:7777
+spike: --expect not given; accepting a client certificate presenting any key
+spike: ticket: moss1OZCCKVQOUMS3KA573DBGVAL3O5B5DE7RIJS2OSCEOYV5NYIKHNWQI7YAAAAR4YI
+spike: accepted connection from 127.0.0.1:64717 in 1.68 ms
+spike: nonce_from_peer=7aa20b6ca89a82baf5e6204d8e22d4e531f1d5f493459f6b8201df08f8559522 nonce_to_peer=29c4479bddbf86c8756fde0d1ec83346ac7dde161db57d8abdb959877158f9b3

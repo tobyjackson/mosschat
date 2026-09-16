@@ -1,0 +1,5 @@
+spike: identity 1ae7ea3c2f86a9131a5c927e66182d3156cc88ea8ada2d077ae5da219383b523
+spike: connected to 192.168.1.193:7777 handshake_time=3.25 ms
+spike: nonce_to_peer=1d7516b032836d810480962c66567adb02793977448bfe428ea25f41bf7f9d9a nonce_from_peer=67ffa57eb6e446335fcd91888450cc3fbaad892f61bccf7024375531c6473967
+spike: 100 pings: rtt_median=0.41 ms rtt_p95=0.62 ms
+spike: session 4de68950

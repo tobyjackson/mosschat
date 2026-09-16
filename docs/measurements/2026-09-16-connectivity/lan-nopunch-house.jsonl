@@ -1,0 +1,4 @@
+{"detail":"house 51ece7165800a533322c3303e01ea242deaef0d2d26cfd6583ee3a97712d998e, gate 192.168.1.193:4433, observed 192.168.1.193:36834, secondary port 4434","event":"registered","peer":null,"ts_ms":1789586959171}
+{"detail":"accepted: a friend on this house's list","event":"knock","peer":"74575751","ts_ms":1789586961669}
+{"detail":"relay through [::ffff:192.168.1.193]:4433","event":"visit_open","peer":"74575751","ts_ms":1789586961687}
+{"detail":"the peer said goodbye","event":"goodbye","peer":"74575751","ts_ms":1789586981715}
