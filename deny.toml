@@ -24,6 +24,10 @@ allow = [
     # dependencies, added after `cargo deny check licenses` named them.
     "ISC", # ring, rustls-webpki, untrusted
     "Unicode-3.0", # unicode-ident
+    # WO-2.5: foldhash (transitive: rusqlite -> hashlink -> hashbrown ->
+    # foldhash), added after `cargo deny check licenses` named it. OSI
+    # approved and FSF Free/Libre per SPDX; permissive, no copyleft.
+    "Zlib",
 ]
 # WO-1.3a fix 3: zeroize (mosschat-core's identity seed wrapper) is
 # "MIT OR Apache-2.0", already covered by the two entries above; already a

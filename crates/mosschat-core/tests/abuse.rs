@@ -48,6 +48,14 @@
 //! revision (e.g. `159d4ea` or `f5a6369`) rather than the merged `aec8a8d`.
 #![forbid(unsafe_code)]
 #![allow(clippy::panic, clippy::todo)]
+// WO-2.5: the two un-ignored store-backed cases below (`r_46_*`, `r_50_*`)
+// use `.expect(...)` for setup that cannot fail short of a broken test
+// environment (tempdir creation, opening a store this same test just
+// created), matching the pattern `docs/dev/lints.md` documents for
+// `#[cfg(test)] mod tests` blocks elsewhere in this crate. This file's own
+// crate root doubles as its test module, so the allow is crate-wide rather
+// than on a nested `mod tests`, same reasoning, different scope.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 // ===========================================================================
 // docs/spec/recording.md
@@ -694,10 +702,59 @@ fn r_42_declined_drop_request_is_still_stored_and_displayed() {
 /// (no envelope, signature, body, author or timestamp recoverable from it),
 /// and a later event whose `prev` matches that `event_id` is accepted
 /// without the visit being marked broken. See also WO-2.2 scenario 7.
+///
+/// WO-2.5 un-ignores the store's half of this rule: [`mosschat_core::store`]
+/// proves the tombstone itself carries only `seq` and `event_id` (no
+/// envelope, signature, body, author or timestamp recoverable) and that
+/// `event_id` survives tombstoning for a later `prev` to match against
+/// (`store::tests::tombstone_keeps_seq_and_event_id_removes_bytes`). Whether
+/// a later event whose `prev` matches is actually *accepted* (as opposed to
+/// merely matchable) is R-13's ingest check, `mosschat_core::event`, WO-2.4,
+/// and is not asserted here.
 #[test]
-#[ignore = "not implemented: R-50"]
 fn r_50_honoured_drop_leaves_tombstone_with_only_seq_and_event_id() {
-    panic!("not implemented: R-50");
+    use mosschat_core::store::{DataKey, KeyFile, Store, StoredEvent};
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let db_path = dir.path().join("house.sqlite3");
+    let key_path = dir.path().join("house.key");
+    let key: DataKey = KeyFile::create(&key_path).expect("create key file");
+    let store = Store::open(&db_path, &key).expect("open store");
+
+    let visit_id = [21u8; 32];
+    let event_id = [22u8; 32];
+    store
+        .open_visit(&visit_id, &[1u8; 32], 1_000)
+        .expect("open visit");
+    store
+        .append_event(
+            &visit_id,
+            &StoredEvent {
+                seq: 5,
+                event_id,
+                event_bytes: b"a message someone asked to have dropped".to_vec(),
+            },
+        )
+        .expect("append event");
+
+    let tombstone = store
+        .tombstone_event(&visit_id, 5)
+        .expect("tombstone event");
+    assert_eq!(tombstone.seq, 5);
+    assert_eq!(tombstone.event_id, event_id);
+
+    let row = store
+        .get_event(&visit_id, 5)
+        .expect("read back tombstoned row")
+        .expect("tombstone row remains");
+    assert!(
+        row.event_bytes.is_none(),
+        "R-50: a tombstone carries no envelope, signature, body, author or timestamp"
+    );
+    assert_eq!(
+        row.event_id, event_id,
+        "R-50/R-13: event_id survives tombstoning so a later prev still matches"
+    );
 }
 
 // --- Section 6: Sizes ----------------------------------------------------
@@ -750,10 +807,33 @@ fn r_45_deleted_visit_absent_from_views_rows_and_store_plaintext() {
 /// Expected: for a visit opened with `private: true`, no row of any kind
 /// exists in the store for it at any point, checkable directly (absence of
 /// row), not merely by a query filter that happens to exclude it.
+///
+/// WO-2.5 un-ignores this at the store layer: [`mosschat_core::store::Store`]
+/// exposes no way to write a `visit`/`message`/`participant`/`device`/
+/// `attachment` row except `open_visit`/`append_event`, and a caller
+/// implementing a private visit (decided above `mosschat-core`, per the
+/// store module's own docs) never calls either for that visit's id. This
+/// test asserts the negative directly, for an id nobody ever opened.
 #[test]
-#[ignore = "not implemented: R-46"]
 fn r_46_private_visit_produces_no_store_row_at_all() {
-    panic!("not implemented: R-46");
+    use mosschat_core::store::{DataKey, KeyFile, Store};
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let db_path = dir.path().join("house.sqlite3");
+    let key_path = dir.path().join("house.key");
+    let key: DataKey = KeyFile::create(&key_path).expect("create key file");
+    let store = Store::open(&db_path, &key).expect("open store");
+
+    let private_visit_id = [55u8; 32];
+    // A private visit: this test never calls `open_visit`/`append_event`
+    // for `private_visit_id`, which is the whole point (R-46: checked by
+    // there being no row, not by a filter over rows that exist).
+    let visits = store.list_visits().expect("list visits");
+    assert!(!visits.contains(&private_visit_id));
+    let event = store
+        .get_event(&private_visit_id, 0)
+        .expect("query for a never-opened visit");
+    assert!(event.is_none());
 }
 
 /// **R-47.** Privacy is a property of the visit, set at open, and no event
