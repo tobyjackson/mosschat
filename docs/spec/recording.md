@@ -268,9 +268,13 @@ body type will be assigned from the reserved range there.
 **R-17.** `text` is at most 65_536 bytes and is not empty. An empty message
 is a client bug, not a message.
 
-**R-18.** `reply_to`, when present, is 32 bytes and names an event already
-stored in this same visit at a lower `seq`. A reply to an event this
-recording does not hold, or holds at a higher `seq`, is rejected.
+**R-18.** `reply_to`, when present, is 32 bytes and names an event, **or a
+tombstone (R-50)**, already stored in this same visit at a lower `seq`. A
+reply to an event this recording does not hold, or holds at a higher `seq`,
+is rejected. A tombstone is a valid target: whether this house honoured a
+drop-request must not change which events it admits, or a house that
+honoured one would reject a reply that a house which declined accepts, and
+section 9 would call that difference a defect or an attack.
 
 ### 5.2 `reaction`
 
@@ -281,8 +285,9 @@ recording does not hold, or holds at a higher `seq`, is rejected.
 | 2 | `symbol` | text string | yes | 32 bytes | The reaction, one short UTF-8 string. |
 | 3 | `remove` | bool | no | — | `true` withdraws a reaction this author previously made. Absent means add. |
 
-**R-19.** `target` names an event already stored in this same visit at a
-lower `seq`.
+**R-19.** `target` names an event, **or a tombstone (R-50)**, already stored
+in this same visit at a lower `seq`. A tombstone is a valid target, for the
+reason R-18 gives.
 
 **R-20.** `symbol` is at most 32 bytes and is not empty. It is display data
 and is not otherwise interpreted; a client renders what it can and shows the
