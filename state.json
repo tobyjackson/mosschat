@@ -1,13 +1,13 @@
 {
-  "updated_at": "2026-09-16T13:31:21-0600",
-  "phase": "1",
-  "task": "Phase 1 (the gatehouse and the doorbell). WO-1.1 to WO-1.4 and WO-1.6 are merged (PRs 1 to 96). WO-1.5 is partly run: the no-gate cases (a), (b), (c) and a same-LAN gate run are in docs/measurements/2026-09-16-connectivity; the direct upgrade won on real machines for the first time (LAN, no NAT).",
-  "next_step": "Host a gatehouse on the public internet (a small VPS, or 443/udp and 444/udp forwarded to hewn-pc), then run WO-1.5 cases (d), (e), (f) with the MacBook on the T-Mobile hotspot. Then WO-1.7 (Dmitri's verdict on the network bet) and the Phase 1 gate.",
-  "blocked_on": "Toby: where the public gatehouse lives (decision pending), and the hotspot runs are human-required.",
+  "updated_at": "2026-09-16T14:10:25-0600",
+  "phase": "1 gate open; 2 started",
+  "task": "Phase 2 (the house) started 2026-09-16 on Toby's go, in parallel with an OPEN Phase 1 gate: WO-1.5 cases (d), (e), (f) and WO-1.7 (Dmitri's verdict on the network bet) are deferred until a public gatehouse box exists. Phase 2 does not touch mosschat-net, so a Phase 1 no-go cannot waste it. WO-2.1 (Konrad: docs/spec/recording.md and docs/spec/door.md) is in flight on branch phase-2/wo-2.1-recording-and-door-spec, worktree ~/code/mosschat-wt/konrad.",
+  "next_step": "WO-2.1 PR reviewed, then WO-2.2 (Dmitri critique, at most 400 words) and WO-2.3 (Wystan abuse stubs) before any implementation. In parallel, Toby stands up a throwaway VPS (Hetzner recommended, UDP 4433/4434 open) for the WO-1.5 gate cases; forge@calendar.yachtclubhub.com was tried and rejected as a shared machine.",
+  "blocked_on": "Phase 1 gate: a public box for WO-1.5 (d)-(f) plus Toby at the MacBook on the T-Mobile hotspot. Phase 3 must not start before WO-1.7 says go. Nothing blocks WO-2.1.",
   "where": "Repository /Users/toby/code/mosschat (GitHub tobyjackson/mosschat, branch main). Plan at ~/Unhewn/Projects/MossChat/PLAN.md, revision 3; the WO-1.5 steps are in ~/Unhewn/Projects/MossChat/wo-1.5-runbook.md. decisions.md is the authority where the two disagree. Binaries 9ec424a sit in ~/code/mosschat-artifacts on the MacBook and in ~/mosschat on hewn-mini and hewn-pc.",
   "open_decisions": [
-    "how to host the public gatehouse for WO-1.5 cases (d) to (f): VPS or home port forward",
+    "how to host the public gatehouse for WO-1.5 (d)-(f): a throwaway VPS is recommended, the home port-forward spoils the test (gate and house behind the same NAT)",
     "mosschat.io registration pending (Toby, not urgent)"
   ],
-  "notes_for_next_step": "One worktree per agent under ~/code/mosschat-wt/<agent>; never share a tree. Commit messages end with Claude-Session: https://claude.ai/code/session_01JhkHdEWtjg7WVCLjek3AWV. The netns lab cannot judge NAT traversal (issue 88); only real routers can. Substantive open issues: 84 (no redial after a fault over 30 s), 74 (unbounded write_all on the gate), 90 (probe queue race), 76 (intermittent 30 s CI stall). The doctor's direct-path RTT comes from the probe sampler and its relay RTT from QUIC; say which when comparing."
+  "notes_for_next_step": "One worktree per agent under ~/code/mosschat-wt/<agent>; never share a tree. Commit messages end with Claude-Session: https://claude.ai/code/session_01JhkHdEWtjg7WVCLjek3AWV. The netns lab cannot judge NAT traversal (issue 88); only real routers can. Substantive open issues: 84 (no redial after a fault over 30 s), 74 (unbounded write_all on the gate), 90 (probe queue race), 76 (intermittent 30 s CI stall). The doctor's direct-path RTT comes from the probe sampler and its relay RTT from QUIC; say which when comparing. crates/mosschat-core/src/event/envelope.rs (387 lines) already exists from Phase 1 and must be read before the recording spec is written. A same-LAN demo kit of keys sits in ~/mosschat/demo on hewn-mini and hewn-pc and in ~/code/mosschat-artifacts/demo on the MacBook."
 }
