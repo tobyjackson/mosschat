@@ -29,8 +29,11 @@ pub struct Envelope {
     pub author: [u8; 32],
     /// The host-assigned sequence number (D5: order is the host's order).
     pub seq: u64,
-    /// `event_id` of the previous event in this author's chain, or all
-    /// zero bytes for the first event.
+    /// `event_id` of the event at `seq - 1` in the **host's sequence**, or
+    /// 32 zero bytes when `seq == 0` (`docs/spec/recording.md` R-13). Where
+    /// the event at `seq - 1` was dropped at its author's request, `prev`
+    /// matches the tombstone R-50 leaves in its place, not the original
+    /// event's bytes.
     pub prev: [u8; 32],
     /// Display-only timestamp; never used to determine order.
     pub ts_ms: u64,
