@@ -13,7 +13,10 @@ implementation must reject is a numbered rule below.
 and phrased as an assertion: a conforming implementation asserts it, and
 rejects the event when the assertion fails. Numbers are stable once merged;
 a withdrawn rule keeps its number and is marked withdrawn rather than
-reused. Rules are grouped by subject but numbered in one flat sequence.
+reused. Rules are grouped by subject but numbered in one flat sequence, and
+a rule added after first merge takes the next free number and sits where it
+belongs by subject, so the numbers are not in document order. Cite a rule by
+its number, never by its position.
 
 ## 1. Layout
 
@@ -183,7 +186,17 @@ host-assigned, dense, and signed by the author.
 bytes when `seq == 0`. A recording holding two events with the same `seq`,
 or an event whose `prev` does not match the event it stored at `seq - 1`, is
 a host equivocating or a corrupted store; the second event is rejected and
-the visit is marked broken to the user rather than repaired.
+the visit is marked broken to the user rather than repaired. Where the event
+at `seq - 1` was dropped at its author's request, `prev` is matched against
+the tombstone R-50 leaves in its place.
+
+R-13 detects equivocation **within one recording**: two events this machine
+holds at one `seq`, or a `prev` that does not match what this machine stored.
+It does not detect a host that tells two guests different things, because
+section 9 forbids reading another participant's recording to compare. That
+limit is real and is accepted (WO-2.2 scenario 3): the chain makes a host's
+claimed order verifiable after the fact *to the holder of that recording*,
+not across holders.
 
 `ts_ms` is display information. It is never compared to another event's
 `ts_ms` to decide order, never used to expire an event, and a recording
@@ -327,6 +340,32 @@ and contains `person`.
 un-`leave`d `join` earlier in this visit is rejected. This is the concrete
 form of R-7.
 
+**`join` is the sole membership authority for a visit.** A key is admitted
+because the host put it in a `join`, and for no other reason. A participant
+does not check that a key in `join.devices` is backed by a `device-add` in
+force, and cannot: a guest's `device-add` events live in that person's own
+device log (D4, WO-3.4), not in this visit's recording, so the events that
+would prove it are not present to check. The host is the party that vouches,
+which is decision 35's "the host admits, always" applied to keys as well as
+to people.
+
+**R-32's validity window therefore does not gate the ordinary path**, and
+this specification does not pretend otherwise. It governs the one case where
+a `device-add` is itself in the recording: a device added to a person
+mid-visit (section 5.6), where the grant is present and is checked. For a
+key that arrived in a `join`, what fails closed is the host declining to
+list it, not the window. What the window buys is that the field exists and
+is enforced wherever a grant is visible, so a later version can widen that
+enforcement without a format change — which is why it is required now
+(research lesson 5), not a claim that it is load-bearing today.
+
+The cost, stated plainly because it is the limit
+`research/zero-trust-and-ucan.md` D1 names: a host that never learned of a
+revocation will list a revoked key in a `join`, and every participant will
+accept that key's events for that visit. R-37 stops the key being re-added
+to a person once the revocation is seen; it does not reach back into a visit
+a stale host already opened.
+
 ### 5.5 `leave`
 
 | Key | Field | CBOR type | Required | Cap | Meaning |
@@ -442,6 +481,22 @@ request about the whole visit and stands on its own.
 "dropped at their request". The `drop-request` event itself is never
 deleted by being honoured: it is the record that the request was made.
 
+**R-50.** Honouring a `drop-request` leaves a **tombstone** at each dropped
+`seq`, holding that event's `seq` and `event_id` and nothing else: no
+envelope, no signature, no body, no author, no timestamp. R-13 matches a
+later event's `prev` against the tombstone's `event_id` exactly as it would
+against the event itself, so obeying decision 13 does not break the chain
+and does not mark the visit broken. Without this an honest house is punished
+for honouring a request: it deletes the bytes at `seq - 1`, then has nothing
+for the next event's `prev` to match.
+
+A tombstone is not the event. It carries no content, so it satisfies kind
+one's "gone from every view" and the hexdump check of R-45 for the dropped
+event's own bytes; a 32 byte hash of bytes that no longer exist reveals
+nothing about them. It is what the view renders as the "dropped at their
+request" marker of R-41, which is why R-49 says the view shows a marker and
+not a gap.
+
 **R-42.** A `drop-request` that a house declines to honour is still stored
 and still displayed. Declining is a local choice and produces no event.
 
@@ -533,8 +588,13 @@ rule that reads another person's recording. Two participants' recordings of
 one visit are related only by both being prefixes of the host's sequence:
 same events, same order, and a participant who left holds a **shorter**
 recording, never a different one. Nothing repairs a difference, because
-nothing is allowed to produce one; a difference is a defect or an attack,
-surfaced under R-13 as a broken visit and shown to the person.
+nothing is allowed to produce one; a difference is a defect or an attack.
+Where it shows up inside one recording, R-13 surfaces it as a broken visit
+and shows the person. Where it does not — a host that gave two guests
+different orders — no participant detects it, precisely because no
+participant may read another's recording. That is the price of this
+paragraph and it is paid knowingly (WO-2.2 scenario 3): the alternative is
+comparing recordings, which is the merge this format exists to forbid.
 
 **A host replaying its own sequence to a rejoining guest is not a merge**
 (decision 34, invariant 7). Inside one live visit, a guest whose connection

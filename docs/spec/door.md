@@ -14,7 +14,10 @@ from it with no Rust read.
 **Rule numbering.** Every validity rule is numbered `D-<n>` and phrased as
 an assertion: a conforming implementation asserts it and refuses the frame
 when the assertion fails. Numbers are stable once merged; a withdrawn rule
-keeps its number and is marked withdrawn rather than reused.
+keeps its number and is marked withdrawn rather than reused. A rule added
+after first merge takes the next free number and sits where it belongs by
+subject, so the numbers are not in document order. Cite a rule by its
+number, never by its position.
 
 Conventions: all integers are unsigned unless stated; all multi-byte lengths
 are big-endian; "the house" is the daemon, "the client" is whatever connects
@@ -45,6 +48,18 @@ process cannot squat an existing name.
 The local transport authenticates by file permission alone: any process
 running as the user may connect. That is a real trust assumption and it is
 why section 6's scope exists.
+
+**Possession of the local socket is total authority over the house.** A
+`Hello` with no `grant` gets subject `house` (section 6), which includes
+`device.revoke`, `visit.delete` and every recording in the store; so anyone
+at an unlocked, logged-in machine — or any program running as that user —
+is the house, and reads, sends and deletes as the person. Nothing in the
+recording format constrains this: `device-revoke`
+(`docs/spec/recording.md` R-36) removes a key's standing with *other*
+people's houses, and does not reduce what the local door grants on this
+machine. Locking the screen and the disk is the whole defence, exactly as
+decision 10 and risk 6 already say for the data key. `docs/honest-limits.md`
+(WO-5.5) states this in the user's words.
 
 **Network** is off unless configured, and is decision 27's "the door works
 over the network too".
@@ -192,7 +207,7 @@ grant can see, as a sequence of `Snapshot` frames, terminated by exactly one
 | Key | Field | Type | Required | Cap | Meaning |
 |---|---|---|---|---|---|
 | 0 | `kind` | `Text` | yes | 32 bytes | What this frame carries: `contact`, `visit`, `event`, `note`, `device`, `transfer`. |
-| 1 | `items` | array | yes | 256 entries | Items of that kind, shaped as section 7 defines for that kind. |
+| 1 | `items` | array | yes | 917_504 bytes encoded, and at most 256 entries | Items of that kind, shaped as section 7 defines for that kind. The **byte** budget binds first (D-53). |
 
 `SnapshotEnd`:
 
@@ -342,7 +357,7 @@ UTF-8 and capped in bytes.
 | `contact.list` | — | `{ "contacts": [contact] }` | |
 | `contact.get` | `{ "key": Key }` | `{ "contact": contact }` | |
 | `visit.list` | `{ "contact": Key? }` | `{ "visits": [visit] }` | Omit `contact` for all visits in scope. |
-| `visit.events` | `{ "visit": Id, "from_seq": uint?, "limit": uint? }` | `{ "events": [event], "more": bool }` | `limit` defaults to 256 and is capped at 1024. |
+| `visit.events` | `{ "visit": Id, "from_seq": uint?, "limit": uint? }` | `{ "events": [event], "more": bool }` | `limit` defaults to 256 and is capped at 1024 **entries**, but the byte budget of D-53 binds first and `more` is the truncation signal. |
 | `visit.open` | `{ "with": [Key], "private": bool? }` | `{ "visit": Id }` | This house becomes the host. |
 | `visit.send` | `{ "visit": Id, "text": Text(65536), "reply_to": Id? }` | `{ "event_id": Id, "seq": uint }` | Returns once the event is sequenced and stored, not when it was typed. |
 | `visit.react` | `{ "visit": Id, "target": Id, "symbol": Text(32), "remove": bool? }` | `{ "event_id": Id }` | |
@@ -376,9 +391,43 @@ already has the transfer (D9).
 before anything is read from the store, and a cap breach is
 `Error{invalid_argument}` with the connection left open.
 
+**D-53.** **Every multi-item result is capped by bytes, not by items.** The
+house accumulates encoded items into a `Reply` or a `Snapshot` frame and
+stops at the first item that would carry the frame's encoded payload past
+**917_504 bytes** (896 KiB), leaving that item for the next frame or the
+next request. An item count, where one is stated, is a second cap that
+applies after this one; whichever binds first, binds.
+
+An item cap alone cannot work: one `event` item can approach the 131_072
+byte whole-event limit of `docs/spec/recording.md` R-43, so 1024 of them is
+about 128 MiB against D-6's 1 MiB frame, over a hundredfold. The byte
+budget is set below 1 MiB to leave room for the enclosing array, the map
+keys and the 4 byte length prefix, so a conforming house cannot construct a
+frame that D-6 would make it illegal to send.
+
+**D-54.** Truncation is always **signalled, never silent**. For
+`visit.events`, `more: true` means the house stopped early for either
+reason and the client continues from the highest `seq` it received. For a
+`Snapshot`, the house emits as many `Snapshot` frames as it needs and the
+client knows it holds everything at `SnapshotEnd` (D-13), whose `counts`
+give the per-kind totals to check against. A house never drops an item it
+did not report, and a client never infers completeness from a short frame.
+
 **D-29.** `visit.delete` is irreversible and the house performs it without a
 confirmation round trip. Confirming with the person is the client's job; the
 door does not second-guess a command its grant permits.
+
+**D-52.** `visit.delete` is **close-then-delete**, in that order, as one
+operation. The house first leaves the visit if it is a guest, or closes it
+for everyone if it is the host, and only then deletes. It does not delete a
+visit it is still in: events would keep arriving and re-create the rows the
+delete just removed, satisfying `docs/spec/recording.md` R-45 at the instant
+of the call and violating it a second later. After `visit.delete` the house
+is **not** the host of that visit and holds no role in it; there is nothing
+left to host, and a later event naming that visit is refused as an event for
+a visit this house is not in. The `Reply` is sent after both halves are
+done, so a client that got a `Reply` knows the visit is closed and gone, not
+merely scheduled.
 
 **D-30.** A **private** visit is live at the door and absent from the store.
 `visit.open{private: true}` returns a visit id, `visit.send` works against

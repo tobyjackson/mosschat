@@ -29,9 +29,15 @@ sequence, and 32 zero bytes at `seq == 0`.
   holds a prefix-consistent copy of the host's sequence") becomes checkable
   from the bytes rather than asserted by the code that wrote them.
 - A host that equivocates, giving two guests different events at the same
-  `seq`, produces two chains that diverge at a detectable point. Under
-  option B a host can equivocate freely and nothing in the format notices.
-  WO-2.2 is briefed to attack exactly this ("a host lies about the order").
+  `seq`, produces two chains that differ. **The difference is not detectable
+  by comparing the two guests**, because section 9 forbids reading another
+  participant's recording; WO-2.2 scenario 3 accepted that limit. What the
+  chain does buy is detection *within* one recording — a second event at a
+  `seq` already held, or a `prev` that does not match what this machine
+  stored — and an after-the-fact record: each guest's chain commits the host
+  to the order it gave *that* guest, so if two recordings are ever put side
+  by side by their owners, out of band and by choice, the divergence is
+  evident and signed. Under option B neither property exists.
 - Cost: the host must hand the guest `prev` along with `seq`, so the
   sequencing exchange carries two fields instead of one. That exchange
   already exists in section 4 of the recording spec and is WO-3.1's to
