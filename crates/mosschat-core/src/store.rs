@@ -430,6 +430,16 @@ pub struct StoredRow {
     pub event_id: [u8; 32],
 }
 
+/// One visit's own row: what [`Store::visit_row`] reads back (WO-2.4b's
+/// second additive method, for view replay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisitRow {
+    /// The visit's host device key.
+    pub host: [u8; 32],
+    /// When the visit was opened, in Unix milliseconds.
+    pub opened_ms: u64,
+}
+
 /// A tombstone left in place of a dropped event (R-50): `seq` and
 /// `event_id` only, nothing else recoverable.
 #[derive(Debug, Clone)]
@@ -686,6 +696,82 @@ impl Store {
         // operation; run it standalone immediately after.
         self.conn.execute_batch("VACUUM;")?;
         Ok(())
+    }
+
+    /// Reads every stored row for a visit in ascending `seq` order, live
+    /// events and tombstones alike, in one statement.
+    ///
+    /// WO-2.4b's addition for view replay: the view layer rebuilds a
+    /// [`mosschat_core::event::ingest::Recording`](crate::event::ingest::Recording)
+    /// by re-ingesting every stored event in `seq` order (R-48), and reading
+    /// 100k rows one `seq` at a time through [`Self::get_event`] would be
+    /// 100k prepared-statement round trips. This is the bulk form of the
+    /// same query `get_event` answers one row at a time; the
+    /// `PRIMARY KEY (visit_id, seq)` already gives SQLite an ordered scan
+    /// for `ORDER BY seq`, so no new index is needed.
+    ///
+    /// `StoredRow::event_bytes == None` means the row at that `seq` is a
+    /// tombstone (R-50), exactly as [`Self::get_event`] reports it.
+    pub fn events_for_visit(
+        &self,
+        visit_id: &[u8; 32],
+    ) -> Result<Vec<(u64, StoredRow)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, event_id, event_bytes FROM message \
+             WHERE visit_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map((visit_id.as_slice(),), |r| {
+            let seq: i64 = r.get(0)?;
+            let event_id: Vec<u8> = r.get(1)?;
+            let event_bytes: Option<Vec<u8>> = r.get(2)?;
+            Ok((seq, event_id, event_bytes))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, event_id, event_bytes) = row?;
+            let event_id: [u8; 32] = event_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            out.push((
+                seq as u64,
+                StoredRow {
+                    event_bytes,
+                    event_id,
+                },
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Reads one visit's own row: its host and opening time.
+    ///
+    /// WO-2.4b's second additive method: the view layer's store-replay path
+    /// needs the visit's `host` (`Recording::new` requires it) to rebuild a
+    /// [`mosschat_core::event::ingest::Recording`](crate::event::ingest::Recording)
+    /// from stored rows, and this module had no public reader for the
+    /// `visit` table's `host` column before this. Returns `None` for an id
+    /// with no `visit` row, which is also R-46's private-visit case: a
+    /// private visit has no row to read.
+    pub fn visit_row(&self, visit_id: &[u8; 32]) -> Result<Option<VisitRow>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT host, opened_ms FROM visit WHERE id = ?1")?;
+        let mut rows = stmt.query((visit_id.as_slice(),))?;
+        if let Some(row) = rows.next()? {
+            let host: Vec<u8> = row.get(0)?;
+            let host: [u8; 32] = host
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            let opened_ms: i64 = row.get(1)?;
+            Ok(Some(VisitRow {
+                host,
+                opened_ms: opened_ms as u64,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Lists every visit id currently in the store, for view computation
